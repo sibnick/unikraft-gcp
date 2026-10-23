@@ -1,0 +1,13 @@
+spec: v0.6
+
+name: helloworld
+version: 0.1.0
+description: Stock helloworld unikernel for Google Cloud Phase A1 boot spike
+
+unikraft:
+  version: RELEASE-0.21.0
+
+targets:
+  - name: gcp-x86_64
+    architecture: x86_64
+    platform: kvm

@@ -1,0 +1,8 @@
+spec: v0.6
+
+name: unikraft-gcp
+version: 0.1.0
+description: Unikraft on Google Cloud Platform with cloud-accelerated networking
+
+unikraft:
+  version: RELEASE-0.21.0

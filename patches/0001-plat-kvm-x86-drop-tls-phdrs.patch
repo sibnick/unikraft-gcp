@@ -1,0 +1,28 @@
+From: Nik <sibnick@gmail.com>
+Subject: [PATCH] plat/kvm/x86: drop empty TLS program headers to prevent GRUB 2.12 overlap error
+
+When an application has no thread-local storage data, the linker emits an empty
+PT_LOAD program header at the same address as the subsequent data segment.
+GNU GRUB 2.12 multiboot loader detects overlapping segments and aborts boot with:
+    error: overlap detected.
+
+Dropping tls PT_TLS and tls_load PT_LOAD from PHDRS in link64.lds.S ensures
+only valid non-overlapping load segments are generated.
+---
+ plat/kvm/x86/link64.lds.S | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/plat/kvm/x86/link64.lds.S b/plat/kvm/x86/link64.lds.S
+index fc156a0..5ad621f 100644
+--- a/plat/kvm/x86/link64.lds.S
++++ b/plat/kvm/x86/link64.lds.S
+@@ -37,8 +37,6 @@ PHDRS
+ 	text PT_LOAD FLAGS(PHDRS_PF_RX);
+ 	rodata PT_LOAD FLAGS(PHDRS_PF_R);
+ 	data PT_LOAD;
+-	tls PT_TLS;
+-	tls_load PT_LOAD;
+ 	stack PT_GNU_STACK FLAGS(PHDRS_PF_RW);
+ }
+ 
+-- 
