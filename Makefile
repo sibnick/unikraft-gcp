@@ -13,7 +13,7 @@ build: prepare
 	@$(MAKE) -C samples/helloworld -j$$(nproc)
 
 test: build
-	@qemu-system-x86_64 -kernel samples/helloworld/build/helloworld_qemu-x86_64 -nographic
+	@qemu-system-x86_64 -kernel samples/helloworld/build/helloworld_qemu-x86_64 -device virtio-net-pci -nographic
 
 clean:
 	@$(MAKE) -C samples/helloworld clean
