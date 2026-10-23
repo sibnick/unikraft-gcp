@@ -123,7 +123,7 @@ if [ -n "${INSTANCES_LEAK}" ]; then
     LEAK=1
 fi
 
-IMAGES_LEAK=$(gcloud compute images list --project="${GCP_PROJECT}" --no-standard-images --filter='NAME~"^ukg-"' --format="value(name)")
+IMAGES_LEAK=$(gcloud compute images list --project="${GCP_PROJECT}" --no-standard-images --filter="name ~ '^ukg-'" --format="value(name)")
 if [ -n "${IMAGES_LEAK}" ]; then
     echo "[FAIL] Leaked images found:"
     echo "${IMAGES_LEAK}"
