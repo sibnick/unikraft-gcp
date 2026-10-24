@@ -32,6 +32,7 @@
 #include <lwip/ip_addr.h>
 #include "netif/uknetdev.h"
 #include <lwip/etharp.h>
+#include <lwip/inet_chksum.h>
 
 #define DEFAULT_PORT 9000
 #define DEFAULT_PKT_COUNT 1000
@@ -55,22 +56,6 @@ struct __attribute__((packed)) netload_pkt {
 	char payload[];
 };
 
-static uint16_t calc_checksum(const void *data, size_t len)
-{
-	const uint16_t *buf = (const uint16_t *)data;
-	uint32_t sum = 0;
-
-	while (len > 1) {
-		sum += *buf++;
-		len -= 2;
-	}
-	if (len == 1)
-		sum += *(const uint8_t *)buf;
-
-	sum = (sum >> 16) + (sum & 0xffff);
-	sum += (sum >> 16);
-	return (uint16_t)(~sum);
-}
 
 static void poll_stack(void)
 {
@@ -128,10 +113,11 @@ static int do_ping(const char *peer_ip, int timeout_sec)
 		memset(&pkt, 0, sizeof(pkt));
 		pkt.type = 8; /* ICMP_ECHO */
 		pkt.code = 0;
+		pkt.checksum = 0;
 		pkt.id = htons(0x1234);
 		pkt.seq = htons((uint16_t)seq++);
 		strncpy(pkt.payload, "UNIKRAFT_GCP_PING_TEST", sizeof(pkt.payload) - 1);
-		pkt.checksum = calc_checksum(&pkt, sizeof(pkt));
+		pkt.checksum = inet_chksum(&pkt, sizeof(pkt));
 
 		send_time = ukplat_monotonic_clock();
 		printf("[PING] Sending echo request seq=%d to %s...\n", (int)ntohs(pkt.seq), peer_ip);
@@ -158,6 +144,8 @@ static int do_ping(const char *peer_ip, int timeout_sec)
 				if (ret >= ip_hl + (int)sizeof(struct icmp_echo_hdr)) {
 					struct icmp_echo_hdr *r =
 						(struct icmp_echo_hdr *)(rx_buf + ip_hl);
+					printf("[PING] Received packet: len=%zd type=%d code=%d id=0x%04x seq=%d\n",
+					       ret, r->type, r->code, ntohs(r->id), ntohs(r->seq));
 					if (r->type == 0 && r->id == htons(0x1234)) {
 						__nsec rtt_ns = ukplat_monotonic_clock() - send_time;
 						double rtt_ms = (double)rtt_ns / 1000000.0;
@@ -450,7 +438,7 @@ static int run_server(const char *peer_ip, int port)
 
 	if (peer_ip) {
 		printf("[SERVER] Initiating bidirectional ping to peer %s...\n", peer_ip);
-		do_ping(peer_ip, 5);
+		do_ping(peer_ip, 10);
 	}
 
 	/* Keep serving and polling for 5 seconds */
@@ -588,17 +576,17 @@ int main(int argc, char *argv[])
 			return 1;
 		}
 
-		/* Step 1: Ping server */
-		printf("\n[CLIENT] Phase A3.1: ICMP Ping verification...\n");
-		if (do_ping(peer, 15) != 0) {
-			printf("GATE_FAIL: ICMP ping to peer failed\n");
+		/* Step 1: Throughput measurement */
+		printf("\n[CLIENT] Phase A3.1: Bidirectional UDP throughput test...\n");
+		if (run_client(peer, port, count, size) != 0) {
+			printf("GATE_FAIL: throughput benchmark failed\n");
 			return 1;
 		}
 
-		/* Step 2: Throughput measurement */
-		printf("\n[CLIENT] Phase A3.2: Bidirectional UDP throughput test...\n");
-		if (run_client(peer, port, count, size) != 0) {
-			printf("GATE_FAIL: throughput benchmark failed\n");
+		/* Step 2: Ping server */
+		printf("\n[CLIENT] Phase A3.2: ICMP Ping verification...\n");
+		if (do_ping(peer, 15) != 0) {
+			printf("GATE_FAIL: ICMP ping to peer failed\n");
 			return 1;
 		}
 	} else {
