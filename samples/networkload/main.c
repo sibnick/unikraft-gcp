@@ -134,21 +134,23 @@ static int do_ping(const char *peer_ip, int timeout_sec)
 		pkt.checksum = calc_checksum(&pkt, sizeof(pkt));
 
 		send_time = ukplat_monotonic_clock();
+		printf("[PING] Sending echo request seq=%d to %s...\n", (int)ntohs(pkt.seq), peer_ip);
 		ret = sendto(fd, &pkt, sizeof(pkt), 0,
 			     (struct sockaddr *)&dst, sizeof(dst));
 		if (ret < 0) {
+			printf("[PING] sendto error: %d\n", errno);
 			poll_stack();
 			sleep_and_poll(200);
 			continue;
 		}
 
 		/* Poll for response */
-		for (int a = 0; a < 20; a++) {
+		for (int a = 0; a < 25; a++) {
 			struct sockaddr_in from;
 			socklen_t from_len = sizeof(from);
 
 			poll_stack();
-			ret = recvfrom(fd, rx_buf, sizeof(rx_buf), 0,
+			ret = recvfrom(fd, rx_buf, sizeof(rx_buf), MSG_DONTWAIT,
 				       (struct sockaddr *)&from, &from_len);
 			if (ret > 0) {
 				/* Parse IPv4 header length */
@@ -267,7 +269,7 @@ static int run_client(const char *peer_ip, int port, uint32_t count, size_t pkt_
 			socklen_t from_len = sizeof(from);
 
 			poll_stack();
-			ret = recvfrom(fd, rx_buf, pkt_size + 128, 0,
+			ret = recvfrom(fd, rx_buf, pkt_size + 128, MSG_DONTWAIT,
 				       (struct sockaddr *)&from, &from_len);
 			if (ret > 0) {
 				struct netload_pkt *rx_hdr = (struct netload_pkt *)rx_buf;
@@ -386,8 +388,12 @@ static int run_server(const char *peer_ip, int port)
 
 		poll_stack();
 
-		n = recvfrom(fd, buf, buf_size, 0,
+		n = recvfrom(fd, buf, buf_size, MSG_DONTWAIT,
 			     (struct sockaddr *)&cli_addr, &cli_len);
+		if (n <= 0) {
+			sleep_and_poll(5);
+			continue;
+		}
 		if (n > 0) {
 			struct netload_pkt *hdr = (struct netload_pkt *)buf;
 			__nsec now = ukplat_monotonic_clock();
