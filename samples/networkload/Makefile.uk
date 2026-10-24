@@ -1,0 +1,3 @@
+$(eval $(call addlib,appnetworkload))
+
+APPNETWORKLOAD_SRCS-y += $(APPNETWORKLOAD_BASE)/main.c

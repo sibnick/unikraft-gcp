@@ -11,6 +11,8 @@ prepare:
 build: prepare
 	@$(MAKE) -C samples/helloworld defconfig
 	@$(MAKE) -C samples/helloworld -j$$(nproc)
+	@$(MAKE) -C samples/networkload defconfig
+	@$(MAKE) -C samples/networkload -j$$(nproc)
 
 test: build
 	@qemu-system-x86_64 -kernel samples/helloworld/build/helloworld_qemu-x86_64 -device virtio-net-pci -nographic
@@ -18,6 +20,8 @@ test: build
 clean:
 	@$(MAKE) -C samples/helloworld clean
 	@rm -rf samples/helloworld/build
+	@$(MAKE) -C samples/networkload clean
+	@rm -rf samples/networkload/build
 
 teardown:
 	@./scripts/gcp_teardown.sh
