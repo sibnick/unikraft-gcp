@@ -18,8 +18,8 @@ UKG_RUN="${UKG_RUN:-ukg-$(date +%m%d-%H%M)}"
 APP_DIR="${1:-${ROOT_DIR}/samples/helloworld}"
 BUILD_DIR="${APP_DIR}/build"
 DISK_RAW="${BUILD_DIR}/disk.raw"
-DISK_TAR="${BUILD_DIR}/disk.raw.tar.gz"
-IMAGE_NAME="${UKG_RUN}-img"
+IMAGE_NAME="${2:-${UKG_RUN}-img}"
+CMDLINE_ARGS="${3:-}"
 
 if [ -z "${GCP_PROJECT}" ]; then
     echo "[ERROR] GCP_PROJECT is not set." >&2
@@ -58,7 +58,7 @@ cp "${KERNEL_BIN}" "${STAGING_DIR}/boot/unikraft.elf"
 cp /usr/lib/grub/i386-pc/*.mod "${STAGING_DIR}/boot/grub/i386-pc/" || true
 cp /usr/lib/grub/i386-pc/*.lst "${STAGING_DIR}/boot/grub/i386-pc/" || true
 
-cat << 'GRUB_CFG' > "${STAGING_DIR}/boot/grub/grub.cfg"
+cat << GRUB_CFG > "${STAGING_DIR}/boot/grub/grub.cfg"
 set default=0
 set timeout=1
 
@@ -67,7 +67,7 @@ terminal_input serial
 terminal_output serial
 
 menuentry 'unikraft' {
-    multiboot /boot/unikraft.elf
+    multiboot /boot/unikraft.elf ${CMDLINE_ARGS}
     boot
 }
 GRUB_CFG
@@ -95,10 +95,11 @@ dd if=/usr/lib/grub/i386-pc/boot.img of="${DISK_RAW}" bs=446 count=1 conv=notrun
 dd if="${CORE_IMG}" of="${DISK_RAW}" bs=512 seek=1 conv=notrunc status=none
 
 echo "[INFO] Packaging disk image as tar.gz for GCP..."
+DISK_TAR="${BUILD_DIR}/${IMAGE_NAME}-disk.raw.tar.gz"
 rm -f "${DISK_TAR}"
-(cd "${BUILD_DIR}" && tar -Szcf "disk.raw.tar.gz" "disk.raw")
+(cd "${BUILD_DIR}" && tar -Szcf "${IMAGE_NAME}-disk.raw.tar.gz" "disk.raw")
 
-GCS_TARGET="gs://${GCP_BUCKET}/${UKG_RUN}-disk.tar.gz"
+GCS_TARGET="gs://${GCP_BUCKET}/${IMAGE_NAME}-disk.tar.gz"
 echo "[INFO] Uploading to ${GCS_TARGET}..."
 if command -v gcloud &>/dev/null; then
     gcloud storage cp "${DISK_TAR}" "${GCS_TARGET}"
