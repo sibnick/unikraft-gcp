@@ -27,8 +27,10 @@ if [ -x ./fossil ]; then
   FOSSIL="./fossil"
 fi
 
-echo "[git-export] fossil sync"
-"$FOSSIL" sync
+if [ "$("$FOSSIL" remote-url)" != "off" ]; then
+  echo "[git-export] fossil sync"
+  "$FOSSIL" sync
+fi
 
 echo "[git-export] fossil git export"
 "$FOSSIL" git export "$@"
