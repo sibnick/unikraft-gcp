@@ -57,6 +57,24 @@ struct __attribute__((packed)) netload_pkt {
 };
 
 
+static void set_gcp_static_arp(const ip4_addr_t *target_ip)
+{
+	if (!netif_default || !target_ip)
+		return;
+
+	const ip4_addr_t *gw = netif_ip4_gw(netif_default);
+	struct eth_addr gw_mac;
+
+	gw_mac.addr[0] = 0x42;
+	gw_mac.addr[1] = 0x01;
+	gw_mac.addr[2] = ip4_addr1(gw);
+	gw_mac.addr[3] = ip4_addr2(gw);
+	gw_mac.addr[4] = ip4_addr3(gw);
+	gw_mac.addr[5] = ip4_addr4(gw);
+
+	etharp_add_static_entry(target_ip, &gw_mac);
+}
+
 static void poll_stack(void)
 {
 	uknetdev_poll_all();
@@ -103,6 +121,7 @@ static int do_ping(const char *peer_ip, int timeout_sec)
 		return -1;
 	}
 	dst.sin_addr.s_addr = ip.addr;
+	set_gcp_static_arp(&ip);
 
 	deadline = ukplat_monotonic_clock() + ukarch_time_sec_to_nsec(timeout_sec);
 
@@ -227,6 +246,7 @@ static int run_client(const char *peer_ip, int port, uint32_t count, size_t pkt_
 			return -1;
 		}
 		dst.sin_addr.s_addr = peer_addr.addr;
+		set_gcp_static_arp(&peer_addr);
 	}
 
 	printf("[CLIENT] Starting UDP throughput test to %s:%d...\n", peer_ip, port);
@@ -247,12 +267,14 @@ static int run_client(const char *peer_ip, int port, uint32_t count, size_t pkt_
 		ret = sendto(fd, tx_buf, pkt_size, 0,
 			     (struct sockaddr *)&dst, sizeof(dst));
 		if (ret < 0) {
+			if (seq <= 5 || seq % 200 == 0)
+				printf("[CLIENT] sendto error seq=%u: %d\n", seq, errno);
 			poll_stack();
 			continue;
 		}
 
 		/* Receive echo */
-		for (int attempts = 0; attempts < 30; attempts++) {
+		for (int attempts = 0; attempts < 15; attempts++) {
 			struct sockaddr_in from;
 			socklen_t from_len = sizeof(from);
 
@@ -268,11 +290,11 @@ static int run_client(const char *peer_ip, int port, uint32_t count, size_t pkt_
 					break;
 				}
 			}
-			if (attempts == 10 && rx_count == 0) {
+			if (attempts == 5 && rx_count == 0) {
 				sendto(fd, tx_buf, pkt_size, 0,
 				       (struct sockaddr *)&dst, sizeof(dst));
 			}
-			sleep_and_poll(5);
+			sleep_and_poll(2);
 		}
 
 		if (seq % 200 == 0 || seq == count) {
@@ -366,6 +388,12 @@ static int run_server(const char *peer_ip, int port)
 		return -1;
 	}
 
+	if (peer_ip) {
+		ip4_addr_t peer_addr;
+		if (ip4addr_aton(peer_ip, &peer_addr) == 1)
+			set_gcp_static_arp(&peer_addr);
+	}
+
 	printf("[SERVER] Listening on UDP port %d (direct echo mode)...\n", port);
 	fflush(stdout);
 
@@ -386,9 +414,19 @@ static int run_server(const char *peer_ip, int port)
 			struct netload_pkt *hdr = (struct netload_pkt *)buf;
 			__nsec now = ukplat_monotonic_clock();
 
-			if (!first_rx_ns)
+			if (!first_rx_ns) {
 				first_rx_ns = now;
+				char from_ip_str[16] = {0};
+				ip4addr_ntoa_r((const ip4_addr_t *)&cli_addr.sin_addr, from_ip_str, sizeof(from_ip_str));
+				printf("[SERVER] First packet received from %s:%d (len=%zd)\n",
+				       from_ip_str, ntohs(cli_addr.sin_port), n);
+			}
 			last_rx_ns = now;
+
+			/* Ensure static ARP mapping to gateway MAC for replying */
+			ip4_addr_t cli_ip;
+			cli_ip.addr = cli_addr.sin_addr.s_addr;
+			set_gcp_static_arp(&cli_ip);
 
 			if (n >= (ssize_t)sizeof(struct netload_pkt) &&
 			    ntohl(hdr->magic) == NETLOAD_MAGIC) {
@@ -396,8 +434,10 @@ static int run_server(const char *peer_ip, int port)
 				total_bytes += (uint64_t)n * 2; /* bidirectional: RX + TX */
 
 				/* Echo back */
-				sendto(fd, buf, (size_t)n, 0,
+				ssize_t tx_ret = sendto(fd, buf, (size_t)n, 0,
 				       (struct sockaddr *)&cli_addr, cli_len);
+				if (tx_ret < 0 && (rx_pkts <= 5 || rx_pkts % 200 == 0))
+					printf("[SERVER] sendto echo error: %d\n", errno);
 
 				if (ntohl(hdr->flags) == 1) {
 					/* End-of-stream signaled */
@@ -545,6 +585,16 @@ int main(int argc, char *argv[])
 
 			netif_set_addr(netif_default, &my_ip, &my_mask, &my_gw);
 			netif_set_up(netif_default);
+
+			/* Pre-populate static ARP for gateway and peer */
+			set_gcp_static_arp(&my_gw);
+			if (peer) {
+				ip4_addr_t peer_addr;
+				if (ip4addr_aton(peer, &peer_addr) == 1) {
+					set_gcp_static_arp(&peer_addr);
+					printf("Configured static ARP: peer %s -> gateway MAC\n", peer);
+				}
+			}
 		}
 
 		char ip_str[16] = {0};
@@ -576,17 +626,17 @@ int main(int argc, char *argv[])
 			return 1;
 		}
 
-		/* Step 1: Throughput measurement */
-		printf("\n[CLIENT] Phase A3.1: Bidirectional UDP throughput test...\n");
-		if (run_client(peer, port, count, size) != 0) {
-			printf("GATE_FAIL: throughput benchmark failed\n");
+		/* Step 1: Ping server */
+		printf("\n[CLIENT] Phase A3.1: ICMP Ping verification...\n");
+		if (do_ping(peer, 15) != 0) {
+			printf("GATE_FAIL: ICMP ping to peer failed\n");
 			return 1;
 		}
 
-		/* Step 2: Ping server */
-		printf("\n[CLIENT] Phase A3.2: ICMP Ping verification...\n");
-		if (do_ping(peer, 15) != 0) {
-			printf("GATE_FAIL: ICMP ping to peer failed\n");
+		/* Step 2: Throughput measurement */
+		printf("\n[CLIENT] Phase A3.2: Bidirectional UDP throughput test...\n");
+		if (run_client(peer, port, count, size) != 0) {
+			printf("GATE_FAIL: throughput benchmark failed\n");
 			return 1;
 		}
 	} else {
