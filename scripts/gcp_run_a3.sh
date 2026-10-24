@@ -48,12 +48,12 @@ echo "=================================================="
 # 1. Build and upload server image
 echo "[INFO] Building server image ${SRV_IMG}..."
 "${SCRIPT_DIR}/gcp_build_image.sh" "${ROOT_DIR}/samples/networkload" "${SRV_IMG}" \
-    "netdev.ip=${SRV_IP}/${NETMASK}:${GATEWAY} -- role=server peer=${CLI_IP}"
+    "netdev.ip=${SRV_IP}/${NETMASK}:${GATEWAY} -- role=server peer=${CLI_IP} ip=${SRV_IP}/${NETMASK} gw=${GATEWAY}"
 
 # 2. Build and upload client image
 echo "[INFO] Building client image ${CLI_IMG}..."
 "${SCRIPT_DIR}/gcp_build_image.sh" "${ROOT_DIR}/samples/networkload" "${CLI_IMG}" \
-    "netdev.ip=${CLI_IP}/${NETMASK}:${GATEWAY} -- role=client peer=${SRV_IP}"
+    "netdev.ip=${CLI_IP}/${NETMASK}:${GATEWAY} -- role=client peer=${SRV_IP} ip=${CLI_IP}/${NETMASK} gw=${GATEWAY}"
 
 # 3. Create internal firewall rule if missing
 if ! gcloud compute firewall-rules describe "${FIREWALL_NAME}" --project="${GCP_PROJECT}" &>/dev/null; then
@@ -106,7 +106,7 @@ echo "[INFO] Polling serial console output for Phase A3 gate markers..."
 PING_PASS=0
 NET_PASS=0
 
-for i in $(seq 1 45); do
+for i in $(seq 1 60); do
     sleep 3
 
     gcloud compute instances get-serial-port-output "${SRV_NAME}" \

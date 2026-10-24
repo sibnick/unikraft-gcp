@@ -31,6 +31,7 @@
 #include <lwip/netif.h>
 #include <lwip/ip_addr.h>
 #include "netif/uknetdev.h"
+#include <lwip/etharp.h>
 
 #define DEFAULT_PORT 9000
 #define DEFAULT_PKT_COUNT 1000
@@ -459,6 +460,9 @@ int main(int argc, char *argv[])
 {
 	const char *role = "server";
 	const char *peer = NULL;
+	const char *ip_param = NULL;
+	const char *mask_param = NULL;
+	const char *gw_param = NULL;
 	int port = DEFAULT_PORT;
 	uint32_t count = DEFAULT_PKT_COUNT;
 	size_t size = DEFAULT_PKT_SIZE;
@@ -480,6 +484,14 @@ int main(int argc, char *argv[])
 			count = (uint32_t)atoi(argv[i] + 6);
 		} else if (strncmp(argv[i], "size=", 5) == 0) {
 			size = (size_t)atoi(argv[i] + 5);
+		} else if (strncmp(argv[i], "ip=", 3) == 0) {
+			ip_param = argv[i] + 3;
+		} else if (strncmp(argv[i], "netdev.ip=", 10) == 0) {
+			ip_param = argv[i] + 10;
+		} else if (strncmp(argv[i], "mask=", 5) == 0) {
+			mask_param = argv[i] + 5;
+		} else if (strncmp(argv[i], "gw=", 3) == 0) {
+			gw_param = argv[i] + 3;
 		}
 	}
 
@@ -498,6 +510,49 @@ int main(int argc, char *argv[])
 	}
 
 	if (netif_default) {
+		if (ip_param) {
+			char ip_buf[32] = {0};
+			const char *slash = strchr(ip_param, '/');
+			const char *colon = strchr(ip_param, ':');
+			ip4_addr_t my_ip, my_mask, my_gw;
+
+			ip4_addr_set_zero(&my_ip);
+			ip4addr_aton("255.255.240.0", &my_mask);
+			ip4addr_aton("10.150.0.1", &my_gw);
+
+			if (colon && !gw_param)
+				gw_param = colon + 1;
+
+			if (slash) {
+				size_t len = (size_t)(slash - ip_param);
+				if (len < sizeof(ip_buf)) {
+					strncpy(ip_buf, ip_param, len);
+					ip_buf[len] = '\0';
+				}
+				int bits = atoi(slash + 1);
+				if (bits > 0 && bits <= 32) {
+					uint32_t mask_val = htonl(~((1ULL << (32 - bits)) - 1));
+					my_mask.addr = mask_val;
+				}
+				ip4addr_aton(ip_buf, &my_ip);
+			} else {
+				size_t len = colon ? (size_t)(colon - ip_param) : strlen(ip_param);
+				if (len < sizeof(ip_buf)) {
+					strncpy(ip_buf, ip_param, len);
+					ip_buf[len] = '\0';
+				}
+				ip4addr_aton(ip_buf, &my_ip);
+			}
+
+			if (mask_param)
+				ip4addr_aton(mask_param, &my_mask);
+			if (gw_param)
+				ip4addr_aton(gw_param, &my_gw);
+
+			netif_set_addr(netif_default, &my_ip, &my_mask, &my_gw);
+			netif_set_up(netif_default);
+		}
+
 		char ip_str[16] = {0};
 		char gw_str[16] = {0};
 		char mask_str[16] = {0};
@@ -513,8 +568,13 @@ int main(int argc, char *argv[])
 
 	/* Warm up network stack and transmit Gratuitous ARP */
 	printf("Warming up network interface and settling ARP...\n");
-	for (int i = 0; i < 20; i++)
+	if (netif_default)
+		etharp_gratuitous(netif_default);
+	for (int i = 0; i < 20; i++) {
+		if (i % 5 == 0 && netif_default)
+			etharp_gratuitous(netif_default);
 		sleep_and_poll(100);
+	}
 
 	if (strcmp(role, "client") == 0) {
 		if (!peer) {
