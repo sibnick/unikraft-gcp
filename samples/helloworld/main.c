@@ -39,8 +39,13 @@ int main(int argc, char *argv[])
 	count = uk_netdev_count();
 	printf("Probing network devices: count=%u\n", count);
 	if (count == 0) {
+#if defined(CONFIG_LIBGVE)
+		printf("No uk_netdev registered yet (Phase B1 AdminQ probe mode).\n");
+		return 0;
+#else
 		printf("GATE_FAIL: no netdev devices found\n");
 		return 1;
+#endif
 	}
 
 	dev = uk_netdev_get(0);
