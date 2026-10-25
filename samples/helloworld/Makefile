@@ -1,6 +1,6 @@
 UK_ROOT ?= $(realpath $(CURDIR)/../../.unikraft/unikraft)
 UK_LIBS ?= $(CURDIR)/.libs
-LIBS ?=
+LIBS ?= $(realpath $(CURDIR)/../../drivers/gve)
 
 .PHONY: all clean defconfig menuconfig
 

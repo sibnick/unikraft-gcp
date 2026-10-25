@@ -1,0 +1,5 @@
+$(eval $(call addlib_s,libgve,$(CONFIG_LIBGVE)))
+
+LIBGVE_CINCLUDES-y += -I$(LIBGVE_BASE)/include
+
+LIBGVE_SRCS-y += $(LIBGVE_BASE)/gve_main.c

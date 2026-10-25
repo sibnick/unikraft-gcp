@@ -53,6 +53,7 @@ echo "[INFO] Preparing disk layout..."
 STAGING_DIR="${BUILD_DIR}/staging"
 rm -rf "${STAGING_DIR}"
 mkdir -p "${STAGING_DIR}/boot/grub/i386-pc"
+mkdir -p "${STAGING_DIR}/EFI/BOOT"
 
 cp "${KERNEL_BIN}" "${STAGING_DIR}/boot/unikraft.elf"
 cp /usr/lib/grub/i386-pc/*.mod "${STAGING_DIR}/boot/grub/i386-pc/" || true
@@ -72,25 +73,35 @@ menuentry 'unikraft' {
 }
 GRUB_CFG
 
-echo "[INFO] Creating ext4 filesystem..."
+cp "${STAGING_DIR}/boot/grub/grub.cfg" "${STAGING_DIR}/EFI/BOOT/grub.cfg"
+
+echo "[INFO] Building standalone UEFI GRUB binary (/EFI/BOOT/BOOTX64.EFI)..."
+grub-mkimage -O x86_64-efi -o "${STAGING_DIR}/EFI/BOOT/BOOTX64.EFI" \
+    -p "/boot/grub" \
+    part_gpt part_msdos fat ext2 multiboot multiboot2 normal configfile serial terminfo search search_fs_file search_label efi_gop efi_uga all_video video video_fb gfxterm
+
+echo "[INFO] Creating FAT32 boot partition image..."
 PART_IMG="${BUILD_DIR}/part1.img"
 rm -f "${PART_IMG}"
-mkfs.ext4 -F -q -L "ukgboot" -d "${STAGING_DIR}" "${PART_IMG}" 63M
+truncate -s 63M "${PART_IMG}"
+mkfs.vfat -F 32 -n "UKGBOOT" "${PART_IMG}" >/dev/null
+mcopy -i "${PART_IMG}" -s "${STAGING_DIR}"/* ::/
 
 echo "[INFO] Creating 10 GiB raw disk image..."
 rm -f "${DISK_RAW}"
 truncate -s 10G "${DISK_RAW}"
 
 parted -s "${DISK_RAW}" mklabel msdos
-parted -s "${DISK_RAW}" mkpart primary ext4 1MiB 64MiB
+parted -s "${DISK_RAW}" mkpart primary fat32 1MiB 64MiB
 parted -s "${DISK_RAW}" set 1 boot on
+parted -s "${DISK_RAW}" set 1 esp on || true
 
 dd if="${PART_IMG}" of="${DISK_RAW}" bs=1M seek=1 conv=notrunc status=none
 
-echo "[INFO] Installing GRUB bootloader..."
+echo "[INFO] Installing BIOS GRUB bootloader..."
 CORE_IMG="${BUILD_DIR}/core.img"
 grub-mkimage -O i386-pc -o "${CORE_IMG}" -p "(hd0,msdos1)/boot/grub" \
-    biosdisk part_msdos ext2 multiboot normal configfile serial terminfo
+    biosdisk part_msdos fat ext2 multiboot normal configfile serial terminfo
 dd if=/usr/lib/grub/i386-pc/boot.img of="${DISK_RAW}" bs=446 count=1 conv=notrunc status=none
 dd if="${CORE_IMG}" of="${DISK_RAW}" bs=512 seek=1 conv=notrunc status=none
 
@@ -117,6 +128,7 @@ fi
 gcloud compute images create "${IMAGE_NAME}" \
     --project="${GCP_PROJECT}" \
     --source-uri="${GCS_TARGET}" \
+    --guest-os-features=UEFI_COMPATIBLE,GVNIC \
     --labels="run=${UKG_RUN}"
 
 echo "[SUCCESS] Created GCP image: ${IMAGE_NAME}"

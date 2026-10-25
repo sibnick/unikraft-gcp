@@ -1,0 +1,7 @@
+config LIBGVE
+	bool "gve: Google Virtual Ethernet (gVNIC) driver"
+	depends on LIBUKBUS_PCI
+	depends on LIBUKNETDEV
+	select LIBUKSGLIST
+	help
+		Google Virtual Ethernet (gVNIC) driver for Google Cloud third-generation and newer VMs.
