@@ -19,8 +19,10 @@ the captured serial log for these exact tokens.
 | :--- | :--- | :--- |
 | `GATE_BOOT_PASS` | Unikernel banner visible in GCP serial log. Phase A1 done | `4395182d17` |
 | `GATE_VIRTIO_PASS` | virtio-net PCI device probed and configured. Phase A2 done | `a5504bc848` |
-| `GATE_PING_PASS` | Two instances exchange ICMP. Phase A3 first half | `84e256b934` |
-| `GATE_NET_PASS` | networkload bidirectional check passes. Phase A3 done | `84e256b934` |
+| `GATE_PING_PASS` | Two instances exchange ICMP. Phase A3 or B3 first half | `84e256b934`, `9374183aab` |
+| `GATE_NET_PASS` | networkload bidirectional check passes. Phase A3 or B3 done | `84e256b934`, `9374183aab` |
+| `GATE_GVE_ADMINQ_PASS` | gve PCI device probed and Admin Queue describes device. Phase B1 done | `e64aa83ff1` |
+| `GATE_GVE_PASS` | gve queues created and uk_netdev interface configured. Phase B2 done | `a1c1337265` |
 | `GATE_FAIL` | Any gate failed. Follow with the failing step name | current ticket |
 
 A run is valid only when the log shows the expected marker and the
@@ -64,12 +66,17 @@ Do not report a pass without the stored serial log.
 ## 5. Phase Order
 
 1. A1 (ticket `4395182d17`): stock helloworld boots from a custom
-   image; banner and `GATE_BOOT_PASS` in the serial log.
-2. A2 (ticket `a5504bc848`): record virtio probe lines; confirm the
-   transitional device binds; file any core change upstream.
-3. A3 (ticket `84e256b934`): two-instance ping and networkload; then
-   the teardown audit passes.
-4. B1 (ticket `e64aa83ff1`): starts only after A3 closes.
+   image. The serial log shows the banner and `GATE_BOOT_PASS`.
+2. A2 (ticket `a5504bc848`): record virtio probe lines and confirm the
+   transitional device binds.
+3. A3 (ticket `84e256b934`): two-instance ping and networkload pass,
+   then the teardown audit passes.
+4. B1 (ticket `e64aa83ff1`): boot custom UEFI GVNIC image on a third
+   generation VM and verify `GATE_GVE_ADMINQ_PASS`.
+5. B2 (ticket `a1c1337265`): configure gve queues and `uk_netdev`
+   interface, and verify `GATE_GVE_PASS`.
+6. B3 (ticket `9374183aab`): two-instance ping and networkload over
+   gVNIC pass on third generation VMs, then the teardown audit passes.
 
 One agent drives one gate at a time. The full lifecycle is in
 `AGENTS.md`.
