@@ -209,6 +209,32 @@ struct gve_adminq_create_tx_queue {
 	uint8_t padding[4];
 } __attribute__((packed));
 
+#define GVE_RAW_ADDRESSING_QPL_ID	0xFFFFFFFFU
+#define GVE_DEFAULT_RX_BUFFER_SIZE	2048U
+#define GVE_RX_PAD			2U
+#define GVE_RX_BUF_THRESH_DQO		32U
+#define GVE_NUM_PTYPES			1024U
+
+struct gve_irq_db {
+	uint32_t index;
+	uint8_t reserved[60];
+} __attribute__((packed, aligned(64)));
+
+struct gve_queue_resources {
+	uint32_t db_index;
+	uint32_t counter_index;
+	uint8_t reserved[56];
+} __attribute__((packed, aligned(64)));
+
+struct gve_ptype_entry {
+	uint8_t l3_type;
+	uint8_t l4_type;
+} __attribute__((packed));
+
+struct gve_ptype_lut {
+	struct gve_ptype_entry ptypes[GVE_NUM_PTYPES];
+} __attribute__((packed));
+
 struct gve_adminq_create_rx_queue {
 	uint32_t queue_id;
 	uint32_t index;
@@ -222,7 +248,9 @@ struct gve_adminq_create_rx_queue {
 	uint16_t packet_buffer_size;
 	uint16_t rx_buff_ring_size;
 	uint8_t enable_rsc;
-	uint8_t padding[5];
+	uint8_t padding1;
+	uint16_t header_buffer_size;
+	uint8_t padding2[2];
 } __attribute__((packed));
 
 struct gve_adminq_destroy_tx_queue {
@@ -237,6 +265,11 @@ struct gve_adminq_set_driver_parameter {
 	uint32_t parameter_type;
 	uint8_t reserved[4];
 	uint64_t parameter_value;
+} __attribute__((packed));
+
+struct gve_adminq_get_ptype_map {
+	uint64_t ptype_map_len;
+	uint64_t ptype_map_addr;
 } __attribute__((packed));
 
 struct gve_adminq_verify_driver_compatibility {
@@ -258,10 +291,318 @@ union gve_adminq_command {
 			struct gve_adminq_register_page_list reg_page_list;
 			struct gve_adminq_unregister_page_list unreg_page_list;
 			struct gve_adminq_set_driver_parameter set_driver_param;
+			struct gve_adminq_get_ptype_map get_ptype_map;
 			struct gve_adminq_verify_driver_compatibility verify_driver_compatibility;
 		};
 	} __attribute__((packed));
 	uint8_t reserved[64];
 } __attribute__((packed));
+
+/* GQI datapath descriptors (big-endian fields) */
+#define GVE_TXF_STD		0x10U
+#define GVE_TXD_STD		GVE_TXF_STD
+
+struct gve_tx_pkt_desc {
+	uint8_t type_flags;
+	uint8_t checksum_offset;
+	uint8_t l4_csum_offset;
+	uint8_t desc_cnt;
+	uint16_t len;
+	uint16_t seg_len;
+	uint64_t addr;
+} __attribute__((packed));
+
+struct gve_tx_mtd_desc {
+	uint8_t type_flags;
+	uint8_t path_state;
+	uint16_t reserved0;
+	uint32_t path_hash;
+	uint64_t reserved1;
+} __attribute__((packed));
+
+struct gve_tx_seg_desc {
+	uint8_t type_flags;
+	uint8_t l3_offset;
+	uint16_t reserved;
+	uint16_t mss;
+	uint16_t seg_len;
+	uint64_t addr;
+} __attribute__((packed));
+
+union gve_tx_desc {
+	struct gve_tx_pkt_desc pkt;
+	struct gve_tx_mtd_desc mtd;
+	struct gve_tx_seg_desc seg;
+} __attribute__((packed));
+
+union gve_rx_data_slot {
+	uint64_t qpl_offset;
+	uint64_t addr;
+} __attribute__((packed));
+
+#define GVE_RXF_FRAG		(1U << 3)
+#define GVE_RXF_IPV4		(1U << 4)
+#define GVE_RXF_IPV6		(1U << 5)
+#define GVE_RXF_TCP		(1U << 6)
+#define GVE_RXF_UDP		(1U << 7)
+#define GVE_RXF_ERR		(1U << 8)
+#define GVE_RXFLG(x)		__builtin_bswap16(x)
+#define GVE_SEQNO(x)		((uint8_t)(__builtin_bswap16(x) & 0x7U))
+
+static inline uint8_t gve_next_seqno(uint8_t seq)
+{
+	return (seq + 1U == 8U) ? 1U : (uint8_t)(seq + 1U);
+}
+
+struct gve_rx_desc {
+	uint8_t padding[48];
+	uint32_t rss_hash;
+	uint16_t mss;
+	uint16_t reserved;
+	uint8_t hdr_len;
+	uint8_t hdr_off;
+	uint16_t csum;
+	uint16_t len;
+	uint16_t flags_seq;
+} __attribute__((packed, aligned(64)));
+
+/* DQO datapath descriptors (little-endian fields) */
+#define GVE_TX_PKT_DESC_DTYPE_DQO		0xcU
+#define GVE_TX_GENERAL_CTX_DESC_DTYPE_DQO	0x4U
+
+#define GVE_COMPL_TYPE_DQO_PKT			0x2U
+#define GVE_COMPL_TYPE_DQO_DESC			0x4U
+#define GVE_COMPL_TYPE_DQO_MISS			0x1U
+#define GVE_COMPL_TYPE_DQO_REINJECTION		0x3U
+
+struct gve_tx_pkt_desc_dqo {
+	uint64_t buf_addr;
+	uint8_t dtype:5;
+	uint8_t end_of_packet:1;
+	uint8_t checksum_offload_enable:1;
+	uint8_t report_event:1;
+	uint8_t reserved0;
+	uint16_t reserved1;
+	uint16_t compl_tag;
+	uint16_t buf_size:14;
+	uint16_t reserved2:2;
+} __attribute__((packed));
+
+struct gve_tx_general_context_desc_dqo {
+	uint8_t reserved0[4];
+	struct {
+		uint32_t version:8;
+		uint32_t path_hash:24;
+	} path_hash;
+	uint16_t l4_csum_offset:7;
+	uint16_t l4_csum_start:7;
+	uint16_t reserved1:2;
+	uint16_t reserved2;
+	uint8_t dtype:5;
+	uint8_t cmd_type:3;
+	uint8_t reserved3;
+	uint16_t reserved4;
+} __attribute__((packed));
+
+struct gve_tx_compl_desc {
+	uint16_t id:11;
+	uint16_t type:3;
+	uint16_t reserved0:1;
+	uint16_t generation:1;
+	union {
+		uint16_t completion_tag;
+		uint16_t tx_head;
+	};
+	uint32_t reserved1;
+} __attribute__((packed));
+
+struct gve_rx_desc_dqo {
+	uint16_t buf_id;
+	uint16_t reserved0;
+	uint32_t reserved1;
+	uint64_t buf_addr;
+	uint64_t header_buf_addr;
+	uint64_t reserved2;
+} __attribute__((packed, aligned(32)));
+
+struct gve_rx_compl_desc_dqo {
+	uint8_t rxdid:4;
+	uint8_t reserved0:4;
+	uint8_t l3_l4_processed:3;
+	uint8_t csum_ip_err:1;
+	uint8_t csum_l4_err:1;
+	uint8_t csum_external_ip_err:1;
+	uint8_t csum_external_udp_err:1;
+	uint8_t status_error1:1;
+	uint8_t status_error2;
+	uint16_t ptype:10;
+	uint16_t ip_hdr_err:1;
+	uint16_t ipv6_ex_add:1;
+	uint16_t rx_error:1;
+	uint16_t reserved1:3;
+	uint16_t packet_len:14;
+	uint16_t end_of_packet:1;
+	uint16_t header_buffer_overflow:1;
+	uint16_t hdr_len:10;
+	uint16_t rsc:1;
+	uint16_t split_header:1;
+	uint16_t reserved2:1;
+	uint16_t descriptor_done:1;
+	uint16_t generation:1;
+	uint16_t loop_back:1;
+	uint8_t rss_hash_type:4;
+	uint8_t l3_offset:4;
+	uint8_t ts_sub_ns_low:7;
+	uint8_t ts_low_present:1;
+	uint16_t buf_id;
+	union {
+		uint16_t raw_csum;
+		uint16_t rsc_seg_len;
+	};
+	uint32_t hash;
+	uint32_t reserved3;
+	uint32_t reserved4;
+	uint32_t ts;
+} __attribute__((packed, aligned(32)));
+
+_Static_assert(sizeof(struct gve_registers) == 42, "gve_registers size");
+_Static_assert(sizeof(struct gve_driver_info) == 304, "gve_driver_info size");
+_Static_assert(sizeof(struct gve_device_descriptor) == 40, "gve_device_descriptor size");
+_Static_assert(sizeof(struct gve_device_option) == 8, "gve_device_option size");
+_Static_assert(sizeof(struct gve_irq_db) == 64, "gve_irq_db size");
+_Static_assert(sizeof(struct gve_queue_resources) == 64, "gve_queue_resources size");
+_Static_assert(sizeof(struct gve_ptype_lut) == 2048, "gve_ptype_lut size");
+_Static_assert(sizeof(struct gve_adminq_configure_device_resources) == 40, "configure_device_resources size");
+_Static_assert(sizeof(struct gve_adminq_register_page_list) == 24, "register_page_list size");
+_Static_assert(sizeof(struct gve_adminq_create_tx_queue) == 48, "create_tx_queue size");
+_Static_assert(sizeof(struct gve_adminq_create_rx_queue) == 56, "create_rx_queue size");
+_Static_assert(sizeof(struct gve_adminq_get_ptype_map) == 16, "get_ptype_map size");
+_Static_assert(sizeof(union gve_adminq_command) == 64, "gve_adminq_command size");
+_Static_assert(sizeof(union gve_tx_desc) == 16, "gve_tx_desc size");
+_Static_assert(sizeof(union gve_rx_data_slot) == 8, "gve_rx_data_slot size");
+_Static_assert(sizeof(struct gve_rx_desc) == 64, "gve_rx_desc size");
+_Static_assert(sizeof(struct gve_tx_pkt_desc_dqo) == 16, "gve_tx_pkt_desc_dqo size");
+_Static_assert(sizeof(struct gve_tx_general_context_desc_dqo) == 16, "gve_tx_general_context_desc_dqo size");
+_Static_assert(sizeof(struct gve_tx_compl_desc) == 8, "gve_tx_compl_desc size");
+_Static_assert(sizeof(struct gve_rx_desc_dqo) == 32, "gve_rx_desc_dqo size");
+_Static_assert(sizeof(struct gve_rx_compl_desc_dqo) == 32, "gve_rx_compl_desc_dqo size");
+
+static inline void gve_adminq_fill_configure_resources(
+	union gve_adminq_command *cmd,
+	uint64_t counter_array_paddr,
+	uint64_t irq_db_paddr,
+	uint32_t num_counters,
+	uint32_t num_irq_dbs,
+	uint8_t queue_format)
+{
+	__builtin_memset(cmd, 0, sizeof(*cmd));
+	cmd->opcode = __builtin_bswap32(GVE_ADMINQ_CONFIGURE_DEVICE_RESOURCES);
+	cmd->configure_device_resources.counter_array =
+		__builtin_bswap64(counter_array_paddr);
+	cmd->configure_device_resources.irq_db_addr =
+		__builtin_bswap64(irq_db_paddr);
+	cmd->configure_device_resources.num_counters =
+		__builtin_bswap32(num_counters);
+	cmd->configure_device_resources.num_irq_dbs =
+		__builtin_bswap32(num_irq_dbs);
+	cmd->configure_device_resources.irq_db_stride =
+		__builtin_bswap32(sizeof(struct gve_irq_db));
+	cmd->configure_device_resources.ntfy_blk_msix_base_idx =
+		__builtin_bswap32(0);
+	cmd->configure_device_resources.queue_format = queue_format;
+}
+
+static inline void gve_adminq_fill_create_tx_queue(
+	union gve_adminq_command *cmd,
+	uint32_t queue_id,
+	uint64_t q_res_paddr,
+	uint64_t tx_ring_paddr,
+	uint32_t qpl_id,
+	uint32_t ntfy_id,
+	uint64_t tx_comp_ring_paddr,
+	uint16_t tx_ring_size,
+	uint16_t tx_comp_ring_size)
+{
+	__builtin_memset(cmd, 0, sizeof(*cmd));
+	cmd->opcode = __builtin_bswap32(GVE_ADMINQ_CREATE_TX_QUEUE);
+	cmd->create_tx_queue.queue_id = __builtin_bswap32(queue_id);
+	cmd->create_tx_queue.queue_resources_addr =
+		__builtin_bswap64(q_res_paddr);
+	cmd->create_tx_queue.tx_ring_addr =
+		__builtin_bswap64(tx_ring_paddr);
+	cmd->create_tx_queue.queue_page_list_id =
+		__builtin_bswap32(qpl_id);
+	cmd->create_tx_queue.ntfy_id = __builtin_bswap32(ntfy_id);
+	cmd->create_tx_queue.tx_comp_ring_addr =
+		__builtin_bswap64(tx_comp_ring_paddr);
+	cmd->create_tx_queue.tx_ring_size =
+		__builtin_bswap16(tx_ring_size);
+	cmd->create_tx_queue.tx_comp_ring_size =
+		__builtin_bswap16(tx_comp_ring_size);
+}
+
+static inline void gve_adminq_fill_create_rx_queue(
+	union gve_adminq_command *cmd,
+	uint32_t queue_id,
+	uint32_t index,
+	uint32_t ntfy_id,
+	uint64_t q_res_paddr,
+	uint64_t rx_desc_ring_paddr,
+	uint64_t rx_data_ring_paddr,
+	uint32_t qpl_id,
+	uint16_t rx_ring_size,
+	uint16_t packet_buf_size,
+	uint16_t rx_buff_ring_size)
+{
+	__builtin_memset(cmd, 0, sizeof(*cmd));
+	cmd->opcode = __builtin_bswap32(GVE_ADMINQ_CREATE_RX_QUEUE);
+	cmd->create_rx_queue.queue_id = __builtin_bswap32(queue_id);
+	cmd->create_rx_queue.index = __builtin_bswap32(index);
+	cmd->create_rx_queue.ntfy_id = __builtin_bswap32(ntfy_id);
+	cmd->create_rx_queue.queue_resources_addr =
+		__builtin_bswap64(q_res_paddr);
+	cmd->create_rx_queue.rx_desc_ring_addr =
+		__builtin_bswap64(rx_desc_ring_paddr);
+	cmd->create_rx_queue.rx_data_ring_addr =
+		__builtin_bswap64(rx_data_ring_paddr);
+	cmd->create_rx_queue.queue_page_list_id =
+		__builtin_bswap32(qpl_id);
+	cmd->create_rx_queue.rx_ring_size =
+		__builtin_bswap16(rx_ring_size);
+	cmd->create_rx_queue.packet_buffer_size =
+		__builtin_bswap16(packet_buf_size);
+	cmd->create_rx_queue.rx_buff_ring_size =
+		__builtin_bswap16(rx_buff_ring_size);
+	cmd->create_rx_queue.enable_rsc = 0;
+}
+
+static inline void gve_dqo_fill_tx_pkt_desc(
+	struct gve_tx_pkt_desc_dqo *desc,
+	uint64_t buf_addr,
+	uint16_t compl_tag,
+	uint16_t buf_size)
+{
+	__builtin_memset(desc, 0, sizeof(*desc));
+	desc->buf_addr = buf_addr;
+	desc->dtype = GVE_TX_PKT_DESC_DTYPE_DQO;
+	desc->end_of_packet = 1;
+	desc->checksum_offload_enable = 0;
+	desc->report_event = 1;
+	desc->compl_tag = compl_tag;
+	desc->buf_size = buf_size & 0x3fffU;
+}
+
+static inline void gve_gqi_fill_tx_pkt_desc(
+	union gve_tx_desc *desc,
+	uint64_t addr,
+	uint16_t len)
+{
+	__builtin_memset(desc, 0, sizeof(*desc));
+	desc->pkt.type_flags = GVE_TXD_STD;
+	desc->pkt.desc_cnt = 1;
+	desc->pkt.len = __builtin_bswap16(len);
+	desc->pkt.seg_len = __builtin_bswap16(len);
+	desc->pkt.addr = __builtin_bswap64(addr);
+}
 
 #endif /* __UK_DRV_GVE_H__ */
