@@ -82,8 +82,7 @@ for z in ${ZONE_LIST}; do
         --network-interface=nic-type=GVNIC,no-address \
         --image="${IMAGE_NAME}" \
         --tags=ukg-vm \
-        --labels="run=${UKG_RUN}" \
-        --disk-labels="run=${UKG_RUN}"; then
+        --labels="run=${UKG_RUN}"; then
         CREATED_ZONE="${z}"
         GCP_ZONE="${z}"
         break

@@ -74,9 +74,7 @@ gcloud compute instances create "${INSTANCE_NAME}" \
     --network-interface=nic-type=GVNIC,no-address \
     --image="${IMAGE_NAME}" \
     --tags=ukg-vm \
-    --labels="run=${UKG_RUN}" \
-    --disk-labels="run=${UKG_RUN}"
-
+    --labels="run=${UKG_RUN}"
 echo "[INFO] Polling serial console output for GATE_GVE_ADMINQ_PASS..."
 ADMINQ_PASS=0
 for i in $(seq 1 40); do

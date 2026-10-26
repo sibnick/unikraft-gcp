@@ -110,9 +110,7 @@ gcloud compute instances create "${SRV_NAME}" \
     --private-network-ip="${SRV_IP}" \
     --no-address \
     --tags=ukg-vm \
-    --labels="run=${UKG_RUN}" \
-    --disk-labels="run=${UKG_RUN}"
-
+    --labels="run=${UKG_RUN}"
 sleep 5
 
 # 6. Launch client instance
@@ -125,9 +123,7 @@ gcloud compute instances create "${CLI_NAME}" \
     --private-network-ip="${CLI_IP}" \
     --no-address \
     --tags=ukg-vm \
-    --labels="run=${UKG_RUN}" \
-    --disk-labels="run=${UKG_RUN}"
-
+    --labels="run=${UKG_RUN}"
 # 7. Poll serial console output
 echo "[INFO] Polling serial console output for Phase A3 gate markers..."
 PING_PASS=0

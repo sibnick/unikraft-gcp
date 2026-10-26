@@ -123,8 +123,7 @@ for z in ${ZONE_LIST}; do
         --network-interface="nic-type=GVNIC,no-address,private-network-ip=${SRV_IP}" \
         --image="${SRV_IMG}" \
         --tags=ukg-vm \
-        --labels="run=${UKG_RUN}" \
-        --disk-labels="run=${UKG_RUN}"; then
+        --labels="run=${UKG_RUN}"; then
 
         sleep 8
 
@@ -136,8 +135,7 @@ for z in ${ZONE_LIST}; do
             --network-interface="nic-type=GVNIC,no-address,private-network-ip=${CLI_IP}" \
             --image="${CLI_IMG}" \
             --tags=ukg-vm \
-            --labels="run=${UKG_RUN}" \
-            --disk-labels="run=${UKG_RUN}"; then
+            --labels="run=${UKG_RUN}"; then
             SELECTED_ZONE="${z}"
             GCP_ZONE="${z}"
             break

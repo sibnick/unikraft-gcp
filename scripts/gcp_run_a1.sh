@@ -63,9 +63,7 @@ gcloud compute instances create "${INSTANCE_NAME}" \
     --image="${IMAGE_NAME}" \
     --no-address \
     --tags=ukg-vm \
-    --labels="run=${UKG_RUN}" \
-    --disk-labels="run=${UKG_RUN}"
-
+    --labels="run=${UKG_RUN}"
 echo "[INFO] Polling serial console output for GATE_BOOT_PASS..."
 BOOT_PASS=0
 for i in $(seq 1 40); do
