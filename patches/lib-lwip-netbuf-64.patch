@@ -1,0 +1,34 @@
+Description: Raise MEMP_NUM_NETBUF to 64 for the sequential (netconn) API
+
+The lwIP default MEMP_NUM_NETBUF is 2. The socket receive path
+(recv_udp in api_msg.c) allocates one struct netbuf per received
+datagram and holds it until the application calls recv(). When the
+socket mailbox holds one netbuf and recv() is copying another, the
+next received datagram finds no free netbuf and lwIP drops it without
+an error. This caused silent UDP datagram loss on the gVNIC path
+(Ticket 9374183aab): the MEMP_NETBUF allocation error count matched
+the lost packet count exactly on both peers.
+
+Size the pool like MEMP_NUM_NETCONN. A struct netbuf is small (about
+40 bytes), so 64 entries cost about 2.5 KB.
+
+--- a/include/lwipopts.h
++++ b/include/lwipopts.h
+@@ -366,7 +366,17 @@
+ #define MEMP_NUM_NETCONN CONFIG_LWIP_NUM_TCPCON
+ #else
+ #define MEMP_NUM_NETCONN 64
+ #endif /* LWIP_TCP */
++/*
++ * Number of struct netbuf entries. The sequential API allocates one
++ * netbuf per received datagram. The netbuf stays allocated until the
++ * application reads the datagram with recv(). The lwIP default of 2 is
++ * too small: when the socket mailbox holds one netbuf and recv() is
++ * copying another, the next received datagram cannot allocate a netbuf
++ * and lwIP drops it without an error. Keep the count aligned with
++ * MEMP_NUM_NETCONN.
++ */
++#define MEMP_NUM_NETBUF 64
+ #else
+ #define LWIP_NETCONN 0
+ #endif

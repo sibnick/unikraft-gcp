@@ -38,7 +38,8 @@ if [ -n "${INSTANCES}" ]; then
     while read -r name zone; do
         [ -z "${name}" ] && continue
         echo "Deleting instance ${name} in ${zone}..."
-        gcloud compute instances delete "${name}" --zone="${zone}" --project="${GCP_PROJECT}" --quiet
+        gcloud compute instances delete "${name}" --zone="${zone}" --project="${GCP_PROJECT}" --quiet \
+            || echo "[WARN] delete failed (already gone?), continuing"
     done <<< "${INSTANCES}"
 else
     echo "No instances found to delete."
@@ -56,7 +57,8 @@ if [ -n "${IMAGES}" ]; then
     while read -r img; do
         [ -z "${img}" ] && continue
         echo "Deleting image ${img}..."
-        gcloud compute images delete "${img}" --project="${GCP_PROJECT}" --quiet
+        gcloud compute images delete "${img}" --project="${GCP_PROJECT}" --quiet \
+            || echo "[WARN] delete failed (already gone?), continuing"
     done <<< "${IMAGES}"
 else
     echo "No images found to delete."
@@ -74,7 +76,8 @@ if [ -n "${DISKS}" ]; then
     while read -r name zone; do
         [ -z "${name}" ] && continue
         echo "Deleting disk ${name} in ${zone}..."
-        gcloud compute disks delete "${name}" --zone="${zone}" --project="${GCP_PROJECT}" --quiet
+        gcloud compute disks delete "${name}" --zone="${zone}" --project="${GCP_PROJECT}" --quiet \
+            || echo "[WARN] delete failed (already gone?), continuing"
     done <<< "${DISKS}"
 else
     echo "No orphaned disks found to delete."
@@ -92,7 +95,8 @@ if [ -n "${RULES}" ]; then
     while read -r rule; do
         [ -z "${rule}" ] && continue
         echo "Deleting firewall rule ${rule}..."
-        gcloud compute firewall-rules delete "${rule}" --project="${GCP_PROJECT}" --quiet
+        gcloud compute firewall-rules delete "${rule}" --project="${GCP_PROJECT}" --quiet \
+            || echo "[WARN] delete failed (already gone?), continuing"
     done <<< "${RULES}"
 else
     echo "No firewall rules found to delete."

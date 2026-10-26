@@ -299,7 +299,7 @@ union gve_adminq_command {
 } __attribute__((packed));
 
 /* GQI datapath descriptors (big-endian fields) */
-#define GVE_TXF_STD		0x10U
+#define GVE_TXF_STD		0x00U
 #define GVE_TXD_STD		GVE_TXF_STD
 
 struct gve_tx_pkt_desc {
@@ -345,7 +345,7 @@ union gve_rx_data_slot {
 #define GVE_RXF_IPV6		(1U << 5)
 #define GVE_RXF_TCP		(1U << 6)
 #define GVE_RXF_UDP		(1U << 7)
-#define GVE_RXF_ERR		(1U << 8)
+#define GVE_RXF_ERR		(1U << 11)
 #define GVE_RXFLG(x)		__builtin_bswap16(x)
 #define GVE_SEQNO(x)		((uint8_t)(__builtin_bswap16(x) & 0x7U))
 
@@ -375,6 +375,9 @@ struct gve_rx_desc {
 #define GVE_COMPL_TYPE_DQO_MISS			0x1U
 #define GVE_COMPL_TYPE_DQO_REINJECTION		0x3U
 
+#define GVE_ITR_NO_UPDATE_DQO			(3U << 3)
+#define GVE_ITR_ENABLE_BIT_DQO			(1U << 0)
+
 struct gve_tx_pkt_desc_dqo {
 	uint64_t buf_addr;
 	uint8_t dtype:5;
@@ -388,20 +391,33 @@ struct gve_tx_pkt_desc_dqo {
 	uint16_t reserved2:2;
 } __attribute__((packed));
 
-struct gve_tx_general_context_desc_dqo {
-	uint8_t reserved0[4];
-	struct {
-		uint32_t version:8;
-		uint32_t path_hash:24;
-	} path_hash;
-	uint16_t l4_csum_offset:7;
-	uint16_t l4_csum_start:7;
-	uint16_t reserved1:2;
-	uint16_t reserved2;
+struct gve_tx_context_cmd_dtype {
 	uint8_t dtype:5;
-	uint8_t cmd_type:3;
-	uint8_t reserved3;
-	uint16_t reserved4;
+	uint8_t tso:1;
+	uint8_t reserved1:2;
+	uint8_t reserved2;
+} __attribute__((packed));
+
+struct gve_tx_general_context_desc_dqo {
+	uint8_t flex4;
+	uint8_t flex5;
+	uint8_t flex6;
+	uint8_t flex7;
+	uint8_t flex8;
+	uint8_t flex9;
+	uint8_t flex10;
+	uint8_t flex11;
+	struct gve_tx_context_cmd_dtype cmd_dtype;
+	uint16_t reserved;
+	uint8_t flex0;
+	uint8_t flex1;
+	uint8_t flex2;
+	uint8_t flex3;
+} __attribute__((packed));
+
+union gve_tx_desc_dqo {
+	struct gve_tx_pkt_desc_dqo pkt;
+	struct gve_tx_general_context_desc_dqo general_ctx;
 } __attribute__((packed));
 
 struct gve_tx_compl_desc {
@@ -426,43 +442,44 @@ struct gve_rx_desc_dqo {
 } __attribute__((packed, aligned(32)));
 
 struct gve_rx_compl_desc_dqo {
-	uint8_t rxdid:4;
-	uint8_t reserved0:4;
-	uint8_t l3_l4_processed:3;
-	uint8_t csum_ip_err:1;
-	uint8_t csum_l4_err:1;
-	uint8_t csum_external_ip_err:1;
-	uint8_t csum_external_udp_err:1;
-	uint8_t status_error1:1;
-	uint8_t status_error2;
-	uint16_t ptype:10;
-	uint16_t ip_hdr_err:1;
-	uint16_t ipv6_ex_add:1;
-	uint16_t rx_error:1;
-	uint16_t reserved1:3;
-	uint16_t packet_len:14;
-	uint16_t end_of_packet:1;
-	uint16_t header_buffer_overflow:1;
-	uint16_t hdr_len:10;
-	uint16_t rsc:1;
-	uint16_t split_header:1;
-	uint16_t reserved2:1;
-	uint16_t descriptor_done:1;
-	uint16_t generation:1;
-	uint16_t loop_back:1;
-	uint8_t rss_hash_type:4;
-	uint8_t l3_offset:4;
-	uint8_t ts_sub_ns_low:7;
-	uint8_t ts_low_present:1;
-	uint16_t buf_id;
+	uint8_t rxdid:4;                  /* Offset 0 [3:0] */
+	uint8_t reserved0:4;              /* Offset 0 [7:4] */
+	uint8_t loopback:1;               /* Offset 1 [0] */
+	uint8_t ipv6_ex_add:1;            /* Offset 1 [1] */
+	uint8_t rx_error:1;               /* Offset 1 [2] */
+	uint8_t reserved1:5;              /* Offset 1 [7:3] */
+	uint16_t packet_type:10;          /* Offset 2..3 [9:0] */
+	uint16_t ip_hdr_err:1;            /* Offset 2..3 [10] */
+	uint16_t udp_len_err:1;           /* Offset 2..3 [11] */
+	uint16_t raw_cs_invalid:1;        /* Offset 2..3 [12] */
+	uint16_t reserved2:3;             /* Offset 2..3 [15:13] */
+	uint16_t packet_len:14;           /* Offset 4..5 [13:0] */
+	uint16_t generation:1;            /* Offset 4..5 [14] */
+	uint16_t buffer_queue_id:1;       /* Offset 4..5 [15] */
+	uint16_t header_len:10;           /* Offset 6..7 [9:0] */
+	uint16_t rsc:1;                   /* Offset 6..7 [10] */
+	uint16_t split_header:1;          /* Offset 6..7 [11] */
+	uint16_t reserved3:4;             /* Offset 6..7 [15:12] */
+	uint8_t descriptor_done:1;        /* Offset 8 [0] */
+	uint8_t end_of_packet:1;          /* Offset 8 [1] */
+	uint8_t header_buffer_overflow:1;/* Offset 8 [2] */
+	uint8_t l3_l4_processed:1;        /* Offset 8 [3] */
+	uint8_t csum_ip_err:1;            /* Offset 8 [4] */
+	uint8_t csum_l4_err:1;            /* Offset 8 [5] */
+	uint8_t csum_external_ip_err:1;   /* Offset 8 [6] */
+	uint8_t csum_external_udp_err:1;  /* Offset 8 [7] */
+	uint8_t status_error1;            /* Offset 9 */
+	uint8_t reserved5;                /* Offset 10 */
+	uint8_t ts_sub_nsecs_low;         /* Offset 11 */
+	uint16_t buf_id;                  /* Offset 12..13 */
 	union {
-		uint16_t raw_csum;
+		uint16_t raw_cs;              /* Offset 14..15 */
 		uint16_t rsc_seg_len;
 	};
-	uint32_t hash;
-	uint32_t reserved3;
-	uint32_t reserved4;
-	uint32_t ts;
+	uint32_t hash;                    /* Offset 16..19 */
+	uint32_t reserved6;               /* Offset 20..23 */
+	uint32_t reserved7;               /* Offset 24..27 */
+	uint32_t ts;                      /* Offset 28..31 */
 } __attribute__((packed, aligned(32)));
 
 _Static_assert(sizeof(struct gve_registers) == 42, "gve_registers size");
@@ -483,6 +500,7 @@ _Static_assert(sizeof(union gve_rx_data_slot) == 8, "gve_rx_data_slot size");
 _Static_assert(sizeof(struct gve_rx_desc) == 64, "gve_rx_desc size");
 _Static_assert(sizeof(struct gve_tx_pkt_desc_dqo) == 16, "gve_tx_pkt_desc_dqo size");
 _Static_assert(sizeof(struct gve_tx_general_context_desc_dqo) == 16, "gve_tx_general_context_desc_dqo size");
+_Static_assert(sizeof(union gve_tx_desc_dqo) == 16, "union gve_tx_desc_dqo size");
 _Static_assert(sizeof(struct gve_tx_compl_desc) == 8, "gve_tx_compl_desc size");
 _Static_assert(sizeof(struct gve_rx_desc_dqo) == 32, "gve_rx_desc_dqo size");
 _Static_assert(sizeof(struct gve_rx_compl_desc_dqo) == 32, "gve_rx_compl_desc_dqo size");
@@ -576,6 +594,13 @@ static inline void gve_adminq_fill_create_rx_queue(
 	cmd->create_rx_queue.enable_rsc = 0;
 }
 
+static inline void gve_dqo_fill_tx_general_ctx_desc(
+	struct gve_tx_general_context_desc_dqo *desc)
+{
+	__builtin_memset(desc, 0, sizeof(*desc));
+	desc->cmd_dtype.dtype = GVE_TX_GENERAL_CTX_DESC_DTYPE_DQO;
+}
+
 static inline void gve_dqo_fill_tx_pkt_desc(
 	struct gve_tx_pkt_desc_dqo *desc,
 	uint64_t buf_addr,
@@ -587,7 +612,7 @@ static inline void gve_dqo_fill_tx_pkt_desc(
 	desc->dtype = GVE_TX_PKT_DESC_DTYPE_DQO;
 	desc->end_of_packet = 1;
 	desc->checksum_offload_enable = 0;
-	desc->report_event = 1;
+	desc->report_event = ((compl_tag & 31U) == 1U) ? 1U : 0U;
 	desc->compl_tag = compl_tag;
 	desc->buf_size = buf_size & 0x3fffU;
 }
