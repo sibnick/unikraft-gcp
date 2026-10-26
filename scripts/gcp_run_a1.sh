@@ -6,6 +6,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# shellcheck source=./lib/gcp_lib.sh
+source "${SCRIPT_DIR}/lib/gcp_lib.sh"
+
 if [ -f "${ROOT_DIR}/.env" ]; then
     # shellcheck source=/dev/null
     source "${ROOT_DIR}/.env"
@@ -13,10 +16,12 @@ fi
 
 GCP_PROJECT="${GCP_PROJECT:-$(gcloud config get-value project 2>/dev/null || true)}"
 GCP_ZONE="${GCP_ZONE:-$(gcloud config get-value compute/zone 2>/dev/null || true)}"
-UKG_RUN="${1:-${UKG_RUN:-ukg-$(date +%m%d-%H%M)}}"
+UKG_RUN="${1:-${UKG_RUN:-$(ukg_default_run_id)}}"
+ukg_validate_run_id "${UKG_RUN}"
+export UKG_RUN
 IMAGE_NAME="${2:-${UKG_RUN}-img}"
 INSTANCE_NAME="${UKG_RUN}-srv"
-SERIAL_LOG="/tmp/${UKG_RUN}-serial.log"
+SERIAL_LOG="$(ukg_mk_serial_log "${UKG_RUN}")"
 
 if [ -z "${GCP_PROJECT}" ]; then
     echo "[ERROR] GCP_PROJECT is not set." >&2
@@ -34,7 +39,13 @@ echo "Zone:     ${GCP_ZONE}"
 echo "Run ID:   ${UKG_RUN}"
 echo "Image:    ${IMAGE_NAME}"
 echo "Instance: ${INSTANCE_NAME}"
+echo "Log:      ${SERIAL_LOG}"
 echo "=================================================="
+
+# Install the teardown trap before the first resource create. Any
+# later error, Ctrl-C, or killed terminal still tears this run down.
+# Export KEEP_RES=1 to keep resources and print the teardown command.
+ukg_install_teardown_trap
 
 # Delete instance if exists (rerunnable requirement)
 if gcloud compute instances describe "${INSTANCE_NAME}" --zone="${GCP_ZONE}" --project="${GCP_PROJECT}" &>/dev/null; then
@@ -43,13 +54,17 @@ if gcloud compute instances describe "${INSTANCE_NAME}" --zone="${GCP_ZONE}" --p
 fi
 
 echo "[INFO] Creating instance ${INSTANCE_NAME} (n1-standard-1)..."
+# The gate reads evidence from the serial console. The VM needs no
+# billable external IPv4 address.
 gcloud compute instances create "${INSTANCE_NAME}" \
     --zone="${GCP_ZONE}" \
     --project="${GCP_PROJECT}" \
     --machine-type=n1-standard-1 \
     --image="${IMAGE_NAME}" \
+    --no-address \
     --tags=ukg-vm \
-    --labels="run=${UKG_RUN}"
+    --labels="run=${UKG_RUN}" \
+    --disk-labels="run=${UKG_RUN}"
 
 echo "[INFO] Polling serial console output for GATE_BOOT_PASS..."
 BOOT_PASS=0
@@ -76,6 +91,6 @@ if [ "${BOOT_PASS}" -eq 1 ]; then
     exit 0
 else
     echo "[FAIL] GATE_BOOT_PASS not found in serial console output!" >&2
-    echo "Run teardown manually with: ./scripts/gcp_teardown.sh ${UKG_RUN}" >&2
+    echo "The teardown trap now deletes this run's resources. Export KEEP_RES=1 before the next run to keep them." >&2
     exit 1
 fi

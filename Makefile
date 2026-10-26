@@ -20,7 +20,9 @@ test-host:
 	@rm -f /tmp/test_gve
 
 test: build
-	@qemu-system-x86_64 -kernel samples/helloworld/build/helloworld_qemu-x86_64 -device virtio-net-pci -nographic
+	@# timeout 60 stops a unikernel that never powers off. Without it
+	@# make test hangs forever. Ticket 4347c2a8e6 N6.
+	@timeout 60 qemu-system-x86_64 -kernel samples/helloworld/build/helloworld_qemu-x86_64 -device virtio-net-pci -nographic
 
 clean:
 	@$(MAKE) -C samples/helloworld clean

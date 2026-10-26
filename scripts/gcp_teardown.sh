@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: BSD-3-Clause
-# Tear down billable Google Cloud resources and run leak audit.
+# Tear down billable Google Cloud resources and run the leak audit.
+# The script is rerunnable. Every delete stays guarded with a
+# "delete if exists" flow. Every list capture is guarded too, so one
+# failed gcloud call cannot abort the script and strand the resource
+# classes that come later. Failures are counted and reported with a
+# non-zero exit code at the end. Tickets: 8c0f80d874 4a7a2ca6f5
+# e3effabf78 (M5) 4347c2a8e6 (N4).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# shellcheck source=./lib/gcp_lib.sh
+source "${SCRIPT_DIR}/lib/gcp_lib.sh"
 
 if [ -f "${ROOT_DIR}/.env" ]; then
     # shellcheck source=/dev/null
@@ -17,6 +26,30 @@ GCP_BUCKET="${GCP_BUCKET:-}"
 
 RUN_ID="${1:-}"
 
+# An empty run id deletes every ukg- resource in the project. A
+# non-empty run id must be a validated run id. Otherwise a loose
+# pattern such as "." matches resources that this project rule must
+# never delete.
+if [ -n "${RUN_ID}" ]; then
+    ukg_validate_run_id "${RUN_ID}"
+    NAME_FILTER="name ~ \"^${RUN_ID}\""
+else
+    NAME_FILTER='name ~ "^ukg-"'
+fi
+
+# One filter style for this whole script: lowercase field name with
+# a double-quoted regex. The audit always covers every ukg- resource,
+# even when the delete pass was scoped to one run id.
+AUDIT_FILTER='name ~ "^ukg-"'
+
+FAILURES=0
+LEAK=0
+
+record_failure() {
+    echo "[WARN] $*" >&2
+    FAILURES=$((FAILURES + 1))
+}
+
 echo "=================================================="
 echo "Google Cloud Teardown & Leak Audit"
 echo "Project: ${GCP_PROJECT}"
@@ -27,131 +60,181 @@ fi
 echo "=================================================="
 
 # 1. Instances
-echo "[INFO] Deleting instances..."
-if [ -n "${RUN_ID}" ]; then
-    INSTANCES=$(gcloud compute instances list --project="${GCP_PROJECT}" --filter="name ~ '^${RUN_ID}'" --format="value(name,zone)")
-else
-    INSTANCES=$(gcloud compute instances list --project="${GCP_PROJECT}" --filter="name ~ '^ukg-'" --format="value(name,zone)")
-fi
-
-if [ -n "${INSTANCES}" ]; then
+delete_instances() {
+    echo "[INFO] Deleting instances..."
+    local list
+    list="$(gcloud compute instances list --project="${GCP_PROJECT}" \
+        --filter="${NAME_FILTER}" --format="value(name,zone)")" \
+        || { record_failure "Could not list instances. Skipping this class."; return 0; }
+    if [ -z "${list}" ]; then
+        echo "No instances found to delete."
+        return 0
+    fi
+    local name zone
     while read -r name zone; do
         [ -z "${name}" ] && continue
         echo "Deleting instance ${name} in ${zone}..."
-        gcloud compute instances delete "${name}" --zone="${zone}" --project="${GCP_PROJECT}" --quiet \
-            || echo "[WARN] delete failed (already gone?), continuing"
-    done <<< "${INSTANCES}"
-else
-    echo "No instances found to delete."
-fi
+        gcloud compute instances delete "${name}" --zone="${zone}" \
+            --project="${GCP_PROJECT}" --quiet \
+            || record_failure "Instance delete failed (already gone?): ${name} in ${zone}"
+    done <<< "${list}"
+}
 
 # 2. Images
-echo "[INFO] Deleting images..."
-if [ -n "${RUN_ID}" ]; then
-    IMAGES=$(gcloud compute images list --project="${GCP_PROJECT}" --no-standard-images --filter="name ~ '^${RUN_ID}'" --format="value(name)")
-else
-    IMAGES=$(gcloud compute images list --project="${GCP_PROJECT}" --no-standard-images --filter="name ~ '^ukg-'" --format="value(name)")
-fi
-
-if [ -n "${IMAGES}" ]; then
+delete_images() {
+    echo "[INFO] Deleting images..."
+    local list
+    list="$(gcloud compute images list --project="${GCP_PROJECT}" --no-standard-images \
+        --filter="${NAME_FILTER}" --format="value(name)")" \
+        || { record_failure "Could not list images. Skipping this class."; return 0; }
+    if [ -z "${list}" ]; then
+        echo "No images found to delete."
+        return 0
+    fi
+    local img
     while read -r img; do
         [ -z "${img}" ] && continue
         echo "Deleting image ${img}..."
         gcloud compute images delete "${img}" --project="${GCP_PROJECT}" --quiet \
-            || echo "[WARN] delete failed (already gone?), continuing"
-    done <<< "${IMAGES}"
-else
-    echo "No images found to delete."
-fi
+            || record_failure "Image delete failed (already gone?): ${img}"
+    done <<< "${list}"
+}
 
 # 3. Disks
-echo "[INFO] Deleting disks..."
-if [ -n "${RUN_ID}" ]; then
-    DISKS=$(gcloud compute disks list --project="${GCP_PROJECT}" --filter="name ~ '^${RUN_ID}'" --format="value(name,zone)")
-else
-    DISKS=$(gcloud compute disks list --project="${GCP_PROJECT}" --filter="name ~ '^ukg-'" --format="value(name,zone)")
-fi
-
-if [ -n "${DISKS}" ]; then
+delete_disks() {
+    echo "[INFO] Deleting disks..."
+    local list
+    list="$(gcloud compute disks list --project="${GCP_PROJECT}" \
+        --filter="${NAME_FILTER}" --format="value(name,zone)")" \
+        || { record_failure "Could not list disks. Skipping this class."; return 0; }
+    if [ -z "${list}" ]; then
+        echo "No orphaned disks found to delete."
+        return 0
+    fi
+    local name zone
     while read -r name zone; do
         [ -z "${name}" ] && continue
         echo "Deleting disk ${name} in ${zone}..."
-        gcloud compute disks delete "${name}" --zone="${zone}" --project="${GCP_PROJECT}" --quiet \
-            || echo "[WARN] delete failed (already gone?), continuing"
-    done <<< "${DISKS}"
-else
-    echo "No orphaned disks found to delete."
-fi
+        gcloud compute disks delete "${name}" --zone="${zone}" \
+            --project="${GCP_PROJECT}" --quiet \
+            || record_failure "Disk delete failed (already gone?): ${name} in ${zone}"
+    done <<< "${list}"
+}
 
 # 4. Firewall rules
-echo "[INFO] Deleting firewall rules..."
-if [ -n "${RUN_ID}" ]; then
-    RULES=$(gcloud compute firewall-rules list --project="${GCP_PROJECT}" --filter="name ~ '^${RUN_ID}'" --format="value(name)")
-else
-    RULES=$(gcloud compute firewall-rules list --project="${GCP_PROJECT}" --filter="name ~ '^ukg-'" --format="value(name)")
-fi
-
-if [ -n "${RULES}" ]; then
+delete_firewall_rules() {
+    echo "[INFO] Deleting firewall rules..."
+    local list
+    list="$(gcloud compute firewall-rules list --project="${GCP_PROJECT}" \
+        --filter="${NAME_FILTER}" --format="value(name)")" \
+        || { record_failure "Could not list firewall rules. Skipping this class."; return 0; }
+    if [ -z "${list}" ]; then
+        echo "No firewall rules found to delete."
+        return 0
+    fi
+    local rule
     while read -r rule; do
         [ -z "${rule}" ] && continue
         echo "Deleting firewall rule ${rule}..."
         gcloud compute firewall-rules delete "${rule}" --project="${GCP_PROJECT}" --quiet \
-            || echo "[WARN] delete failed (already gone?), continuing"
-    done <<< "${RULES}"
-else
-    echo "No firewall rules found to delete."
-fi
+            || record_failure "Firewall delete failed (already gone?): ${rule}"
+    done <<< "${list}"
+}
 
-# 5. Cloud Storage Objects
-if [ -n "${GCP_BUCKET}" ]; then
-    echo "[INFO] Cleaning Cloud Storage objects in gs://${GCP_BUCKET}..."
-    if [ -n "${RUN_ID}" ]; then
-        gcloud storage rm --recursive "gs://${GCP_BUCKET}/${RUN_ID}*" 2>/dev/null || true
-    else
-        gcloud storage rm --recursive "gs://${GCP_BUCKET}/ukg-*" 2>/dev/null || true
+# 5. Cloud Storage objects
+clean_gcs_objects() {
+    if [ -z "${GCP_BUCKET}" ]; then
+        echo "[INFO] GCP_BUCKET is not set. Skipping Cloud Storage cleanup."
+        return 0
     fi
-fi
+    echo "[INFO] Cleaning Cloud Storage objects in gs://${GCP_BUCKET}..."
+    local prefix="ukg-*"
+    if [ -n "${RUN_ID}" ]; then
+        prefix="${RUN_ID}*"
+    fi
+    # A wildcard with no match exits non-zero. That is a normal
+    # "nothing to delete" case here, so no failure is recorded.
+    gcloud storage rm --recursive "gs://${GCP_BUCKET}/${prefix}" 2>/dev/null || true
+}
 
 # 6. Leak Audit per skills/gcloud-compute/SKILL.md Section 5
+audit_class() {
+    local label="$1"
+    shift
+    local out=""
+    if ! out="$("$@" 2>/dev/null)"; then
+        echo "[FAIL] Audit query failed for ${label}. The result is unknown, not clean." >&2
+        LEAK=1
+        record_failure "Audit query failed: ${label}"
+        return 0
+    fi
+    if [ -n "${out}" ]; then
+        echo "[FAIL] Leaked ${label} found:"
+        echo "${out}"
+        LEAK=1
+    else
+        echo "[OK] No leaked ${label}."
+    fi
+}
+
+audit_gcs_objects() {
+    if [ -z "${GCP_BUCKET}" ]; then
+        echo "[SKIP] GCP_BUCKET is not set. Cannot audit Cloud Storage objects."
+        return 0
+    fi
+    local out=""
+    if ! out="$(gcloud storage ls "gs://${GCP_BUCKET}/" 2>/dev/null)"; then
+        echo "[FAIL] Audit query failed for Cloud Storage objects. The result is unknown, not clean." >&2
+        LEAK=1
+        record_failure "Audit query failed: Cloud Storage objects"
+        return 0
+    fi
+    local matches
+    matches="$(printf '%s\n' "${out}" | grep "/ukg-" || true)"
+    if [ -n "${matches}" ]; then
+        echo "[FAIL] Leaked Cloud Storage objects found:"
+        echo "${matches}"
+        LEAK=1
+    else
+        echo "[OK] No leaked Cloud Storage objects."
+    fi
+}
+
+run_leak_audit() {
+    echo ""
+    echo "=================================================="
+    echo "[AUDIT] Running Leak Audit..."
+    echo "=================================================="
+    audit_class "instances" gcloud compute instances list \
+        --project="${GCP_PROJECT}" --filter="${AUDIT_FILTER}" --format="value(name)"
+    audit_class "images" gcloud compute images list \
+        --project="${GCP_PROJECT}" --no-standard-images --filter="${AUDIT_FILTER}" --format="value(name)"
+    audit_class "disks" gcloud compute disks list \
+        --project="${GCP_PROJECT}" --filter="${AUDIT_FILTER}" --format="value(name)"
+    audit_class "global addresses" gcloud compute addresses list \
+        --project="${GCP_PROJECT}" --filter="${AUDIT_FILTER} AND address_type=GLOBAL" --format="value(name)"
+    audit_class "firewall rules" gcloud compute firewall-rules list \
+        --project="${GCP_PROJECT}" --filter="${AUDIT_FILTER}" --format="value(name)"
+    audit_gcs_objects
+}
+
+delete_instances
+delete_images
+delete_disks
+delete_firewall_rules
+clean_gcs_objects
+run_leak_audit
+
 echo ""
-echo "=================================================="
-echo "[AUDIT] Running Leak Audit..."
-echo "=================================================="
-
-LEAK=0
-
-INSTANCES_LEAK=$(gcloud compute instances list --project="${GCP_PROJECT}" --filter='NAME~"^ukg-"' --format="value(name)")
-if [ -n "${INSTANCES_LEAK}" ]; then
-    echo "[FAIL] Leaked instances found:"
-    echo "${INSTANCES_LEAK}"
-    LEAK=1
-fi
-
-IMAGES_LEAK=$(gcloud compute images list --project="${GCP_PROJECT}" --no-standard-images --filter="name ~ '^ukg-'" --format="value(name)")
-if [ -n "${IMAGES_LEAK}" ]; then
-    echo "[FAIL] Leaked images found:"
-    echo "${IMAGES_LEAK}"
-    LEAK=1
-fi
-
-DISKS_LEAK=$(gcloud compute disks list --project="${GCP_PROJECT}" --filter='NAME~"^ukg-"' --format="value(name)")
-if [ -n "${DISKS_LEAK}" ]; then
-    echo "[FAIL] Leaked disks found:"
-    echo "${DISKS_LEAK}"
-    LEAK=1
-fi
-
-RULES_LEAK=$(gcloud compute firewall-rules list --project="${GCP_PROJECT}" --filter='NAME~"^ukg-"' --format="value(name)")
-if [ -n "${RULES_LEAK}" ]; then
-    echo "[FAIL] Leaked firewall rules found:"
-    echo "${RULES_LEAK}"
-    LEAK=1
-fi
-
-if [ "${LEAK}" -eq 0 ]; then
+if [ "${LEAK}" -eq 0 ] && [ "${FAILURES}" -eq 0 ]; then
     echo "[AUDIT PASS] All resource lists empty. Zero leaked resources."
     exit 0
-else
-    echo "[AUDIT FAIL] Leak audit detected remaining resources!" >&2
-    exit 1
 fi
+if [ "${LEAK}" -ne 0 ]; then
+    echo "[AUDIT FAIL] Leak audit detected remaining or unverified resources!" >&2
+fi
+if [ "${FAILURES}" -ne 0 ]; then
+    echo "[TEARDOWN FAIL] ${FAILURES} teardown or audit steps failed." >&2
+    echo "Fix the reported errors and run this script again." >&2
+fi
+exit 1

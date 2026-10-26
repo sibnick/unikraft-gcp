@@ -27,7 +27,11 @@ if [ -x ./fossil ]; then
   FOSSIL="./fossil"
 fi
 
-if [ "$("$FOSSIL" remote-url)" != "off" ]; then
+# A fresh checkout can print nothing here. Treat empty output like
+# "off": there is no sync peer, so do not run fossil sync.
+# Ticket 4347c2a8e6 L5.
+REMOTE_URL="$("$FOSSIL" remote-url 2>/dev/null || true)"
+if [ -n "${REMOTE_URL}" ] && [ "${REMOTE_URL}" != "off" ]; then
   echo "[git-export] fossil sync"
   "$FOSSIL" sync
 fi

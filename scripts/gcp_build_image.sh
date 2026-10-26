@@ -6,6 +6,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# shellcheck source=./lib/gcp_lib.sh
+source "${SCRIPT_DIR}/lib/gcp_lib.sh"
+
 if [ -f "${ROOT_DIR}/.env" ]; then
     # shellcheck source=/dev/null
     source "${ROOT_DIR}/.env"
@@ -14,7 +17,9 @@ fi
 GCP_PROJECT="${GCP_PROJECT:-$(gcloud config get-value project 2>/dev/null || true)}"
 GCP_ZONE="${GCP_ZONE:-$(gcloud config get-value compute/zone 2>/dev/null || true)}"
 GCP_BUCKET="${GCP_BUCKET:-}"
-UKG_RUN="${UKG_RUN:-ukg-$(date +%m%d-%H%M)}"
+UKG_RUN="${UKG_RUN:-$(ukg_default_run_id)}"
+ukg_validate_run_id "${UKG_RUN}"
+export UKG_RUN
 APP_DIR="${1:-${ROOT_DIR}/samples/helloworld}"
 BUILD_DIR="${APP_DIR}/build"
 DISK_RAW="${BUILD_DIR}/disk.raw"
@@ -30,6 +35,15 @@ if [ -z "${GCP_BUCKET}" ]; then
     exit 1
 fi
 
+# Fail fast when the BIOS GRUB modules are missing. Without them the
+# build would upload and register an unbootable 10 GiB image.
+# Install the grub-pc-bin package on the build host. Ticket M4.
+GRUB_PC_DIR="/usr/lib/grub/i386-pc"
+if [ ! -d "${GRUB_PC_DIR}" ]; then
+    echo "[ERROR] ${GRUB_PC_DIR} not found. Install the grub-pc-bin package." >&2
+    exit 1
+fi
+
 echo "[INFO] Run ID: ${UKG_RUN}"
 echo "[INFO] Project: ${GCP_PROJECT}"
 echo "[INFO] Bucket: ${GCP_BUCKET}"
@@ -41,7 +55,9 @@ if [ ! -f "${BUILD_DIR}/.config" ]; then
 fi
 make -C "${APP_DIR}" -j"$(nproc)"
 
-KERNEL_BIN="$(find "${BUILD_DIR}" -maxdepth 1 -type f -name "*_qemu-x86_64" | head -n 1)"
+# -print -quit stops at the first match and exits 0. find piped to
+# head can exit 141 under pipefail. Ticket N1.
+KERNEL_BIN="$(find "${BUILD_DIR}" -maxdepth 1 -type f -name "*_qemu-x86_64" -print -quit)"
 if [ -z "${KERNEL_BIN}" ] || [ ! -f "${KERNEL_BIN}" ]; then
     echo "[ERROR] Kernel binary not found in ${BUILD_DIR}." >&2
     exit 1
@@ -56,8 +72,9 @@ mkdir -p "${STAGING_DIR}/boot/grub/i386-pc"
 mkdir -p "${STAGING_DIR}/EFI/BOOT"
 
 cp "${KERNEL_BIN}" "${STAGING_DIR}/boot/unikraft.elf"
-cp /usr/lib/grub/i386-pc/*.mod "${STAGING_DIR}/boot/grub/i386-pc/" || true
-cp /usr/lib/grub/i386-pc/*.lst "${STAGING_DIR}/boot/grub/i386-pc/" || true
+# The grub-pc dir precheck above guarantees these files exist.
+cp "${GRUB_PC_DIR}"/*.mod "${STAGING_DIR}/boot/grub/i386-pc/"
+cp "${GRUB_PC_DIR}"/*.lst "${STAGING_DIR}/boot/grub/i386-pc/"
 
 cat << GRUB_CFG > "${STAGING_DIR}/boot/grub/grub.cfg"
 set default=0
@@ -102,24 +119,32 @@ echo "[INFO] Installing BIOS GRUB bootloader..."
 CORE_IMG="${BUILD_DIR}/core.img"
 grub-mkimage -O i386-pc -o "${CORE_IMG}" -p "(hd0,msdos1)/boot/grub" \
     biosdisk part_msdos fat ext2 multiboot normal configfile serial terminfo
-dd if=/usr/lib/grub/i386-pc/boot.img of="${DISK_RAW}" bs=446 count=1 conv=notrunc status=none
+dd if="${GRUB_PC_DIR}/boot.img" of="${DISK_RAW}" bs=446 count=1 conv=notrunc status=none
 dd if="${CORE_IMG}" of="${DISK_RAW}" bs=512 seek=1 conv=notrunc status=none
 
 echo "[INFO] Packaging disk image as tar.gz for GCP..."
-DISK_TAR="${BUILD_DIR}/${IMAGE_NAME}-disk.raw.tar.gz"
+# The local tar name and the uploaded object name match on purpose.
+# Ticket N2.
+DISK_TAR="${BUILD_DIR}/${IMAGE_NAME}-disk.tar.gz"
 rm -f "${DISK_TAR}"
-(cd "${BUILD_DIR}" && tar -Szcf "${IMAGE_NAME}-disk.raw.tar.gz" "disk.raw")
+(cd "${BUILD_DIR}" && tar -Szcf "${IMAGE_NAME}-disk.tar.gz" "disk.raw")
 
 GCS_TARGET="gs://${GCP_BUCKET}/${IMAGE_NAME}-disk.tar.gz"
 echo "[INFO] Uploading to ${GCS_TARGET}..."
-if command -v gcloud &>/dev/null; then
-    gcloud storage cp "${DISK_TAR}" "${GCS_TARGET}"
-else
-    gsutil cp "${DISK_TAR}" "${GCS_TARGET}"
-fi
+# gcloud is required by every later step, so no gsutil fallback.
+# Ticket N3.
+gcloud storage cp "${DISK_TAR}" "${GCS_TARGET}"
 
 echo "[INFO] Registering custom GCP image ${IMAGE_NAME}..."
-# Delete image if exists (rerunnable requirement)
+# Replace an image with the same name (rerunnable requirement).
+# Image names are run scoped, and the run id now carries seconds and
+# the PID, so a fresh run never reaches this block. Only an explicit
+# rerun with the same UKG_RUN does.
+# Risk note: gcloud cannot rename or atomically replace an image.
+# The old image is deleted before the new one is created. If the
+# create fails in this window, the run has no image. The teardown
+# trap then deletes the partial run, and a rerun with a fresh run id
+# rebuilds the image. Ticket L6.
 if gcloud compute images describe "${IMAGE_NAME}" --project="${GCP_PROJECT}" &>/dev/null; then
     echo "[INFO] Image ${IMAGE_NAME} already exists. Deleting..."
     gcloud compute images delete "${IMAGE_NAME}" --project="${GCP_PROJECT}" --quiet
