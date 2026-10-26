@@ -38,9 +38,8 @@ ukg_default_run_id() {
 # The default keeps the zones that earlier B-path runs used.
 # Call it after GCP_ZONE is set.
 ukg_zone_list() {
-    # Word splitting here is intended. Do not quote ${zones}.
     local zones="${UKG_ZONES:-${GCP_ZONE:-} us-east4-b us-east4-c us-central1-a us-central1-b}"
-    printf '%s\n' ${zones} | awk 'NF && !seen[$0]++'
+    echo "${zones}" | tr -s '[:space:]' '\n' | awk 'NF && !seen[$0]++'
 }
 
 # Print a fresh private path for a serial console log file.

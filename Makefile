@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # Unikraft on Google Cloud Platform build and validation harness
 
-.PHONY: all prepare build test test-host clean teardown
+.PHONY: all prepare build test test-host lint clean teardown
 
 all: build
 
@@ -18,6 +18,12 @@ test-host:
 	@cc -Wall -Wextra -Werror -std=c11 -Idrivers/gve/include tests/test_gve.c -o /tmp/test_gve
 	@/tmp/test_gve
 	@rm -f /tmp/test_gve
+
+lint:
+	@# Run from scripts/ so ShellCheck resolves the source= directives.
+	@# Older hosts without ShellCheck skip instead of failing the build.
+	@command -v shellcheck >/dev/null || { echo "lint: shellcheck not installed, skipping"; exit 0; }
+	@cd scripts && shellcheck -x *.sh lib/*.sh && echo "lint: shellcheck clean"
 
 test: build
 	@# timeout 60 stops a unikernel that never powers off. Without it
