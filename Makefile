@@ -37,4 +37,15 @@ clean:
 	@rm -rf samples/networkload/build
 
 teardown:
-	@./scripts/gcp_teardown.sh
+	@# The run id is mandatory. A teardown with no run id deletes
+	@# every ukg- resource in the project. Set UKG_TEARDOWN_ALL=1
+	@# to allow that sweep. Ticket f3df948f2c.
+	@if [ -z "$(RUN)" ] && [ "$${UKG_TEARDOWN_ALL:-0}" != "1" ]; then \
+		echo "[ERROR] Missing run id." ; \
+		echo "[ERROR] Usage: make teardown RUN=<run-id>" ; \
+		echo "[ERROR] Example: make teardown RUN=ukg-1026-213005-4242" ; \
+		echo "[ERROR] To sweep every ukg- resource on purpose, run:" ; \
+		echo "[ERROR] UKG_TEARDOWN_ALL=1 make teardown" ; \
+		exit 2 ; \
+	fi
+	@./scripts/gcp_teardown.sh $(RUN)

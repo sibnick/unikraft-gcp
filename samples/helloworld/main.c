@@ -35,6 +35,9 @@ int main(int argc, char *argv[])
 	printf("\n========================================\n");
 	printf("Hello from Unikraft on Google Cloud (Phase A2)!\n");
 	printf("========================================\n");
+	/* Phase A1 boot marker. gcp_run_a1.sh polls this exact
+	 * string on the serial console. Keep it on its own line. */
+	printf("GATE_BOOT_PASS\n");
 
 	count = uk_netdev_count();
 	printf("Probing network devices: count=%u\n", count);

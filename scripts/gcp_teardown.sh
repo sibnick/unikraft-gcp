@@ -6,7 +6,9 @@
 # failed gcloud call cannot abort the script and strand the resource
 # classes that come later. Failures are counted and reported with a
 # non-zero exit code at the end. Tickets: 8c0f80d874 4a7a2ca6f5
-# e3effabf78 (M5) 4347c2a8e6 (N4).
+# e3effabf78 (M5) 4347c2a8e6 (N4) f3df948f2c.
+# Usage: gcp_teardown.sh <run-id>. The run id is mandatory. The
+# project-wide sweep needs the explicit opt-in UKG_TEARDOWN_ALL=1.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,22 +22,35 @@ if [ -f "${ROOT_DIR}/.env" ]; then
     source "${ROOT_DIR}/.env"
 fi
 
-GCP_PROJECT="${GCP_PROJECT:-$(gcloud config get-value project 2>/dev/null || true)}"
-GCP_ZONE="${GCP_ZONE:-$(gcloud config get-value compute/zone 2>/dev/null || true)}"
-GCP_BUCKET="${GCP_BUCKET:-}"
-
 RUN_ID="${1:-}"
 
-# An empty run id deletes every ukg- resource in the project. A
-# non-empty run id must be a validated run id. Otherwise a loose
-# pattern such as "." matches resources that this project rule must
-# never delete.
+# A run id is mandatory. This check runs before any gcloud call, so
+# a wrong invocation cannot touch the project. A non-empty run id
+# must pass validation. Otherwise a loose pattern such as "."
+# matches resources that this project rule must never delete.
+# Ticket f3df948f2c.
 if [ -n "${RUN_ID}" ]; then
     ukg_validate_run_id "${RUN_ID}"
     NAME_FILTER="name ~ \"^${RUN_ID}\""
-else
+elif [ "${UKG_TEARDOWN_ALL:-0}" = "1" ]; then
+    # Explicit opt-in for the project-wide sweep. It deletes every
+    # ukg- resource and storage object in the project.
     NAME_FILTER='name ~ "^ukg-"'
+else
+    echo "[ERROR] Missing run id." >&2
+    echo "[ERROR] A teardown without a run id deletes every" >&2
+    echo "[ERROR] ukg- resource in the project. That can kill a" >&2
+    echo "[ERROR] run owned by another session." >&2
+    echo "[ERROR] Usage: gcp_teardown.sh <run-id>" >&2
+    echo "[ERROR] Example: gcp_teardown.sh ukg-1026-213005-4242" >&2
+    echo "[ERROR] To sweep every ukg- resource on purpose, run:" >&2
+    echo "[ERROR] UKG_TEARDOWN_ALL=1 gcp_teardown.sh" >&2
+    exit 2
 fi
+
+GCP_PROJECT="${GCP_PROJECT:-$(gcloud config get-value project 2>/dev/null || true)}"
+GCP_ZONE="${GCP_ZONE:-$(gcloud config get-value compute/zone 2>/dev/null || true)}"
+GCP_BUCKET="${GCP_BUCKET:-}"
 
 # One filter style for this whole script: lowercase field name with
 # a double-quoted regex. The audit always covers every ukg- resource,
@@ -56,6 +71,10 @@ echo "Project: ${GCP_PROJECT}"
 echo "Zone:    ${GCP_ZONE}"
 if [ -n "${RUN_ID}" ]; then
     echo "Run ID:  ${RUN_ID}"
+elif [ "${UKG_TEARDOWN_ALL:-0}" = "1" ]; then
+    echo "[WARNING] Project-wide sweep active (UKG_TEARDOWN_ALL=1)."
+    echo "[WARNING] This run deletes every ukg- resource in the"
+    echo "[WARNING] project, also from other sessions."
 fi
 echo "=================================================="
 
