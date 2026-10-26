@@ -109,11 +109,20 @@ Use conventional prefixes: `feat(scope):`, `fix(scope):`, `docs:`,
 fossil commit -m "feat(image): add GRUB serial boot recipe [Ticket 4395182d17]"
 ```
 
-> [!CAUTION]
-> The GitHub mirror and the `sibnick.men` sync remote are not created
-> yet. When the owner adds them, follow `skills/fossil-git-sync/SKILL.md`
-> and use the copied `scripts/git_export.sh` helper. Until then,
-> `fossil sync` has no target and is not needed.
+> [!NOTE]
+> Both remotes now exist. The Fossil sync remote is named `sibnick`:
+> `ssh://nikolay@sibnick.men:2222//home/nikolay/Unikraft-GCP.fossil`.
+> Keep the double slash after the port. A single slash makes Fossil
+> send a relative path. Autosync runs on every command while this
+> default is set. Use `fossil remote off` to work offline and
+> `fossil remote sibnick` to resume. A warning about multiple open
+> leaf check-ins on trunk is cosmetic. It names the empty initial
+> check-in of the remote database. Checkouts resolve to the real tip.
+> The Git mirror is `git@github.com:sibnick/unikraft-gcp.git`, wired
+> through the `gitpush` setting. After merging work to trunk, run
+> `scripts/git_export.sh`. It exports the pending check-ins, pushes
+> the mirror, and fixes the mirror index. Follow
+> `skills/fossil-git-sync/SKILL.md` for the full procedure.
 
 ---
 
