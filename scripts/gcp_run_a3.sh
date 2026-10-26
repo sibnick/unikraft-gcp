@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: BSD-3-Clause
 # Launch a two-instance VM pair on Google Cloud and verify traffic for Phase A3.
+# The IP plan and the firewall scope are overridable through the
+# environment or .env. See the variables below. Ticket e3effabf78 M2.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# shellcheck source=./lib/gcp_lib.sh
+source "${SCRIPT_DIR}/lib/gcp_lib.sh"
 
 if [ -f "${ROOT_DIR}/.env" ]; then
     # shellcheck source=/dev/null
@@ -13,7 +18,8 @@ fi
 
 GCP_PROJECT="${GCP_PROJECT:-$(gcloud config get-value project 2>/dev/null || true)}"
 GCP_ZONE="${GCP_ZONE:-$(gcloud config get-value compute/zone 2>/dev/null || true)}"
-UKG_RUN="${1:-${UKG_RUN:-ukg-$(date +%m%d-%H%M)}}"
+UKG_RUN="${1:-${UKG_RUN:-$(ukg_default_run_id)}}"
+ukg_validate_run_id "${UKG_RUN}"
 export UKG_RUN
 
 SRV_NAME="${UKG_RUN}-srv"
@@ -22,14 +28,19 @@ SRV_IMG="${UKG_RUN}-srv-img"
 CLI_IMG="${UKG_RUN}-cli-img"
 FIREWALL_NAME="${UKG_RUN}-allow-internal"
 
-SRV_IP="10.150.0.10"
-CLI_IP="10.150.0.11"
-NETMASK="20"
-GATEWAY="10.150.0.1"
+# IP plan for the run subnet. Custom subnets are regional, so a
+# fallback region needs a different plan. Override all five values
+# together in .env when you change region. Defaults keep the
+# historical us-east4 plan.
+SRV_IP="${UKG_SRV_IP:-10.150.0.10}"
+CLI_IP="${UKG_CLI_IP:-10.150.0.11}"
+NETMASK="${UKG_NETMASK:-20}"
+GATEWAY="${UKG_GATEWAY:-10.150.0.1}"
+SUBNET="${UKG_SUBNET:-10.150.0.0/20}"
 
-SRV_LOG="/tmp/${UKG_RUN}-srv-serial.log"
-CLI_LOG="/tmp/${UKG_RUN}-cli-serial.log"
-COMBINED_LOG="/tmp/${UKG_RUN}-serial.log"
+SRV_LOG="$(ukg_mk_serial_log "${UKG_RUN}-srv")"
+CLI_LOG="$(ukg_mk_serial_log "${UKG_RUN}-cli")"
+COMBINED_LOG="$(ukg_mk_serial_log "${UKG_RUN}")"
 
 if [ -z "${GCP_PROJECT}" ] || [ -z "${GCP_ZONE}" ]; then
     echo "[ERROR] GCP_PROJECT and GCP_ZONE must be set." >&2
@@ -43,7 +54,15 @@ echo "Zone:     ${GCP_ZONE}"
 echo "Run ID:   ${UKG_RUN}"
 echo "Server:   ${SRV_NAME} (${SRV_IP}) image: ${SRV_IMG}"
 echo "Client:   ${CLI_NAME} (${CLI_IP}) image: ${CLI_IMG}"
+echo "Subnet:   ${SUBNET}"
+echo "Logs:     ${SRV_LOG} ${CLI_LOG} ${COMBINED_LOG}"
 echo "=================================================="
+
+# Install the teardown trap before the first resource create. The
+# image builds below already create billable objects. Any later
+# error, Ctrl-C, or killed terminal still tears this run down.
+# Export KEEP_RES=1 to keep resources and print the teardown command.
+ukg_install_teardown_trap
 
 # 1. Build and upload server image
 echo "[INFO] Building server image ${SRV_IMG}..."
@@ -55,15 +74,17 @@ echo "[INFO] Building client image ${CLI_IMG}..."
 "${SCRIPT_DIR}/gcp_build_image.sh" "${ROOT_DIR}/samples/networkload" "${CLI_IMG}" \
     "netdev.ip=${CLI_IP}/${NETMASK}:${GATEWAY} -- role=client peer=${SRV_IP} ip=${CLI_IP}/${NETMASK} gw=${GATEWAY}"
 
-# 3. Create internal firewall rule if missing
+# 3. Create internal firewall rule if missing.
+# Open only what the gate needs: ICMP for the ping half and UDP 9000
+# for the networkload half. The source range is the run subnet only.
 if ! gcloud compute firewall-rules describe "${FIREWALL_NAME}" --project="${GCP_PROJECT}" &>/dev/null; then
     echo "[INFO] Creating internal firewall rule ${FIREWALL_NAME}..."
     gcloud compute firewall-rules create "${FIREWALL_NAME}" \
         --project="${GCP_PROJECT}" \
         --network=default \
         --direction=INGRESS \
-        --allow=icmp,tcp:1-65535,udp:1-65535 \
-        --source-ranges=10.128.0.0/9 \
+        --allow=icmp,udp:9000 \
+        --source-ranges="${SUBNET}" \
         --target-tags=ukg-vm
 fi
 
@@ -79,14 +100,18 @@ fi
 
 # 5. Launch server instance
 echo "[INFO] Launching server instance ${SRV_NAME}..."
+# The gate reads evidence from the serial console and the pair talks
+# inside the VPC. Both VMs need no billable external IPv4 address.
 gcloud compute instances create "${SRV_NAME}" \
     --zone="${GCP_ZONE}" \
     --project="${GCP_PROJECT}" \
     --machine-type=n1-standard-1 \
     --image="${SRV_IMG}" \
     --private-network-ip="${SRV_IP}" \
+    --no-address \
     --tags=ukg-vm \
-    --labels="run=${UKG_RUN}"
+    --labels="run=${UKG_RUN}" \
+    --disk-labels="run=${UKG_RUN}"
 
 sleep 5
 
@@ -98,8 +123,10 @@ gcloud compute instances create "${CLI_NAME}" \
     --machine-type=n1-standard-1 \
     --image="${CLI_IMG}" \
     --private-network-ip="${CLI_IP}" \
+    --no-address \
     --tags=ukg-vm \
-    --labels="run=${UKG_RUN}"
+    --labels="run=${UKG_RUN}" \
+    --disk-labels="run=${UKG_RUN}"
 
 # 7. Poll serial console output
 echo "[INFO] Polling serial console output for Phase A3 gate markers..."
@@ -115,11 +142,11 @@ for i in $(seq 1 60); do
     gcloud compute instances get-serial-port-output "${CLI_NAME}" \
         --zone="${GCP_ZONE}" --project="${GCP_PROJECT}" > "${CLI_LOG}" 2>&1 || true
 
-    if grep -q "GATE_PING_PASS" "${CLI_LOG}" || grep -q "GATE_PING_PASS" "${SRV_LOG}"; then
+    if ukg_gate_ping_pass "${SRV_LOG}" "${CLI_LOG}"; then
         PING_PASS=1
     fi
 
-    if grep -q "GATE_NET_PASS" "${CLI_LOG}" || grep -q "GATE_THROUGHPUT_PASS" "${CLI_LOG}"; then
+    if ukg_gate_net_pass "${SRV_LOG}" "${CLI_LOG}"; then
         NET_PASS=1
     fi
 
@@ -133,7 +160,8 @@ for i in $(seq 1 60); do
 done
 echo ""
 
-# Combine logs for evidence contract
+# Combine logs for evidence contract. Store the file as
+# reports/<run-id>-serial.log in fossil uv.
 {
     echo "=== SERVER SERIAL CONSOLE OUTPUT (${SRV_NAME}) ==="
     cat "${SRV_LOG}" 2>/dev/null || true
@@ -141,6 +169,7 @@ echo ""
     echo "=== CLIENT SERIAL CONSOLE OUTPUT (${CLI_NAME}) ==="
     cat "${CLI_LOG}" 2>/dev/null || true
 } > "${COMBINED_LOG}"
+echo "[INFO] Combined evidence log: ${COMBINED_LOG}"
 
 echo "--- Server Serial Console Output ---"
 cat "${SRV_LOG}" 2>/dev/null || true
@@ -156,6 +185,6 @@ if [ "${PING_PASS}" -eq 1 ] && [ "${NET_PASS}" -eq 1 ]; then
 else
     echo "[FAIL] Missing Phase A3 gate markers in serial console output!" >&2
     echo "PING_PASS=${PING_PASS}, NET_PASS=${NET_PASS}" >&2
-    echo "Run teardown manually with: ./scripts/gcp_teardown.sh ${UKG_RUN}" >&2
+    echo "The teardown trap now deletes this run's resources. Export KEEP_RES=1 before the next run to keep them." >&2
     exit 1
 fi
