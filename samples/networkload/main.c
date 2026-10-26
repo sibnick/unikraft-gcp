@@ -167,9 +167,11 @@ static int do_ping(const char *peer_ip, int timeout_sec)
 					       ret, r->type, r->code, ntohs(r->id), ntohs(r->seq));
 					if (r->type == 0 && r->id == htons(0x1234)) {
 						__nsec rtt_ns = ukplat_monotonic_clock() - send_time;
-						double rtt_ms = (double)rtt_ns / 1000000.0;
-						printf("[PING] Echo reply from %s: seq=%d rtt=%.2f ms\n",
-						       peer_ip, ntohs(r->seq), rtt_ms);
+						uint64_t rtt_us = (uint64_t)rtt_ns / 1000ULL;
+						printf("[PING] Echo reply from %s: seq=%d rtt=%llu.%02llu ms\n",
+						       peer_ip, ntohs(r->seq),
+						       (unsigned long long)(rtt_us / 1000ULL),
+						       (unsigned long long)((rtt_us % 1000ULL) / 10ULL));
 						pass = 1;
 						break;
 					}
@@ -209,7 +211,6 @@ static int run_client(const char *peer_ip, int port, uint32_t count, size_t pkt_
 	uint32_t rx_count = 0;
 	uint64_t total_bytes = 0;
 	__nsec start_ns, end_ns;
-	double duration_s, throughput_mb_s, pps;
 
 	if (pkt_size < sizeof(struct netload_pkt))
 		pkt_size = sizeof(struct netload_pkt);
@@ -275,31 +276,32 @@ static int run_client(const char *peer_ip, int port, uint32_t count, size_t pkt_
 
 		/* Receive echo */
 		for (int attempts = 0; attempts < 15; attempts++) {
-			struct sockaddr_in from;
-			socklen_t from_len = sizeof(from);
-
+			int got_any = 0;
 			poll_stack();
-			ret = recvfrom(fd, rx_buf, pkt_size + 128, MSG_DONTWAIT,
-				       (struct sockaddr *)&from, &from_len);
-			if (ret > 0) {
+			while (1) {
+				struct sockaddr_in from;
+				socklen_t from_len = sizeof(from);
+
+				ret = recvfrom(fd, rx_buf, pkt_size + 128, MSG_DONTWAIT,
+					       (struct sockaddr *)&from, &from_len);
+				if (ret <= 0)
+					break;
 				struct netload_pkt *rx_hdr = (struct netload_pkt *)rx_buf;
-				if (ntohl(rx_hdr->magic) == NETLOAD_MAGIC &&
-				    ntohl(rx_hdr->seq) == seq) {
+				if (ntohl(rx_hdr->magic) == NETLOAD_MAGIC) {
 					rx_count++;
 					total_bytes += (uint64_t)ret * 2; /* bidirectional: TX + RX */
-					break;
+					got_any = 1;
 				}
 			}
-			if (attempts == 5 && rx_count == 0) {
-				sendto(fd, tx_buf, pkt_size, 0,
-				       (struct sockaddr *)&dst, sizeof(dst));
-			}
+			if (got_any)
+				break;
 			sleep_and_poll(2);
 		}
 
 		if (seq % 200 == 0 || seq == count) {
-			printf("[CLIENT] Progress: %u/%u packets echoed (%.1f%%)\n",
-			       rx_count, seq, (double)rx_count * 100.0 / (double)seq);
+			uint32_t pct = (seq > 0) ? (rx_count * 100U / seq) : 0U;
+			printf("[CLIENT] Progress: %u/%u packets echoed (%u%%)\n",
+			       rx_count, seq, pct);
 		}
 	}
 
@@ -312,24 +314,49 @@ static int run_client(const char *peer_ip, int port, uint32_t count, size_t pkt_
 		sleep_and_poll(10);
 	}
 
-	end_ns = ukplat_monotonic_clock();
-	duration_s = (double)(end_ns - start_ns) / 1000000000.0;
-	if (duration_s < 0.001)
-		duration_s = 0.001;
+	/* Drain in-flight echo responses */
+	for (int d = 0; d < 100; d++) {
+		poll_stack();
+		while (1) {
+			struct sockaddr_in from;
+			socklen_t from_len = sizeof(from);
+			ssize_t ret = recvfrom(fd, rx_buf, pkt_size + 128, MSG_DONTWAIT,
+					       (struct sockaddr *)&from, &from_len);
+			if (ret <= 0)
+				break;
+			struct netload_pkt *rx_hdr = (struct netload_pkt *)rx_buf;
+			if (ntohl(rx_hdr->magic) == NETLOAD_MAGIC) {
+				rx_count++;
+				total_bytes += (uint64_t)ret * 2;
+			}
+		}
+		if (rx_count >= count)
+			break;
+		sleep_and_poll(10);
+	}
 
-	throughput_mb_s = ((double)total_bytes) / (duration_s * 1024.0 * 1024.0);
-	pps = (double)rx_count / duration_s;
+	end_ns = ukplat_monotonic_clock();
+	uint64_t duration_ms = (uint64_t)(end_ns - start_ns) / 1000000ULL;
+	if (duration_ms == 0)
+		duration_ms = 1;
+
+	uint64_t throughput_kb_s = (total_bytes * 1000ULL) / (duration_ms * 1024ULL);
+	uint64_t pps_int = ((uint64_t)rx_count * 1000ULL) / duration_ms;
+	uint32_t pct_rx = (count > 0) ? (rx_count * 100U / count) : 0U;
 
 	printf("\n========================================\n");
 	printf("Networkload Client Benchmark Summary:\n");
 	printf("Target:             %s:%d\n", peer_ip, port);
 	printf("Packets sent:       %u\n", count);
-	printf("Packets echoed:     %u (%.2f%% received)\n",
-	       rx_count, (double)rx_count * 100.0 / (double)count);
+	printf("Packets echoed:     %u (%u%% received)\n", rx_count, pct_rx);
 	printf("Total data (bi-dir): %lu bytes\n", (unsigned long)total_bytes);
-	printf("Duration:           %.3f seconds\n", duration_s);
-	printf("Throughput:         %.2f MB/s\n", throughput_mb_s);
-	printf("Packet rate:        %.0f pkts/sec\n", pps);
+	printf("Duration:           %llu.%03llu seconds\n",
+	       (unsigned long long)(duration_ms / 1000ULL),
+	       (unsigned long long)(duration_ms % 1000ULL));
+	printf("Throughput:         %llu.%02llu MB/s\n",
+	       (unsigned long long)(throughput_kb_s / 1024ULL),
+	       (unsigned long long)((throughput_kb_s % 1024ULL) * 100ULL / 1024ULL));
+	printf("Packet rate:        %llu pkts/sec\n", (unsigned long long)pps_int);
 	printf("========================================\n");
 
 	close(fd);
@@ -407,7 +434,7 @@ static int run_server(const char *peer_ip, int port)
 		n = recvfrom(fd, buf, buf_size, MSG_DONTWAIT,
 			     (struct sockaddr *)&cli_addr, &cli_len);
 		if (n <= 0) {
-			sleep_and_poll(5);
+			sleep_and_poll(1);
 			continue;
 		}
 		if (n > 0) {
@@ -454,22 +481,24 @@ static int run_server(const char *peer_ip, int port)
 	}
 
 	if (rx_pkts > 0) {
-		double duration_s = (double)(last_rx_ns - first_rx_ns) / 1000000000.0;
-		double throughput_mb_s, pps;
+		uint64_t duration_ms = (uint64_t)(last_rx_ns - first_rx_ns) / 1000000ULL;
+		if (duration_ms == 0)
+			duration_ms = 1;
 
-		if (duration_s < 0.001)
-			duration_s = 0.001;
-
-		throughput_mb_s = ((double)total_bytes) / (duration_s * 1024.0 * 1024.0);
-		pps = (double)rx_pkts / duration_s;
+		uint64_t throughput_kb_s = (total_bytes * 1000ULL) / (duration_ms * 1024ULL);
+		uint64_t pps_int = ((uint64_t)rx_pkts * 1000ULL) / duration_ms;
 
 		printf("\n========================================\n");
 		printf("Networkload Server Benchmark Summary:\n");
 		printf("Packets echoed:     %u\n", rx_pkts);
 		printf("Total data (bi-dir): %lu bytes\n", (unsigned long)total_bytes);
-		printf("Duration:           %.3f seconds\n", duration_s);
-		printf("Throughput:         %.2f MB/s\n", throughput_mb_s);
-		printf("Packet rate:        %.0f pkts/sec\n", pps);
+		printf("Duration:           %llu.%03llu seconds\n",
+		       (unsigned long long)(duration_ms / 1000ULL),
+		       (unsigned long long)(duration_ms % 1000ULL));
+		printf("Throughput:         %llu.%02llu MB/s\n",
+		       (unsigned long long)(throughput_kb_s / 1024ULL),
+		       (unsigned long long)((throughput_kb_s % 1024ULL) * 100ULL / 1024ULL));
+		printf("Packet rate:        %llu pkts/sec\n", (unsigned long long)pps_int);
 		printf("========================================\n");
 		printf("GATE_NET_PASS\n");
 		printf("GATE_THROUGHPUT_PASS\n");

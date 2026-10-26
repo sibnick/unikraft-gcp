@@ -30,6 +30,7 @@ static void test_struct_sizes(void)
 	assert(sizeof(struct gve_rx_desc) == 64);
 	assert(sizeof(struct gve_tx_pkt_desc_dqo) == 16);
 	assert(sizeof(struct gve_tx_general_context_desc_dqo) == 16);
+	assert(sizeof(union gve_tx_desc_dqo) == 16);
 	assert(sizeof(struct gve_tx_compl_desc) == 8);
 	assert(sizeof(struct gve_rx_desc_dqo) == 32);
 	assert(sizeof(struct gve_rx_compl_desc_dqo) == 32);
@@ -131,18 +132,26 @@ static void test_gqi_datapath_descriptors(void)
 static void test_dqo_datapath_descriptors(void)
 {
 	struct gve_tx_pkt_desc_dqo tx_desc;
+	struct gve_tx_general_context_desc_dqo ctx_desc;
 	struct gve_rx_compl_desc_dqo rx_ring[4];
 	uint32_t head = 0;
 	uint8_t cur_gen = 1;
 	int step;
 
-	gve_dqo_fill_tx_pkt_desc(&tx_desc, 0xdeadbeef000ULL, 42U, 1514U);
+	gve_dqo_fill_tx_general_ctx_desc(&ctx_desc);
+	assert(ctx_desc.cmd_dtype.dtype == GVE_TX_GENERAL_CTX_DESC_DTYPE_DQO);
+
+	gve_dqo_fill_tx_pkt_desc(&tx_desc, 0xdeadbeef000ULL, 1U, 1514U);
 	assert(tx_desc.buf_addr == 0xdeadbeef000ULL);
 	assert(tx_desc.dtype == GVE_TX_PKT_DESC_DTYPE_DQO);
 	assert(tx_desc.end_of_packet == 1U);
 	assert(tx_desc.report_event == 1U);
-	assert(tx_desc.compl_tag == 42U);
+	assert(tx_desc.compl_tag == 1U);
 	assert(tx_desc.buf_size == 1514U);
+
+	gve_dqo_fill_tx_pkt_desc(&tx_desc, 0xdeadbeef000ULL, 42U, 1514U);
+	assert(tx_desc.report_event == 0U);
+	assert(tx_desc.compl_tag == 42U);
 
 	/* Simulate DQO completion ring generation-bit flip across wrap-around */
 	memset(rx_ring, 0, sizeof(rx_ring));

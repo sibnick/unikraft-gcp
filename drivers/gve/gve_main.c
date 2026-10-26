@@ -43,7 +43,7 @@ struct uk_netdev_tx_queue {
 	uint8_t *bounce_bufs;
 
 	/* DQO_RDA rings and state */
-	struct gve_tx_pkt_desc_dqo *dqo_tx_ring;
+	union gve_tx_desc_dqo *dqo_tx_ring;
 	struct gve_tx_compl_desc *dqo_compl_ring;
 	uint32_t dqo_tail;
 	uint32_t dqo_complq_head;
@@ -621,7 +621,7 @@ static struct uk_netdev_tx_queue *gve_netdev_txq_configure(
 
 	if (gdev->queue_format == GVE_DQO_RDA_FORMAT) {
 		size_t tx_ring_sz = align_up_page(
-			(size_t)txq->cnt * sizeof(struct gve_tx_pkt_desc_dqo));
+			(size_t)txq->cnt * sizeof(union gve_tx_desc_dqo));
 		size_t comp_ring_sz;
 
 		txq->comp_cnt = gdev->tx_comp_ring_entries ?
@@ -875,7 +875,22 @@ static int gve_netdev_start(struct uk_netdev *dev)
 	/* Post initial RX buffers via BAR2 doorbell */
 	if (gdev->queue_format == GVE_DQO_RDA_FORMAT) {
 		mmio_write32(&gdev->db_bar2[rx_db_idx],
-			     bswap32(gdev->rxq->dqo_bufq_tail));
+			     gdev->rxq->dqo_bufq_tail);
+
+		if (gdev->irq_db_indices) {
+			if (gdev->irq_db_indices[0].index != 0) {
+				uint32_t irq_db0 = bswap32(gdev->irq_db_indices[0].index);
+
+				mmio_write32(&gdev->db_bar2[irq_db0],
+					     (3U << 3) | 1U);
+			}
+			if (gdev->irq_db_indices[1].index != 0) {
+				uint32_t irq_db1 = bswap32(gdev->irq_db_indices[1].index);
+
+				mmio_write32(&gdev->db_bar2[irq_db1],
+					     (3U << 3) | 1U);
+			}
+		}
 	} else {
 		mmio_write32(&gdev->db_bar2[rx_db_idx],
 			     bswap32(gdev->rxq->gqi_fill_cnt));
@@ -955,9 +970,10 @@ static int gve_netdev_xmit(struct uk_netdev *dev,
 	tx_db_idx = bswap32(queue->q_resources->db_index);
 
 	if (gdev->queue_format == GVE_DQO_RDA_FORMAT) {
-		uint32_t slot = queue->dqo_tail & queue->mask;
+		uint32_t ctx_slot = queue->dqo_tail & queue->mask;
+		uint32_t pkt_slot = (queue->dqo_tail + 1U) & queue->mask;
 		uint8_t *dst = queue->bounce_bufs +
-			       (size_t)slot * GVE_DEFAULT_RX_BUFFER_SIZE;
+			       (size_t)pkt_slot * GVE_DEFAULT_RX_BUFFER_SIZE;
 		uint16_t off = 0;
 
 		gve_poll_dqo_tx_completions(queue);
@@ -967,15 +983,21 @@ static int gve_netdev_xmit(struct uk_netdev *dev,
 			off += iter->len;
 		}
 
-		gve_dqo_fill_tx_pkt_desc(&queue->dqo_tx_ring[slot],
+		if (tot_len < 60) {
+			memset(dst + tot_len, 0, 60 - tot_len);
+			tot_len = 60;
+		}
+
+		gve_dqo_fill_tx_general_ctx_desc(
+			&queue->dqo_tx_ring[ctx_slot].general_ctx);
+		gve_dqo_fill_tx_pkt_desc(&queue->dqo_tx_ring[pkt_slot].pkt,
 					 (uint64_t)(uintptr_t)dst,
-					 (uint16_t)slot,
+					 (uint16_t)pkt_slot,
 					 tot_len);
 		__asm__ __volatile__("mfence" ::: "memory");
 
-		queue->dqo_tail = (queue->dqo_tail + 1U) & queue->mask;
-		mmio_write32(&gdev->db_bar2[tx_db_idx],
-			     bswap32(queue->dqo_tail));
+		queue->dqo_tail = (queue->dqo_tail + 2U) & queue->mask;
+		mmio_write32(&gdev->db_bar2[tx_db_idx], queue->dqo_tail);
 	} else {
 		uint32_t slot = queue->gqi_req & queue->mask;
 		uint8_t *dst;
@@ -996,6 +1018,11 @@ static int gve_netdev_xmit(struct uk_netdev *dev,
 		for (iter = pkt; iter != NULL; iter = iter->next) {
 			memcpy(dst + off, iter->data, iter->len);
 			off += iter->len;
+		}
+
+		if (tot_len < 60) {
+			memset(dst + tot_len, 0, 60 - tot_len);
+			tot_len = 60;
 		}
 
 		gve_gqi_fill_tx_pkt_desc(&queue->gqi_tx_ring[slot], addr, tot_len);
@@ -1074,8 +1101,9 @@ static int gve_netdev_recv(struct uk_netdev *dev,
 
 			queue->dqo_bufq_tail =
 				(queue->dqo_bufq_tail + 1U) & queue->buf_mask;
-			mmio_write32(&gdev->db_bar2[rx_db_idx],
-				     bswap32(queue->dqo_bufq_tail));
+			if ((queue->dqo_bufq_tail & 31U) == 0U)
+				mmio_write32(&gdev->db_bar2[rx_db_idx],
+					     queue->dqo_bufq_tail);
 		}
 
 		if (*pkt == NULL)
