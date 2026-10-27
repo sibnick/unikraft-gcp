@@ -61,14 +61,15 @@ index cae20a5..9cca88c 100644
  LIBLWIP_SRCS-y += $(LIBLWIP_BASE)/init.c|unikraft
  LIBLWIP_SRCS-y += $(LIBLWIP_BASE)/time.c|unikraft
 diff --git a/include/lwipopts.h b/include/lwipopts.h
-index 710c160..db7cb00 100644
+index 710c160..0ec529a 100644
 --- a/include/lwipopts.h
 +++ b/include/lwipopts.h
-@@ -62,7 +62,22 @@ void sys_free(void *ptr);
+@@ -62,7 +62,23 @@ void sys_free(void *ptr);
   */
  #if CONFIG_LWIP_NOTHREADS
  #define NO_SYS 1
-+#if CONFIG_LWIP_PERCORE || !defined(CONFIG_LWIP_PERCORE)
++/* Enable per-core state only when the Kconfig option is set */
++#if CONFIG_LWIP_PERCORE
 +#define LWIP_PERCORE 1
 +#endif
 +/* Single-threaded: there is no inter-task contention to protect */
@@ -87,7 +88,7 @@ index 710c160..db7cb00 100644
  #else  /* CONFIG_LWIP_NOTHREADS */
  #define NO_SYS 0
  #define LWIP_NETIF_LOOPBACK_MULTITHREADING 1
-@@ -253,6 +268,9 @@ void sys_free(void *ptr);
+@@ -253,6 +269,9 @@ void sys_free(void *ptr);
  
  /* enable SO_REUSEADDR option */
  #define SO_REUSE 1
@@ -97,7 +98,23 @@ index 710c160..db7cb00 100644
  #endif /* LWIP_SOCKET */
  
  /**
-@@ -299,7 +317,10 @@ void sys_free(void *ptr);
+@@ -289,8 +308,13 @@ void sys_free(void *ptr);
+  * this at the very last point in this configuration file.
+  */
+ #ifndef PBUF_POOL_SIZE
+-#include <uk/essentials.h> /* MAX */
+-#define PBUF_POOL_SIZE MAX(((TCP_WND + TCP_MSS - 1) / TCP_MSS), 2 * IP_REASS_MAX_PBUFS)
++/*
++ * Plain ternary, not uk/essentials.h MAX. The core checks this
++ * value in #if directives, and a statement-expression macro cannot
++ * be evaluated by the preprocessor. The operands are integer
++ * constants, so the ternary is preprocessor-evaluable.
++ */
++#define PBUF_POOL_SIZE ((((TCP_WND + TCP_MSS - 1) / TCP_MSS) > (2 * IP_REASS_MAX_PBUFS)) ? ((TCP_WND + TCP_MSS - 1) / TCP_MSS) : (2 * IP_REASS_MAX_PBUFS))
+ #endif
+ #ifndef PBUF_POOL_BUFSIZE
+ /* smallest PBUF_POOL_BUFSIZE which satisfies TCP_WND < PBUF_POOL_SIZE * (PBUF_POOL_BUFSIZE - protocol headers) */
+@@ -299,7 +323,10 @@ void sys_free(void *ptr);
  #ifndef MEMP_NUM_PBUF
  #define MEMP_NUM_PBUF ((MEMP_NUM_TCP_PCB * (TCP_SND_QUEUELEN)) / 2)
  #endif
@@ -108,7 +125,7 @@ index 710c160..db7cb00 100644
  #endif /* MEM_USE_POOLS */
  
  /**
-@@ -329,9 +350,12 @@ void sys_free(void *ptr);
+@@ -329,9 +356,12 @@ void sys_free(void *ptr);
  #define LWIP_DHCP 0
  #endif
  
@@ -124,10 +141,20 @@ index 710c160..db7cb00 100644
  #define LWIP_NETCONN 1
  /* maximum number of struct netconn entries, which limits the maximum
   * number of open sockets */
-@@ -340,6 +364,8 @@ void sys_free(void *ptr);
+@@ -340,6 +370,18 @@ void sys_free(void *ptr);
  #else
  #define MEMP_NUM_NETCONN 64
  #endif /* LWIP_TCP */
++/*
++ * Number of struct netbuf entries. The sequential API allocates one
++ * netbuf per received datagram. The netbuf stays allocated until the
++ * application reads the datagram with recv(). The lwIP default of 2 is
++ * too small: when the socket mailbox holds one netbuf and recv() is
++ * copying another, the next received datagram cannot allocate a netbuf
++ * and lwIP drops it without an error. Keep the count aligned with
++ * MEMP_NUM_NETCONN.
++ */
++#define MEMP_NUM_NETBUF 64
 +#else
 +#define LWIP_NETCONN 0
  #endif
@@ -222,10 +249,10 @@ index cd40985..d819503 100644
  }
 +#endif /* CONFIG_LWIP_NOTHREADS */
 diff --git a/sockets.c b/sockets.c
-index 258957f..4a75614 100644
+index 258957f..f2040e8 100644
 --- a/sockets.c
 +++ b/sockets.c
-@@ -483,6 +483,30 @@ lwip_posix_socket_event_callback(struct lwip_sock *sock,
+@@ -483,6 +483,32 @@ lwip_posix_socket_event_callback(struct lwip_sock *sock,
  	posix_sock_event_assign(sockobj, events);
  }
  
@@ -243,6 +270,8 @@ index 258957f..4a75614 100644
 +	struct lwip_sock *sock;
 +
 +	lwip_fd = _lwip_getfd(file);
++	if (unlikely(lwip_fd < 0))
++		return 0;
 +
 +	sock = lwip_socket_dbg_get_socket(lwip_fd);
 +	if (unlikely(!sock || !sock->conn))
@@ -256,7 +285,7 @@ index 258957f..4a75614 100644
  static void
  lwip_posix_socket_poll_setup(posix_sock *file)
  {
-@@ -529,6 +553,9 @@ static struct posix_socket_ops lwip_posix_socket_ops = {
+@@ -529,6 +555,9 @@ static struct posix_socket_ops lwip_posix_socket_ops = {
  	.write		= lwip_posix_socket_write,
  	.close		= lwip_posix_socket_close,
  	.ioctl		= lwip_posix_socket_ioctl,
@@ -267,7 +296,7 @@ index 258957f..4a75614 100644
  };
  
 diff --git a/uknetdev.c b/uknetdev.c
-index b13c5aa..031bc4b 100644
+index b13c5aa..c03c623 100644
 --- a/uknetdev.c
 +++ b/uknetdev.c
 @@ -92,6 +92,11 @@ struct lwip_netdev_data {
@@ -282,10 +311,18 @@ index b13c5aa..031bc4b 100644
  };
  
  /*
-@@ -106,6 +111,11 @@ UK_CTASSERT((sizeof(struct lwip_netdev_data)) <= CONFIG_UK_NETDEV_SCRATCH_SIZE);
+@@ -106,6 +111,19 @@ UK_CTASSERT((sizeof(struct lwip_netdev_data)) <= CONFIG_UK_NETDEV_SCRATCH_SIZE);
  #define netif_to_uknetdev(nf) \
  	((struct uk_netdev *) (nf)->state)
  
++/*
++ * TODO: report the real link state. The pinned unikraft 0.21 core
++ * exports no link-state getter in uk_netdev, so this stub always
++ * reports link up. The link-down branches in uknetdev_poll() and
++ * uknetdev_init() stay dormant with it. Drivers report link up at
++ * probe, so current devices match this value. Switch the body to a
++ * real uk_netdev link-state call when the core exports one.
++ */
 +static inline int uk_netdev_link_state_get(struct uk_netdev *dev __maybe_unused)
 +{
 +	return 1;
@@ -294,7 +331,7 @@ index b13c5aa..031bc4b 100644
  static uint16_t netif_alloc_rxpkts(void *argp, struct uk_netbuf *nb[],
  				   uint16_t count)
  {
-@@ -301,6 +311,7 @@ static void uknetdev_input(struct uk_netdev *dev,
+@@ -301,6 +319,7 @@ static void uknetdev_input(struct uk_netdev *dev,
  void uknetdev_poll(struct netif *nf)
  {
  	struct uk_netdev *dev;
@@ -302,7 +339,7 @@ index b13c5aa..031bc4b 100644
  
  	UK_ASSERT(nf);
  	/*
-@@ -315,9 +326,60 @@ void uknetdev_poll(struct netif *nf)
+@@ -315,9 +334,60 @@ void uknetdev_poll(struct netif *nf)
  	UK_ASSERT(dev);
  
  	uknetdev_input(dev, 0, nf);
@@ -363,7 +400,7 @@ index b13c5aa..031bc4b 100644
  void uknetdev_poll_all(void)
  {
  	struct netif *nf;
-@@ -330,8 +392,14 @@ void uknetdev_poll_all(void)
+@@ -330,8 +400,14 @@ void uknetdev_poll_all(void)
  	 */
  	NETIF_FOREACH(nf) {
  		if (nf->name[0] == UKNETDEV_NETIF_NAME0
@@ -379,7 +416,7 @@ index b13c5aa..031bc4b 100644
  	}
  }
  
-@@ -485,6 +553,9 @@ err_t uknetdev_init(struct netif *nf)
+@@ -485,6 +561,9 @@ err_t uknetdev_init(struct netif *nf)
  	if (!lwip_data->dev_info.max_rx_queues
  	    || !lwip_data->dev_info.max_tx_queues)
  		return ERR_IF;
@@ -389,7 +426,7 @@ index b13c5aa..031bc4b 100644
  #if CONFIG_LWIP_UKNETDEV_POLLONLY
  	/* Unset receive interrupt support: We force polling mode */
  	lwip_data->dev_info.features &= ~UK_NETDEV_F_RXQ_INTR;
-@@ -583,8 +654,11 @@ err_t uknetdev_init(struct netif *nf)
+@@ -583,8 +662,11 @@ err_t uknetdev_init(struct netif *nf)
  
  	/* Device capabilities */
  	netif_set_flags(nf, (NETIF_FLAG_BROADCAST
