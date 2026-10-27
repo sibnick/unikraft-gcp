@@ -931,11 +931,12 @@ static unsigned int gve_netdev_promiscuous_get(struct uk_netdev *dev __unused)
 }
 
 /*
- * Consume DQO TX completions. A DESC-type completion names the TX
- * ring index that the device still needs. The driver moves dqo_head
- * to that index and reclaims the slots below it. The driver consumes
- * other completion types without reclaim. The step cap bounds one
- * call even if the device writes bogus generations.
+ * Consume DQO TX completions. A DESC-type completion reports the
+ * device TX head in tx_head: the slot after the last descriptor the
+ * device fetched. The driver moves dqo_head to that slot and
+ * reclaims the entries below it. The driver consumes other
+ * completion types without reclaim. The step cap bounds one call
+ * even if the device writes bogus generations.
  */
 static void gve_poll_dqo_tx_completions(struct uk_netdev_tx_queue *queue)
 {
@@ -955,7 +956,7 @@ static void gve_poll_dqo_tx_completions(struct uk_netdev_tx_queue *queue)
 		if (cdesc->type == GVE_COMPL_TYPE_DQO_DESC)
 			queue->dqo_head = gve_ring_advance_head(
 				queue->dqo_head, queue->dqo_tail,
-				queue->cnt, cdesc->id);
+				queue->cnt, cdesc->tx_head);
 
 		queue->dqo_complq_head =
 			(queue->dqo_complq_head + 1U) & queue->comp_mask;
@@ -1022,13 +1023,16 @@ static int gve_netdev_xmit(struct uk_netdev *dev,
 
 		/*
 		 * Reclaim completed slots first. Refuse the send while
-		 * either target slot is still in flight. Writing an
-		 * uncompleted slot would let the device read a mixed
-		 * descriptor.
+		 * the two target slots or the cache-overlap gap are
+		 * not free. Writing an entry the device still fetches
+		 * would let it read a mixed descriptor. The capacity
+		 * bound of cnt - 1 matches num_avail_tx_slots() in
+		 * the Linux gve driver.
 		 */
 		gve_poll_dqo_tx_completions(queue);
 		if (!gve_ring_has_space(queue->dqo_head, queue->dqo_tail,
-					2U, (uint32_t)queue->cnt))
+					GVE_TX_DQO_WRITE_RESERVE,
+					(uint32_t)queue->cnt - 1U))
 			return -ENOSPC;
 
 		ctx_slot = queue->dqo_tail & queue->mask;

@@ -421,20 +421,24 @@ union gve_tx_desc_dqo {
 } __attribute__((packed));
 
 /*
- * DQO TX completion descriptor. Little-endian. The first word packs
- * the ring id in bits 10:0, the completion type in bits 14:12, and
- * the generation bit at 15. Bit 11 is reserved by the device. A
- * DESC-type completion carries the TX ring index that the device
- * still needs. The driver reclaims all ring slots below that index.
+ * DQO TX completion descriptor. Little-endian bitfields, matching
+ * struct gve_tx_compl_desc in the Linux gve driver. In the first
+ * 16-bit word the TX queue id sits at bits 10:0, the completion
+ * type at bits 13:11, and the generation bit at bit 15. Bit 14 is
+ * reserved by the device. The id field names the queue, not a ring
+ * slot. A DESC-type completion reports the device TX head in
+ * tx_head: the ring slot after the last descriptor the device
+ * fetched. The field is __le16 in Linux, so a plain read is correct
+ * on x86. The driver reclaims all ring slots below that index.
  */
 struct gve_tx_compl_desc {
 	uint16_t id:11;
-	uint16_t reserved0:1;
 	uint16_t type:3;
+	uint16_t reserved0:1;
 	uint16_t generation:1;
 	union {
-		uint16_t completion_tag;
-		uint16_t tx_head;
+		uint16_t completion_tag;	/* PKT-type, le16 */
+		uint16_t tx_head;			/* DESC-type, le16 */
 	};
 	uint32_t reserved1;
 } __attribute__((packed));
@@ -667,12 +671,23 @@ static inline int gve_ring_has_space(uint32_t head, uint32_t tail,
 }
 
 /*
+ * Producer reserve for one DQO send: two ring entries for the
+ * context and packet descriptor pair, plus a gap between device
+ * head and driver tail. The gap mirrors GVE_TX_MIN_DESC_PREVENT_
+ * CACHE_OVERLAP in the Linux gve driver: the device fetches
+ * descriptors a few entries ahead of its reported head.
+ */
+#define GVE_TX_DQO_CACHE_GAP		4U
+#define GVE_TX_DQO_WRITE_RESERVE	(2U + GVE_TX_DQO_CACHE_GAP)
+
+/*
  * Move the TX head toward the ring index that the device reports.
- * new_idx is an absolute ring slot index. The helper picks the
- * free-running counter congruent to new_idx between head and tail.
- * It never moves head past tail. A report congruent with the
- * current head advances nothing, so an ambiguous full-ring report
- * keeps the driver on the safe side.
+ * new_idx is the absolute ring slot index from a DESC completion
+ * tx_head field. The helper picks the free-running counter
+ * congruent to new_idx between head and tail. It never moves head
+ * past tail. A report congruent with the current head advances
+ * nothing, so an ambiguous full-ring report keeps the driver on the
+ * safe side.
  */
 static inline uint32_t gve_ring_advance_head(uint32_t head, uint32_t tail,
 					     uint16_t cnt, uint32_t new_idx)

@@ -173,9 +173,14 @@ static void test_dqo_datapath_descriptors(void)
 }
 
 /*
- * Pin the DQO TX completion dtype word: id bits 10:0, type bits 14:12,
- * generation bit 15, bit 11 reserved. The device writes this word in
- * little-endian order. The layout matches the Linux gve driver masks.
+ * Pin the DQO TX completion word layout: queue id bits 10:0, type
+ * bits 13:11, generation bit 15, bit 14 reserved. The device writes
+ * this word in little-endian order. The layout matches the struct
+ * gve_tx_compl_desc bitfields in the Linux gve driver.
+ * Regression for the Path B3 freeze on run ukg-1027-224408-b3f: a
+ * struct with type at bits 14:12 misreads a DESC completion (type
+ * 4) as PKT (type 2), so the driver never reclaims TX slots and the
+ * ring wedges at capacity.
  */
 static void test_dqo_tx_compl_layout(void)
 {
@@ -188,22 +193,47 @@ static void test_dqo_tx_compl_layout(void)
 	u.c.id = 0x2a5U;
 	u.c.type = GVE_COMPL_TYPE_DQO_DESC;
 	u.c.generation = 1U;
-	assert(u.w[0] == (uint16_t)0xc2a5U);
+	/* gen bit 15, type 4 at bits 13:11 (0x2000), id 0x2a5. */
+	assert(u.w[0] == (uint16_t)0xa2a5U);
 	assert(u.c.id == 0x2a5U);
 	assert(u.c.type == GVE_COMPL_TYPE_DQO_DESC);
 	assert(u.c.generation == 1U);
 
-	/* Device value with type PKT (0x2 << 12) and id 1. */
+	/*
+	 * A DESC completion as the device writes it: type 4 at bits
+	 * 13:11, queue id 3. The old struct read bits 14:12 and saw
+	 * type 2 (PKT), which skipped reclaim.
+	 */
 	memset(&u, 0, sizeof(u));
-	u.w[0] = (uint16_t)0x2001U;
+	u.w[0] = (uint16_t)((GVE_COMPL_TYPE_DQO_DESC << 11) | 3U);
+	assert(((u.w[0] >> 12) & 7U) == GVE_COMPL_TYPE_DQO_PKT);
+	assert(u.c.type == GVE_COMPL_TYPE_DQO_DESC);
+	assert(u.c.id == 3U);
+
+	/* Device value with type PKT (0x2 << 11) and id 1. */
+	memset(&u, 0, sizeof(u));
+	u.w[0] = (uint16_t)0x1001U;
 	assert(u.c.generation == 0U);
 	assert(u.c.type == GVE_COMPL_TYPE_DQO_PKT);
 	assert(u.c.id == 1U);
 
-	/* REINJECTION (0x3) must land in bits 14:12, not 13:11. */
+	/* REINJECTION (0x3) must land in bits 13:11, not 14:12. */
 	memset(&u, 0, sizeof(u));
 	u.c.type = GVE_COMPL_TYPE_DQO_REINJECTION;
-	assert(u.w[0] == (uint16_t)0x3000U);
+	assert(u.w[0] == (uint16_t)0x1800U);
+
+	/*
+	 * A DESC completion reports the device head in tx_head, the
+	 * little-endian second word. The id stays a queue number and
+	 * must never be used as a ring index.
+	 */
+	memset(&u, 0, sizeof(u));
+	u.c.type = GVE_COMPL_TYPE_DQO_DESC;
+	u.c.tx_head = 77U;
+	assert(u.w[1] == 77U);
+	assert(u.c.tx_head == 77U);
+	assert(u.c.completion_tag == 77U);
+	assert(u.c.id == 0U);
 }
 
 static void test_ring_size_validation(void)
@@ -227,49 +257,54 @@ static void test_ring_size_validation(void)
 	assert((uint16_t)(0U - 1U) == 0xffffU);
 }
 
-/* DQO writes two entries per packet: one context plus one packet. */
+/*
+ * DQO writes two entries per packet: one context plus one packet.
+ * The producer keeps the Linux gve reserve: two entries plus the
+ * four-entry cache-overlap gap, against a capacity of cnt - 1.
+ */
 static void test_tx_ring_full_refusal_dqo(void)
 {
 	const uint16_t cnt = 16;
+	const uint32_t cap = (uint32_t)cnt - 1U;
 	uint32_t head = 0;
 	uint32_t tail = 0;
 	int sent = 0;
 
-	/* Fill the ring. 16 entries hold 8 two-entry packets. */
-	while (gve_ring_has_space(head, tail, 2U, cnt)) {
-		assert(sent < 8);
+	/* Fill the ring. Entries up to 9 outstanding allow 5 sends. */
+	while (gve_ring_has_space(head, tail, GVE_TX_DQO_WRITE_RESERVE, cap)) {
+		assert(sent < 5);
 		tail += 2U;
 		sent++;
 	}
-	assert(sent == 8);
-	assert(tail == 16U);
-	/* Full ring: tail + 2 must never reach an unreclaimed slot. */
-	assert(!gve_ring_has_space(head, tail, 2U, cnt));
+	assert(sent == 5);
+	assert(tail == 10U);
+	/* No room: tail + 6 must stay inside the cnt - 1 window. */
+	assert(!gve_ring_has_space(head, tail, GVE_TX_DQO_WRITE_RESERVE, cap));
 
 	/*
-	 * The device consumed the whole ring and reports id 0. That
-	 * report is congruent with the current head, so the driver
-	 * keeps head at 0 and still refuses. Safe-side policy.
+	 * The device consumed the whole ring and reports tx_head 0.
+	 * That report is congruent with the current head, so the
+	 * driver keeps head at 0 and still refuses. Safe-side policy.
 	 */
 	head = gve_ring_advance_head(head, tail, cnt, 0U);
 	assert(head == 0U);
-	assert(!gve_ring_has_space(head, tail, 2U, cnt));
+	assert(!gve_ring_has_space(head, tail, GVE_TX_DQO_WRITE_RESERVE, cap));
 
 	/* Device consumed two entries: one packet slot pair frees up. */
 	head = gve_ring_advance_head(head, tail, cnt, 2U);
 	assert(head == 2U);
-	assert(gve_ring_has_space(head, tail, 2U, cnt));
+	assert(gve_ring_has_space(head, tail, GVE_TX_DQO_WRITE_RESERVE, cap));
 	tail += 2U;
-	assert(!gve_ring_has_space(head, tail, 2U, cnt));
+	assert(!gve_ring_has_space(head, tail, GVE_TX_DQO_WRITE_RESERVE, cap));
 
 	/* A report at ring index 4 reclaims linearly: head 2 -> 4. */
 	head = gve_ring_advance_head(head, tail, cnt, 4U);
 	assert(head == 4U);
-	/* A legal lagging report: head 4 -> 15, still behind tail 18. */
-	head = gve_ring_advance_head(head, tail, cnt, 15U);
-	assert(head == 15U);
+	/* A legal lagging report: head 4 -> 11, still behind tail 12. */
+	head = gve_ring_advance_head(head, tail, cnt, 11U);
+	assert(head == 11U);
 	/* Bogus report far ahead: congruence puts it past tail. Clamp. */
-	head = gve_ring_advance_head(head, tail, cnt, 13U);
+	head = gve_ring_advance_head(head, tail, cnt, 10U);
 	assert(head == tail);
 }
 
@@ -303,13 +338,14 @@ static void test_dqo_tx_ring_soak(void)
 			if (drain > tail - dev_done)
 				drain = tail - dev_done;
 			dev_done += drain;
-			/* Device reports its index in a DESC completion. */
+			/* Device reports tx_head in a DESC completion. */
 			head = gve_ring_advance_head(head, tail, cnt,
 						     dev_done & mask);
 			assert(head <= tail);
 		}
 
-		if (!gve_ring_has_space(head, tail, 2U, cnt))
+		if (!gve_ring_has_space(head, tail, GVE_TX_DQO_WRITE_RESERVE,
+					(uint32_t)cnt - 1U))
 			continue;	/* full ring: refuse the send */
 
 		/* Both target slots must be reclaimed before the write. */
