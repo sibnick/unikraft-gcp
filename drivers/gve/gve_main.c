@@ -45,7 +45,8 @@ struct uk_netdev_tx_queue {
 	/* DQO_RDA rings and state */
 	union gve_tx_desc_dqo *dqo_tx_ring;
 	struct gve_tx_compl_desc *dqo_compl_ring;
-	uint32_t dqo_tail;
+	uint32_t dqo_tail;	/* free-running producer entry counter */
+	uint32_t dqo_head;	/* free-running reclaimed entry counter */
 	uint32_t dqo_complq_head;
 	uint8_t dqo_cur_gen_bit;
 
@@ -76,6 +77,7 @@ struct uk_netdev_rx_queue {
 	struct gve_rx_compl_desc_dqo *dqo_complq_ring;
 	uint8_t *dqo_rx_bufs;
 	uint32_t dqo_bufq_tail;
+	uint32_t dqo_refill_pending;	/* reposts since last doorbell */
 	uint32_t dqo_complq_head;
 	uint8_t dqo_cur_gen_bit;
 
@@ -928,9 +930,18 @@ static unsigned int gve_netdev_promiscuous_get(struct uk_netdev *dev __unused)
 	return 0;
 }
 
+/*
+ * Consume DQO TX completions. A DESC-type completion names the TX
+ * ring index that the device still needs. The driver moves dqo_head
+ * to that index and reclaims the slots below it. The driver consumes
+ * other completion types without reclaim. The step cap bounds one
+ * call even if the device writes bogus generations.
+ */
 static void gve_poll_dqo_tx_completions(struct uk_netdev_tx_queue *queue)
 {
-	while (1) {
+	uint32_t steps;
+
+	for (steps = 0; steps < (uint32_t)queue->comp_cnt; steps++) {
 		struct gve_tx_compl_desc *cdesc =
 			&queue->dqo_compl_ring[queue->dqo_complq_head];
 		uint8_t gen;
@@ -940,11 +951,38 @@ static void gve_poll_dqo_tx_completions(struct uk_netdev_tx_queue *queue)
 		if (gen != queue->dqo_cur_gen_bit)
 			break;
 
+		__asm__ __volatile__("lfence" ::: "memory");
+		if (cdesc->type == GVE_COMPL_TYPE_DQO_DESC)
+			queue->dqo_head = gve_ring_advance_head(
+				queue->dqo_head, queue->dqo_tail,
+				queue->cnt, cdesc->id);
+
 		queue->dqo_complq_head =
 			(queue->dqo_complq_head + 1U) & queue->comp_mask;
 		if (queue->dqo_complq_head == 0)
 			queue->dqo_cur_gen_bit ^= 1U;
 	}
+}
+
+/*
+ * Update gqi_done from the device TX event counter. The device keeps
+ * the counter in counter_array as a big-endian count of completed
+ * TX packets for this queue.
+ */
+static void gve_gqi_poll_tx_done(struct uk_netdev_tx_queue *queue)
+{
+	struct gve_device *gdev = queue->gdev;
+	uint32_t idx = bswap32(queue->q_resources->counter_index);
+	uint32_t done;
+
+	if (!gdev->counter_array ||
+	    idx >= (uint32_t)gdev->num_event_counters)
+		return;
+
+	done = bswap32(gdev->counter_array[idx]);
+	__asm__ __volatile__("" ::: "memory");
+	if ((int32_t)(done - queue->gqi_done) > 0)
+		queue->gqi_done = done;
 }
 
 static int gve_netdev_xmit(struct uk_netdev *dev,
@@ -953,57 +991,94 @@ static int gve_netdev_xmit(struct uk_netdev *dev,
 {
 	struct gve_device *gdev = to_gvedev(dev);
 	struct uk_netbuf *iter;
-	uint16_t tot_len = 0;
+	struct gve_chain_acc acc;
+	uint32_t tot_len;
+	uint32_t padded_len;
 	uint32_t tx_db_idx;
 
 	if (!gdev || !queue || !pkt)
 		return -EINVAL;
 
-	for (iter = pkt; iter != NULL; iter = iter->next)
-		tot_len += iter->len;
-
-	if (tot_len == 0 || tot_len > GVE_DEFAULT_RX_BUFFER_SIZE) {
-		uk_netbuf_free(pkt);
-		return UK_NETDEV_STATUS_SUCCESS;
+	/*
+	 * Sum the chain in uint32 space. Reject any segment or total
+	 * above the device buffer size. The caller keeps ownership of
+	 * a rejected chain, so do not free the packet here.
+	 */
+	gve_chain_acc_init(&acc, GVE_DEFAULT_RX_BUFFER_SIZE);
+	for (iter = pkt; iter != NULL; iter = iter->next) {
+		if (gve_chain_acc_add(&acc, iter->len) != 0)
+			return -EMSGSIZE;
 	}
+	tot_len = acc.total;
+	padded_len = gve_tx_pad_len(tot_len);
 
 	tx_db_idx = bswap32(queue->q_resources->db_index);
 
 	if (gdev->queue_format == GVE_DQO_RDA_FORMAT) {
-		uint32_t ctx_slot = queue->dqo_tail & queue->mask;
-		uint32_t pkt_slot = (queue->dqo_tail + 1U) & queue->mask;
-		uint8_t *dst = queue->bounce_bufs +
-			       (size_t)pkt_slot * GVE_DEFAULT_RX_BUFFER_SIZE;
-		uint16_t off = 0;
+		uint32_t ctx_slot;
+		uint32_t pkt_slot;
+		uint8_t *dst;
+		uint32_t off = 0;
 
+		/*
+		 * Reclaim completed slots first. Refuse the send while
+		 * either target slot is still in flight. Writing an
+		 * uncompleted slot would let the device read a mixed
+		 * descriptor.
+		 */
 		gve_poll_dqo_tx_completions(queue);
+		if (!gve_ring_has_space(queue->dqo_head, queue->dqo_tail,
+					2U, (uint32_t)queue->cnt))
+			return -ENOSPC;
+
+		ctx_slot = queue->dqo_tail & queue->mask;
+		pkt_slot = (queue->dqo_tail + 1U) & queue->mask;
+		dst = queue->bounce_bufs +
+		      (size_t)pkt_slot * GVE_DEFAULT_RX_BUFFER_SIZE;
 
 		for (iter = pkt; iter != NULL; iter = iter->next) {
 			memcpy(dst + off, iter->data, iter->len);
 			off += iter->len;
 		}
 
-		if (tot_len < 60) {
-			memset(dst + tot_len, 0, 60 - tot_len);
-			tot_len = 60;
-		}
+		if (padded_len != tot_len)
+			memset(dst + tot_len, 0, padded_len - tot_len);
 
 		gve_dqo_fill_tx_general_ctx_desc(
 			&queue->dqo_tx_ring[ctx_slot].general_ctx);
 		gve_dqo_fill_tx_pkt_desc(&queue->dqo_tx_ring[pkt_slot].pkt,
 					 (uint64_t)(uintptr_t)dst,
 					 (uint16_t)pkt_slot,
-					 tot_len);
+					 (uint16_t)padded_len);
 		__asm__ __volatile__("mfence" ::: "memory");
 
-		queue->dqo_tail = (queue->dqo_tail + 2U) & queue->mask;
-		mmio_write32(&gdev->db_bar2[tx_db_idx], queue->dqo_tail);
+		queue->dqo_tail += 2U;
+		mmio_write32(&gdev->db_bar2[tx_db_idx],
+			     queue->dqo_tail & queue->mask);
 	} else {
-		uint32_t slot = queue->gqi_req & queue->mask;
+		uint32_t slot;
+		uint32_t capacity;
 		uint8_t *dst;
 		uint64_t addr;
-		uint16_t off = 0;
+		uint32_t off = 0;
 
+		/*
+		 * GQI posts one descriptor per packet. A QPL page can
+		 * back several ring slots, so cap the window by the
+		 * page count too. That stops the driver from overwriting
+		 * a page that the device still sends.
+		 */
+		capacity = gve_gqi_tx_capacity((uint32_t)queue->cnt,
+					       queue->num_qpl_pages,
+					       gdev->queue_format ==
+					       GVE_GQI_QPL_FORMAT);
+
+		gve_gqi_poll_tx_done(queue);
+		if (!gve_ring_has_space(queue->gqi_done, queue->gqi_req,
+					1U, capacity))
+			return -ENOSPC;
+
+		slot = queue->gqi_req & queue->mask;
 		if (gdev->queue_format == GVE_GQI_QPL_FORMAT) {
 			uint32_t page_idx = slot % queue->num_qpl_pages;
 
@@ -1020,12 +1095,11 @@ static int gve_netdev_xmit(struct uk_netdev *dev,
 			off += iter->len;
 		}
 
-		if (tot_len < 60) {
-			memset(dst + tot_len, 0, 60 - tot_len);
-			tot_len = 60;
-		}
+		if (padded_len != tot_len)
+			memset(dst + tot_len, 0, padded_len - tot_len);
 
-		gve_gqi_fill_tx_pkt_desc(&queue->gqi_tx_ring[slot], addr, tot_len);
+		gve_gqi_fill_tx_pkt_desc(&queue->gqi_tx_ring[slot], addr,
+					 (uint16_t)padded_len);
 		__asm__ __volatile__("mfence" ::: "memory");
 
 		queue->gqi_req++;
@@ -1081,11 +1155,22 @@ static int gve_netdev_recv(struct uk_netdev *dev,
 			alloc_cnt = queue->alloc_rxpkts(
 				queue->alloc_rxpkts_argp, &nb, 1);
 			if (alloc_cnt >= 1 && nb != NULL) {
-				src = queue->dqo_rx_bufs +
-				      (size_t)buf_id * GVE_DEFAULT_RX_BUFFER_SIZE;
-				memcpy(nb->data, src, pkt_len);
-				nb->len = pkt_len;
-				*pkt = nb;
+				if (gve_rx_fits_netbuf(
+					    (uint32_t)pkt_len,
+					    (uint32_t)uk_netbuf_tailroom(nb))) {
+					src = queue->dqo_rx_bufs +
+					      (size_t)buf_id * GVE_DEFAULT_RX_BUFFER_SIZE;
+					memcpy(nb->data, src, pkt_len);
+					nb->len = pkt_len;
+					*pkt = nb;
+				} else {
+					/*
+					 * The frame exceeds the usable
+					 * data area. Drop it. The buffer
+					 * still returns to the ring below.
+					 */
+					uk_netbuf_free(nb);
+				}
 			}
 		}
 
@@ -1101,9 +1186,25 @@ static int gve_netdev_recv(struct uk_netdev *dev,
 
 			queue->dqo_bufq_tail =
 				(queue->dqo_bufq_tail + 1U) & queue->buf_mask;
-			if ((queue->dqo_bufq_tail & 31U) == 0U)
+			queue->dqo_refill_pending++;
+			if (gve_rx_refill_should_ring(
+				    queue->dqo_refill_pending,
+				    GVE_RX_BUF_THRESH_DQO)) {
 				mmio_write32(&gdev->db_bar2[rx_db_idx],
 					     queue->dqo_bufq_tail);
+				queue->dqo_refill_pending = 0;
+			}
+		}
+
+		/*
+		 * Flush reposts that the threshold did not cover. The
+		 * driver never returns to the stack with an unnotified
+		 * buffer, so the device cannot stall on a hidden buffer.
+		 */
+		if (queue->dqo_refill_pending != 0U) {
+			mmio_write32(&gdev->db_bar2[rx_db_idx],
+				     queue->dqo_bufq_tail);
+			queue->dqo_refill_pending = 0;
 		}
 
 		if (*pkt == NULL)
@@ -1130,11 +1231,18 @@ static int gve_netdev_recv(struct uk_netdev *dev,
 			alloc_cnt = queue->alloc_rxpkts(
 				queue->alloc_rxpkts_argp, &nb, 1);
 			if (alloc_cnt >= 1 && nb != NULL) {
-				src = queue->qpl_pages +
-				      (size_t)slot * GVE_PAGE_SIZE + GVE_RX_PAD;
-				memcpy(nb->data, src, pkt_len);
-				nb->len = pkt_len;
-				*pkt = nb;
+				if (gve_rx_fits_netbuf(
+					    (uint32_t)pkt_len,
+					    (uint32_t)uk_netbuf_tailroom(nb))) {
+					src = queue->qpl_pages +
+					      (size_t)slot * GVE_PAGE_SIZE + GVE_RX_PAD;
+					memcpy(nb->data, src, pkt_len);
+					nb->len = pkt_len;
+					*pkt = nb;
+				} else {
+					/* Frame exceeds tailroom. Drop it. */
+					uk_netbuf_free(nb);
+				}
 			}
 		}
 
@@ -1438,6 +1546,26 @@ static int gve_add_dev(struct pci_device *pdev)
 
 	printf("[gve] Negotiated queue format: %s (%d)\n",
 	       gve_queue_format_name(gdev->queue_format), gdev->queue_format);
+
+	/*
+	 * All ring indexing uses cnt - 1 as a mask. Reject a device
+	 * that reports a zero or non-power-of-two ring size. The two
+	 * DQO ring sizes only feed masks in the DQO_RDA format, so
+	 * validate them when the device negotiated that format.
+	 */
+	if (!gve_ring_size_valid(gdev->tx_desc_cnt) ||
+	    !gve_ring_size_valid(gdev->rx_desc_cnt)) {
+		printf("GATE_FAIL: gve invalid ring size tx=%u rx=%u\n",
+		       gdev->tx_desc_cnt, gdev->rx_desc_cnt);
+		return -EINVAL;
+	}
+	if (gdev->queue_format == GVE_DQO_RDA_FORMAT &&
+	    (!gve_ring_size_valid(gdev->tx_comp_ring_entries) ||
+	     !gve_ring_size_valid(gdev->rx_buff_ring_entries))) {
+		printf("GATE_FAIL: gve invalid DQO ring size tx_comp=%u rx_buff=%u\n",
+		       gdev->tx_comp_ring_entries, gdev->rx_buff_ring_entries);
+		return -EINVAL;
+	}
 
 	if (gdev->mtu == 0) {
 		printf("GATE_FAIL: gve invalid MTU 0\n");
