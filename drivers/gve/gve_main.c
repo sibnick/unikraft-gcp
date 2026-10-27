@@ -1157,7 +1157,8 @@ static int gve_netdev_recv(struct uk_netdev *dev,
 			if (alloc_cnt >= 1 && nb != NULL) {
 				if (gve_rx_fits_netbuf(
 					    (uint32_t)pkt_len,
-					    (uint32_t)uk_netbuf_tailroom(nb))) {
+					    (uint32_t)(nb->buflen -
+						       uk_netbuf_headroom(nb)))) {
 					src = queue->dqo_rx_bufs +
 					      (size_t)buf_id * GVE_DEFAULT_RX_BUFFER_SIZE;
 					memcpy(nb->data, src, pkt_len);
@@ -1233,7 +1234,8 @@ static int gve_netdev_recv(struct uk_netdev *dev,
 			if (alloc_cnt >= 1 && nb != NULL) {
 				if (gve_rx_fits_netbuf(
 					    (uint32_t)pkt_len,
-					    (uint32_t)uk_netbuf_tailroom(nb))) {
+					    (uint32_t)(nb->buflen -
+						       uk_netbuf_headroom(nb)))) {
 					src = queue->qpl_pages +
 					      (size_t)slot * GVE_PAGE_SIZE + GVE_RX_PAD;
 					memcpy(nb->data, src, pkt_len);

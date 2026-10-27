@@ -743,14 +743,18 @@ static inline uint32_t gve_tx_pad_len(uint32_t total)
 }
 
 /*
- * Decide whether a received frame fits the netbuf. pkt_len is the
- * frame length. tailroom is the usable data area of the netbuf.
+ * Decide whether a received frame fits the netbuf data area.
+ * pkt_len is the frame length. cap is the writable space from the
+ * netbuf data pointer to the end of the buffer: buflen minus
+ * headroom. Do not pass uk_netbuf_tailroom() here. The lwIP glue
+ * presets len to the whole receive area (lwip_alloc_netbuf), so
+ * tailroom is always 0 on an RX netbuf and would drop every frame.
  * Return 1 when the copy is safe and 0 when the driver must drop
  * the frame.
  */
-static inline int gve_rx_fits_netbuf(uint32_t pkt_len, uint32_t tailroom)
+static inline int gve_rx_fits_netbuf(uint32_t pkt_len, uint32_t cap)
 {
-	return (pkt_len > 0U) && (pkt_len <= tailroom);
+	return (pkt_len > 0U) && (pkt_len <= cap);
 }
 
 /*

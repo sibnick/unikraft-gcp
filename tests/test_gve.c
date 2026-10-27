@@ -462,6 +462,30 @@ static void test_rx_fits_netbuf(void)
 }
 
 /*
+ * Regression for the Path B3 failure on run ukg-1027-221230. The lwIP
+ * glue (lwip_alloc_netbuf) presets len to buflen minus headroom, so
+ * uk_netbuf_tailroom() returns 0 on every RX netbuf. A tailroom-based
+ * guard drops all received traffic. The driver must pass the capacity
+ * from the data pointer to the end of the buffer instead.
+ */
+static void test_rx_fits_netbuf_lwip_glue(void)
+{
+	uint32_t buflen = 2048U;
+	uint32_t headroom = 0U;
+	uint32_t len = buflen - headroom;   /* glue preset */
+	uint32_t tailroom = buflen - headroom - len;
+	uint32_t cap = buflen - headroom;   /* what the driver passes */
+
+	assert(tailroom == 0U);
+	/* The old tailroom check would drop a 60-byte echo reply. */
+	assert(!gve_rx_fits_netbuf(60U, tailroom));
+	/* The capacity check accepts it. */
+	assert(gve_rx_fits_netbuf(60U, cap));
+	assert(gve_rx_fits_netbuf(2048U, cap));
+	assert(!gve_rx_fits_netbuf(2049U, cap));
+}
+
+/*
  * DQO RX refill doorbell policy. Ring at GVE_RX_BUF_THRESH_DQO and
  * flush unnotified reposts at the end of the receive call.
  * Ticket 4181b38c69.
@@ -538,6 +562,7 @@ int main(void)
 	test_tx_pad_len();
 	test_chain_total_wrap();
 	test_rx_fits_netbuf();
+	test_rx_fits_netbuf_lwip_glue();
 	test_rx_refill_doorbell();
 	printf("test_gve: all unit tests passed\n");
 	return 0;
