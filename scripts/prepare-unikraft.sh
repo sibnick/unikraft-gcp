@@ -45,32 +45,87 @@ ukg_fetch_pinned "${UK_URL}" "${UK_DEST}" "${UK_COMMIT}"
 # 2. lib-lwip
 ukg_fetch_pinned "${LWIP_URL}" "${LWIP_DEST}" "${LWIP_COMMIT}"
 
-# Apply patches from patches/ directory if present
+# Apply patches from patches/ directory if present.
+# Try the forward pass for one repository's patch set. Arg $1: target
+# repo dir. Remaining args: patch files in apply order.
+ukg_apply_forward() {
+    local repo="$1"
+    shift
+    local pf
+    for pf in "$@"; do
+        git -C "${repo}" apply "${pf}" || return 1
+    done
+    return 0
+}
+
+# Unapply one repository's patch set. A later patch can depend on an
+# earlier one, so undo in reverse order. Used to detect and roll back
+# an already-patched tree. Arg $1: target repo dir. Remaining args:
+# patch files in apply order.
+ukg_unapply_reverse() {
+    local repo="$1"
+    shift
+    local n i rc pf
+    n=$#
+    for i in $(seq "${n}" -1 1); do
+        eval "pf=\${$i}"
+        git -C "${repo}" apply --reverse "${pf}" 2>/dev/null
+        rc=$?
+        if [ "${rc}" -ne 0 ]; then
+            echo "[ERROR] Cannot unapply $(basename "${pf}") during rollback." >&2
+            echo "[ERROR] The tree may be half-patched. Fix it by hand." >&2
+            return 1
+        fi
+    done
+    return 0
+}
+
+# Apply one repository's patch set. If the whole set does not apply
+# forward, test whether the tree already carries it: unapply the set
+# in reverse order, then apply it again. When even that test fails,
+# stop. Silent continuation would build a tree without a required
+# patch. Ticket 4347c2a8e6 L4, e74d4f8b70.
+# Arg $1: target repo dir. Remaining args: patch files in apply order.
+ukg_apply_set() {
+    local repo="$1"
+    shift
+    local pf
+    if ukg_apply_forward "${repo}" "$@" 2>/dev/null; then
+        for pf in "$@"; do
+            echo "[INFO] Applied patch $(basename "${pf}")."
+        done
+        return 0
+    fi
+    if ukg_unapply_reverse "${repo}" "$@" 2>/dev/null; then
+        echo "[INFO] Patch set is already applied to $(basename "${repo}"). Restoring."
+        ukg_apply_forward "${repo}" "$@" || return 1
+        return 0
+    fi
+    echo "[ERROR] The patch set does not apply to $(basename "${repo}")." >&2
+    echo "[ERROR] The checkout may not match the pinned commit." >&2
+    return 1
+}
+
 if [ -d "${ROOT_DIR}/patches" ]; then
-    for patch_file in "${ROOT_DIR}/patches"/*.patch; do
+    LWIP_PATCHES=()
+    UK_PATCHES=()
+    for patch_file in "${ROOT_DIR}"/patches/*.patch; do
         [ -f "${patch_file}" ] || continue
         patch_name="$(basename "${patch_file}")"
         if [[ "${patch_name}" == lib-lwip* ]]; then
-            TARGET_REPO="${LWIP_DEST}"
+            LWIP_PATCHES+=("${patch_file}")
         else
-            TARGET_REPO="${UK_DEST}"
-        fi
-        echo "[INFO] Checking patch ${patch_name} against $(basename "${TARGET_REPO}")..."
-        if git -C "${TARGET_REPO}" apply --check "${patch_file}" &>/dev/null; then
-            echo "[INFO] Applying patch ${patch_name}..."
-            git -C "${TARGET_REPO}" apply "${patch_file}"
-        elif git -C "${TARGET_REPO}" apply --reverse --check "${patch_file}" &>/dev/null; then
-            # The reverse patch applies cleanly, so the patch is
-            # already in the tree. Ticket 4347c2a8e6 L4.
-            echo "[INFO] Patch ${patch_name} is already applied. Skipping."
-        else
-            # Neither forward nor reverse applies. Silent continuation
-            # would build a tree without a required patch.
-            echo "[ERROR] Patch ${patch_name} does not apply to $(basename "${TARGET_REPO}")." >&2
-            echo "[ERROR] The checkout may not match the pinned commit." >&2
-            exit 1
+            UK_PATCHES+=("${patch_file}")
         fi
     done
+    if [ "${#LWIP_PATCHES[@]}" -gt 0 ]; then
+        echo "[INFO] Checking ${#LWIP_PATCHES[@]} patch(es) against lwip..."
+        ukg_apply_set "${LWIP_DEST}" "${LWIP_PATCHES[@]}"
+    fi
+    if [ "${#UK_PATCHES[@]}" -gt 0 ]; then
+        echo "[INFO] Checking ${#UK_PATCHES[@]} patch(es) against unikraft..."
+        ukg_apply_set "${UK_DEST}" "${UK_PATCHES[@]}"
+    fi
 fi
 
 echo "[SUCCESS] Unikraft core is ready at ${UK_DEST} (commit: ${UK_COMMIT})."

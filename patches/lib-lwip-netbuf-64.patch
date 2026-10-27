@@ -12,23 +12,21 @@ the lost packet count exactly on both peers.
 Size the pool like MEMP_NUM_NETCONN. A struct netbuf is small (about
 40 bytes), so 64 entries cost about 2.5 KB.
 
+diff --git a/include/lwipopts.h b/include/lwipopts.h
+index 0ec529a..a399243 100644
 --- a/include/lwipopts.h
 +++ b/include/lwipopts.h
-@@ -366,7 +366,17 @@
- #define MEMP_NUM_NETCONN CONFIG_LWIP_NUM_TCPCON
- #else
- #define MEMP_NUM_NETCONN 64
- #endif /* LWIP_TCP */
-+/*
-+ * Number of struct netbuf entries. The sequential API allocates one
-+ * netbuf per received datagram. The netbuf stays allocated until the
-+ * application reads the datagram with recv(). The lwIP default of 2 is
-+ * too small: when the socket mailbox holds one netbuf and recv() is
-+ * copying another, the next received datagram cannot allocate a netbuf
-+ * and lwIP drops it without an error. Keep the count aligned with
-+ * MEMP_NUM_NETCONN.
-+ */
-+#define MEMP_NUM_NETBUF 64
+@@ -377,9 +377,12 @@ void sys_free(void *ptr);
+  * too small: when the socket mailbox holds one netbuf and recv() is
+  * copying another, the next received datagram cannot allocate a netbuf
+  * and lwIP drops it without an error. Keep the count aligned with
+- * MEMP_NUM_NETCONN.
++ * MEMP_NUM_NETCONN. An out-of-tree lwipopts.h overlay may still
++ * override this value.
+  */
++#ifndef MEMP_NUM_NETBUF
+ #define MEMP_NUM_NETBUF 64
++#endif
  #else
  #define LWIP_NETCONN 0
  #endif
