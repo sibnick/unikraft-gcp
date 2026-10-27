@@ -498,6 +498,64 @@ static void test_rx_fits_netbuf(void)
 }
 
 /*
+ * The advertised MTU must never exceed one receive buffer minus the
+ * Ethernet header. Jumbo advertisements are clipped; smaller ones
+ * pass through. Ticket 7d17e44863 item M4.
+ */
+static void test_max_mtu_cap(void)
+{
+	/* Jumbo 8892 clipped to 2048 - 14. */
+	assert(gve_max_mtu_capped(8892U, 2048U) == 2034U);
+	/* Exactly at the cap and below: unchanged. */
+	assert(gve_max_mtu_capped(2034U, 2048U) == 2034U);
+	assert(gve_max_mtu_capped(1410U, 2048U) == 1410U);
+	/* Degenerate buffer sizes cap to zero, never to a large value. */
+	assert(gve_max_mtu_capped(1500U, 14U) == 0U);
+	assert(gve_max_mtu_capped(1500U, 0U) == 0U);
+}
+
+/*
+ * TLV region bound checks. A parser must read a fixed struct only
+ * when it is covered by the body length and stays inside the region.
+ * Ticket 7d17e44863 item M3.
+ */
+static void test_tlv_bounds(void)
+{
+	const uint32_t region = 152U;	/* real device total_length */
+
+	/* Header at the very end of the region still fits exactly. */
+	assert(gve_tlv_hdr_fits(region - 8U, region, 8U));
+	/* One byte short of a header: refuse. */
+	assert(!gve_tlv_hdr_fits(region - 7U, region, 8U));
+	/* Offset past the region: refuse, no wraparound. */
+	assert(!gve_tlv_hdr_fits(region + 1U, region, 8U));
+
+	/* Body fully covered: 8 bytes of body with a 4-byte struct. */
+	assert(gve_tlv_body_fits(48U, 8U, 4U, region));
+	/* Struct bigger than declared body: refuse. */
+	assert(!gve_tlv_body_fits(48U, 2U, 4U, region));
+	/* Struct would cross the region end: refuse. */
+	assert(!gve_tlv_body_fits(region - 8U, 16U, 12U, region));
+	/* Declared body past the region, struct inside the region: the
+	 * read is safe, so it passes. The walk stops at the next header
+	 * check. */
+	assert(gve_tlv_body_fits(region - 4U, 64U, 4U, region));
+}
+
+/*
+ * Queue size requests: only the driver default (0) or the fixed
+ * device size pass. Ticket 7d17e44863 item M6.
+ */
+static void test_ring_request(void)
+{
+	assert(gve_ring_request_ok(0U, 1024U));	/* driver default */
+	assert(gve_ring_request_ok(1024U, 1024U));
+	assert(!gve_ring_request_ok(32U, 1024U));
+	assert(!gve_ring_request_ok(2048U, 1024U));
+	assert(!gve_ring_request_ok(1U, 0U));
+}
+
+/*
  * Regression for the Path B3 failure on run ukg-1027-221230. The lwIP
  * glue (lwip_alloc_netbuf) presets len to buflen minus headroom, so
  * uk_netbuf_tailroom() returns 0 on every RX netbuf. A tailroom-based
@@ -600,6 +658,9 @@ int main(void)
 	test_rx_fits_netbuf();
 	test_rx_fits_netbuf_lwip_glue();
 	test_rx_refill_doorbell();
+	test_max_mtu_cap();
+	test_tlv_bounds();
+	test_ring_request();
 	printf("test_gve: all unit tests passed\n");
 	return 0;
 }
