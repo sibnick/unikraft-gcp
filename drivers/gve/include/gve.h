@@ -420,10 +420,17 @@ union gve_tx_desc_dqo {
 	struct gve_tx_general_context_desc_dqo general_ctx;
 } __attribute__((packed));
 
+/*
+ * DQO TX completion descriptor. Little-endian. The first word packs
+ * the ring id in bits 10:0, the completion type in bits 14:12, and
+ * the generation bit at 15. Bit 11 is reserved by the device. A
+ * DESC-type completion carries the TX ring index that the device
+ * still needs. The driver reclaims all ring slots below that index.
+ */
 struct gve_tx_compl_desc {
 	uint16_t id:11;
-	uint16_t type:3;
 	uint16_t reserved0:1;
+	uint16_t type:3;
 	uint16_t generation:1;
 	union {
 		uint16_t completion_tag;
@@ -628,6 +635,134 @@ static inline void gve_gqi_fill_tx_pkt_desc(
 	desc->pkt.len = __builtin_bswap16(len);
 	desc->pkt.seg_len = __builtin_bswap16(len);
 	desc->pkt.addr = __builtin_bswap64(addr);
+}
+
+/*
+ * Shared datapath logic helpers. Both the driver and the host unit
+ * tests use these pure functions. Keep them free of device, memory,
+ * and MMIO access.
+ */
+
+/*
+ * Check a device-reported ring size. The driver masks every ring
+ * index with cnt - 1, so cnt must be a non-zero power of two.
+ * Return 1 when the size is usable and 0 otherwise.
+ */
+static inline int gve_ring_size_valid(uint16_t cnt)
+{
+	return (cnt != 0U) && (((uint32_t)cnt & ((uint32_t)cnt - 1U)) == 0U);
+}
+
+/*
+ * Report whether the producer may write need more ring entries.
+ * head and tail are free-running entry counters. capacity is the
+ * largest number of entries that may be outstanding. Callers must
+ * keep capacity at or below UINT32_MAX / 2. The uint32 subtraction
+ * stays correct when the counters wrap at 2^32.
+ */
+static inline int gve_ring_has_space(uint32_t head, uint32_t tail,
+				     uint32_t need, uint32_t capacity)
+{
+	return (tail + need - head) <= capacity;
+}
+
+/*
+ * Move the TX head toward the ring index that the device reports.
+ * new_idx is an absolute ring slot index. The helper picks the
+ * free-running counter congruent to new_idx between head and tail.
+ * It never moves head past tail. A report congruent with the
+ * current head advances nothing, so an ambiguous full-ring report
+ * keeps the driver on the safe side.
+ */
+static inline uint32_t gve_ring_advance_head(uint32_t head, uint32_t tail,
+					     uint16_t cnt, uint32_t new_idx)
+{
+	uint32_t mask = (uint32_t)cnt - 1U;
+	uint32_t adv = (new_idx - (head & mask)) & mask;
+	uint32_t inflight = tail - head;
+
+	if (adv > inflight)
+		return tail;
+	return head + adv;
+}
+
+/*
+ * Chain length accumulator with a hard bound. The total stays in
+ * uint32 space, so a chain cannot wrap past a 16-bit bound check.
+ */
+struct gve_chain_acc {
+	uint32_t total;
+	uint32_t max;
+};
+
+static inline void gve_chain_acc_init(struct gve_chain_acc *acc, uint32_t max)
+{
+	acc->total = 0U;
+	acc->max = max;
+}
+
+/*
+ * Add one segment length to the chain total. Reject a zero segment,
+ * a segment larger than max, and a total larger than max. Return 0
+ * on success and -1 on rejection. On rejection the total is unchanged.
+ */
+static inline int gve_chain_acc_add(struct gve_chain_acc *acc, uint32_t seg_len)
+{
+	if (seg_len == 0U || seg_len > acc->max)
+		return -1;
+	if (acc->total + seg_len > acc->max)
+		return -1;
+	acc->total += seg_len;
+	return 0;
+}
+
+/*
+ * Return the maximum number of GQI TX packets that may be in
+ * flight. One descriptor uses one ring slot. In QPL mode the pages
+ * repeat every nqp slots when nqp is a power of two, so the smaller
+ * bound wins. When nqp is zero or not a power of two the driver
+ * cannot bound page aliasing cheaply, so it serializes sends.
+ */
+static inline uint32_t gve_gqi_tx_capacity(uint32_t cnt, uint32_t nqp,
+					   int qpl)
+{
+	if (!qpl)
+		return cnt;
+	if (nqp == 0U || (nqp & (nqp - 1U)) != 0U)
+		return 1U;
+	return (nqp < cnt) ? nqp : cnt;
+}
+
+/* Ethernet minimum frame length. The driver pads short TX frames up. */
+#define GVE_TX_MIN_FRAME_LEN		60U
+
+/* Return the transmit length after minimum-frame padding. */
+static inline uint32_t gve_tx_pad_len(uint32_t total)
+{
+	return (total < GVE_TX_MIN_FRAME_LEN) ? GVE_TX_MIN_FRAME_LEN : total;
+}
+
+/*
+ * Decide whether a received frame fits the netbuf. pkt_len is the
+ * frame length. tailroom is the usable data area of the netbuf.
+ * Return 1 when the copy is safe and 0 when the driver must drop
+ * the frame.
+ */
+static inline int gve_rx_fits_netbuf(uint32_t pkt_len, uint32_t tailroom)
+{
+	return (pkt_len > 0U) && (pkt_len <= tailroom);
+}
+
+/*
+ * Decide whether to ring the DQO RX buffer refill doorbell.
+ * unnotified counts reposts since the last doorbell. Ring when the
+ * count reaches the threshold. The caller also rings once per
+ * receive call when unnotified reposts remain.
+ */
+static inline int gve_rx_refill_should_ring(uint32_t unnotified,
+					    uint32_t thresh)
+{
+	return unnotified >= thresh;
 }
 
 #endif /* __UK_DRV_GVE_H__ */
