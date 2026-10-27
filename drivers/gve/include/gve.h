@@ -657,6 +657,65 @@ static inline int gve_ring_size_valid(uint16_t cnt)
 	return (cnt != 0U) && (((uint32_t)cnt & ((uint32_t)cnt - 1U)) == 0U);
 }
 
+/* Ethernet header length without VLAN tags. */
+#define GVE_ETH_HLEN			14U
+
+/*
+ * Cap the advertised maximum MTU to what one receive buffer can
+ * carry. The receive path delivers only frames that fit a single
+ * buffer, so the payload bound is the buffer size minus the
+ * Ethernet header. Jumbo advertisements above the cap must not
+ * reach the stack, or oversized frames arrive as bogus packets
+ * once a peer sends them. VLAN tags eat four more bytes from the
+ * margin. Return the smaller of advertised and the cap.
+ */
+static inline uint16_t gve_max_mtu_capped(uint32_t advertised,
+					  uint32_t rx_buf)
+{
+	uint32_t cap = (rx_buf > GVE_ETH_HLEN) ? (rx_buf - GVE_ETH_HLEN) : 0U;
+
+	return (uint16_t)((advertised < cap) ? advertised : cap);
+}
+
+/*
+ * Bound check for one TLV header inside the device-descriptor region.
+ * off is the byte offset from the start of the descriptor buffer.
+ * region is the usable byte count. hdr_sz is the TLV header size.
+ * Return 1 when the whole header is inside the region.
+ */
+static inline int gve_tlv_hdr_fits(uint32_t off, uint32_t region,
+				   uint32_t hdr_sz)
+{
+	return (off <= region) && ((region - off) >= hdr_sz);
+}
+
+/*
+ * Bound check for the bytes a parser reads from one TLV body. The
+ * parser reads struct_sz bytes, so require body_len to cover them
+ * and require struct_sz to stay inside the region. A body_len that
+ * reaches past the region still allows the read: the bytes the
+ * parser touches stay inside the region, and the walk stops when it
+ * advances past the region.
+ */
+static inline int gve_tlv_body_fits(uint32_t off, uint32_t body_len,
+				    uint32_t struct_sz, uint32_t region)
+{
+	return (body_len >= struct_sz) &&
+	       gve_tlv_hdr_fits(off, region, struct_sz);
+}
+
+/*
+ * Check a caller queue-size request against the driver policy.
+ * The driver creates each ring at the size the device descriptor
+ * reports, and queue_info_get advertises that size as both nb_min
+ * and nb_max. nb_desc 0 asks for the driver default. Return 1 when
+ * the request is 0 or the fixed size, and 0 for anything else.
+ */
+static inline int gve_ring_request_ok(uint32_t nb_desc, uint32_t fixed)
+{
+	return (nb_desc == 0U) || (nb_desc == fixed);
+}
+
 /*
  * Report whether the producer may write need more ring entries.
  * head and tail are free-running entry counters. capacity is the

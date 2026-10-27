@@ -33,6 +33,7 @@ struct gve_device;
 
 struct uk_netdev_tx_queue {
 	struct gve_device *gdev;
+	struct uk_alloc *alloc;	/* allocator that owns these buffers */
 	uint16_t qid;
 	uint16_t cnt;
 	uint16_t mask;
@@ -56,12 +57,14 @@ struct uk_netdev_tx_queue {
 	uint32_t gqi_done;
 	uint32_t qpl_id;
 	uint32_t num_qpl_pages;
+	uint8_t qpl_registered;	/* device holds this QPL: unregister on free */
 	uint8_t *qpl_pages;
 	uint64_t *qpl_page_bus;
 };
 
 struct uk_netdev_rx_queue {
 	struct gve_device *gdev;
+	struct uk_alloc *alloc;	/* allocator that owns these buffers */
 	uint16_t qid;
 	uint16_t cnt;
 	uint16_t mask;
@@ -89,6 +92,7 @@ struct uk_netdev_rx_queue {
 	uint8_t gqi_seqno;
 	uint32_t qpl_id;
 	uint32_t num_qpl_pages;
+	uint8_t qpl_registered;	/* device holds this QPL: unregister on free */
 	uint8_t *qpl_pages;
 	uint64_t *qpl_page_bus;
 };
@@ -167,6 +171,13 @@ static inline uint32_t inl_port(uint16_t port)
 	return val;
 }
 
+/*
+ * Direct CF8/CFC configuration access. Unikraft 0.21 exports no
+ * ukbus accessor for config space or BARs: the core keeps its own
+ * CF8/CFC sequence private in drivers/ukbus/pci/arch/x86_64. These
+ * helpers mirror that sequence. Switch them to a shared ukbus API
+ * when the core exports one (ticket for M7).
+ */
 static uint32_t pci_cfg_read32(uint8_t bus, uint8_t dev, uint8_t func,
 			       uint8_t offset)
 {
@@ -214,34 +225,81 @@ static uint64_t pci_read_bar(uint8_t bus, uint8_t dev, uint8_t func,
 }
 
 /*
- * Map a 32-bit or 64-bit physical BAR address into pdpt0[4 + slot]
- * using 2 MiB pages with uncacheable RW attributes (0x9b).
+ * Return the PDPT entry this driver uses for a BAR slot, or NULL
+ * when the slot index is invalid. Slots 0 and 1 map PDPT entries 4
+ * and 5, covering the 4 GiB and 5 GiB virtual regions.
+ *
+ * Assumption: the Unikraft 0.21 boot page table leaves PDPT entries
+ * 4 and 5 empty. The present-bit check in gve_map_bar turns a broken
+ * assumption into a clean failure: a second gVNIC device fails its
+ * map instead of clobbering the first device's window.
  */
-static volatile void *gve_map_bar(uint64_t paddr, int slot)
+static volatile uint64_t *gve_pdpt_entry(int slot)
 {
 	uint64_t cr3;
 	uint64_t *pml4;
 	uint64_t *pdpt0;
-	uint64_t gb_base;
-	uint64_t vaddr_base;
-	int i;
 
-	if (slot < 0 || slot > 1 || paddr == 0)
+	if (slot < 0 || slot > 1)
 		return NULL;
 
 	__asm__ __volatile__("movq %%cr3, %0" : "=r"(cr3));
 	pml4 = (uint64_t *)(uintptr_t)(cr3 & ~0xfffULL);
 	pdpt0 = (uint64_t *)(uintptr_t)(pml4[0] & ~0xfffULL);
+	return &pdpt0[4 + slot];
+}
+
+/*
+ * Map a 32-bit or 64-bit physical BAR address into pdpt0[4 + slot]
+ * using 2 MiB pages with uncacheable RW attributes (0x9b). Refuse a
+ * slot whose entry is already present.
+ */
+static volatile void *gve_map_bar(uint64_t paddr, int slot)
+{
+	volatile uint64_t *entry;
+	uint64_t cr3;
+	uint64_t gb_base;
+	uint64_t vaddr_base;
+	int i;
+
+	if (paddr == 0)
+		return NULL;
+
+	entry = gve_pdpt_entry(slot);
+	if (!entry)
+		return NULL;
+	if (*entry & 0x1ULL)
+		return NULL;
+
+	__asm__ __volatile__("movq %%cr3, %0" : "=r"(cr3));
 
 	gb_base = paddr & ~0x3fffffffULL;
 	for (i = 0; i < 512; i++)
 		gve_bar_pd[slot][i] = (gb_base + ((uint64_t)i << 21)) | 0x9bULL;
 
-	pdpt0[4 + slot] = ((uint64_t)(uintptr_t)gve_bar_pd[slot]) | 0x03ULL;
+	*entry = ((uint64_t)(uintptr_t)gve_bar_pd[slot]) | 0x03ULL;
 	__asm__ __volatile__("movq %0, %%cr3" :: "r"(cr3) : "memory");
 
 	vaddr_base = ((uint64_t)(4 + slot)) << 30;
 	return (volatile void *)(uintptr_t)(vaddr_base + (paddr & 0x3fffffffULL));
+}
+
+/*
+ * Clear a BAR slot mapping and flush the TLB with a cr3 reload. The
+ * caller must not touch the mapped window afterwards.
+ */
+static void gve_unmap_bar(int slot)
+{
+	volatile uint64_t *entry;
+	uint64_t cr3;
+
+	entry = gve_pdpt_entry(slot);
+	if (!entry || !(*entry & 0x1ULL))
+		return;
+
+	*entry = 0ULL;
+	__asm__ __volatile__("movq %%cr3, %0" : "=r"(cr3));
+	__asm__ __volatile__("movq %0, %%cr3" :: "r"(cr3) : "memory");
 }
 
 static inline uint32_t mmio_read32(const volatile uint32_t *reg)
@@ -354,8 +412,62 @@ static int gve_adminq_exec(volatile struct gve_registers *reg_bar0,
 	return (status == GVE_ADMINQ_COMMAND_PASSED) ? 0 : -EIO;
 }
 
-static int gve_register_qpl(struct gve_device *gdev, uint32_t qpl_id,
-			    uint32_t num_pages, uint8_t **pages_out,
+/*
+ * Teardown commands. They run on error unwinding and on queue
+ * reconfiguration. A failed teardown only logs: the caller is
+ * already unwinding and cannot recover further.
+ */
+static void gve_adminq_destroy_tx_queue(struct gve_device *gdev,
+					uint16_t queue_id)
+{
+	union gve_adminq_command cmd;
+	uint32_t cmd_status = 0;
+	int rc;
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.opcode = bswap32(GVE_ADMINQ_DESTROY_TX_QUEUE);
+	cmd.destroy_tx_queue.queue_id = bswap32(queue_id);
+	rc = gve_adminq_exec(gdev->reg_bar0, gdev->adminq,
+			     &gdev->adminq_prod_cnt, &cmd, &cmd_status);
+	printf("[gve] DESTROY_TX_QUEUE qid=%u rc=%d status=0x%x\n",
+	       queue_id, rc, cmd_status);
+}
+
+static void gve_adminq_destroy_rx_queue(struct gve_device *gdev,
+					uint16_t queue_id)
+{
+	union gve_adminq_command cmd;
+	uint32_t cmd_status = 0;
+	int rc;
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.opcode = bswap32(GVE_ADMINQ_DESTROY_RX_QUEUE);
+	cmd.destroy_rx_queue.queue_id = bswap32(queue_id);
+	rc = gve_adminq_exec(gdev->reg_bar0, gdev->adminq,
+			     &gdev->adminq_prod_cnt, &cmd, &cmd_status);
+	printf("[gve] DESTROY_RX_QUEUE qid=%u rc=%d status=0x%x\n",
+	       queue_id, rc, cmd_status);
+}
+
+static void gve_adminq_unregister_page_list(struct gve_device *gdev,
+					    uint32_t qpl_id)
+{
+	union gve_adminq_command cmd;
+	uint32_t cmd_status = 0;
+	int rc;
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.opcode = bswap32(GVE_ADMINQ_UNREGISTER_PAGE_LIST);
+	cmd.unreg_page_list.page_list_id = bswap32(qpl_id);
+	rc = gve_adminq_exec(gdev->reg_bar0, gdev->adminq,
+			     &gdev->adminq_prod_cnt, &cmd, &cmd_status);
+	printf("[gve] UNREGISTER_PAGE_LIST id=%u rc=%d status=0x%x\n",
+	       qpl_id, rc, cmd_status);
+}
+
+static int gve_register_qpl(struct gve_device *gdev, struct uk_alloc *a,
+			    uint32_t qpl_id, uint32_t num_pages,
+			    uint8_t **pages_out,
 			    uint64_t **page_bus_out)
 {
 	uint8_t *pages;
@@ -365,16 +477,18 @@ static int gve_register_qpl(struct gve_device *gdev, uint32_t qpl_id,
 	uint32_t i;
 	int rc;
 
-	pages = uk_memalign(drv_alloc, GVE_PAGE_SIZE,
+	pages = uk_memalign(a, GVE_PAGE_SIZE,
 			    (size_t)num_pages * GVE_PAGE_SIZE);
 	if (!pages)
 		return -ENOMEM;
 	memset(pages, 0, (size_t)num_pages * GVE_PAGE_SIZE);
 
-	page_bus = uk_memalign(drv_alloc, GVE_PAGE_SIZE,
+	page_bus = uk_memalign(a, GVE_PAGE_SIZE,
 			       align_up_page((size_t)num_pages * sizeof(uint64_t)));
-	if (!page_bus)
+	if (!page_bus) {
+		uk_free(a, pages);
 		return -ENOMEM;
+	}
 	memset(page_bus, 0, align_up_page((size_t)num_pages * sizeof(uint64_t)));
 
 	for (i = 0; i < num_pages; i++) {
@@ -395,8 +509,11 @@ static int gve_register_qpl(struct gve_device *gdev, uint32_t qpl_id,
 			     &gdev->adminq_prod_cnt, &cmd, &cmd_status);
 	printf("[gve] REGISTER_PAGE_LIST id=%u pages=%u rc=%d status=0x%x\n",
 	       qpl_id, num_pages, rc, cmd_status);
-	if (rc != 0)
+	if (rc != 0) {
+		uk_free(a, page_bus);
+		uk_free(a, pages);
 		return rc;
+	}
 
 	*pages_out = pages;
 	*page_bus_out = page_bus;
@@ -410,6 +527,9 @@ static int gve_configure_resources(struct gve_device *gdev)
 	uint32_t ntfy_candidates[2];
 	int cand_idx;
 	int rc = -EIO;
+	int got_counters = 0;	/* allocated by this call: free on failure */
+	int got_dbs = 0;
+	int got_ptype = 0;
 
 	if (gdev->resources_configured)
 		return 0;
@@ -424,15 +544,19 @@ static int gve_configure_resources(struct gve_device *gdev)
 		if (!gdev->counter_array)
 			return -ENOMEM;
 		memset(gdev->counter_array, 0, cnt_sz);
+		got_counters = 1;
 	}
 
 	if (!gdev->irq_db_indices) {
 		size_t db_sz = align_up_page(64UL * sizeof(struct gve_irq_db));
 
 		gdev->irq_db_indices = uk_memalign(drv_alloc, GVE_PAGE_SIZE, db_sz);
-		if (!gdev->irq_db_indices)
-			return -ENOMEM;
+		if (!gdev->irq_db_indices) {
+			rc = -ENOMEM;
+			goto fail;
+		}
 		memset(gdev->irq_db_indices, 0, db_sz);
+		got_dbs = 1;
 	}
 
 	ntfy_candidates[0] = 2U;
@@ -484,17 +608,20 @@ static int gve_configure_resources(struct gve_device *gdev)
 	}
 
 	if (rc != 0)
-		return rc;
+		goto fail;
 
 	if (gdev->queue_format == GVE_DQO_RDA_FORMAT) {
 		if (!gdev->ptype_lut_dqo) {
 			gdev->ptype_lut_dqo = uk_memalign(
 				drv_alloc, GVE_PAGE_SIZE,
 				align_up_page(sizeof(struct gve_ptype_lut)));
-			if (!gdev->ptype_lut_dqo)
-				return -ENOMEM;
+			if (!gdev->ptype_lut_dqo) {
+				rc = -ENOMEM;
+				goto fail;
+			}
 			memset(gdev->ptype_lut_dqo, 0,
 			       align_up_page(sizeof(struct gve_ptype_lut)));
+			got_ptype = 1;
 		}
 
 		memset(&cmd, 0, sizeof(cmd));
@@ -516,6 +643,25 @@ static int gve_configure_resources(struct gve_device *gdev)
 
 	gdev->resources_configured = 1;
 	return 0;
+
+fail:
+	/*
+	 * Release everything this call allocated. State the device
+	 * already had stays in place for a later retry.
+	 */
+	if (got_ptype) {
+		uk_free(drv_alloc, gdev->ptype_lut_dqo);
+		gdev->ptype_lut_dqo = NULL;
+	}
+	if (got_dbs) {
+		uk_free(drv_alloc, gdev->irq_db_indices);
+		gdev->irq_db_indices = NULL;
+	}
+	if (got_counters) {
+		uk_free(drv_alloc, gdev->counter_array);
+		gdev->counter_array = NULL;
+	}
+	return rc;
 }
 
 static int gve_netdev_probe(struct uk_netdev *dev)
@@ -553,6 +699,14 @@ static int gve_netdev_configure(struct uk_netdev *dev,
 	if (!gdev || !conf)
 		return -EINVAL;
 
+	/*
+	 * This driver runs a single queue per direction, and
+	 * info_get advertises exactly that. A larger request is a
+	 * caller bug, so refuse it here instead of ignoring it.
+	 */
+	if (conf->nb_rx_queues != 1 || conf->nb_tx_queues != 1)
+		return -EINVAL;
+
 	return gve_configure_resources(gdev);
 }
 
@@ -588,37 +742,90 @@ static int gve_netdev_rxq_info_get(struct uk_netdev *dev, uint16_t queue_id,
 	return 0;
 }
 
+/*
+ * Release one TX queue. A live queue is destroyed on the device
+ * first. A half-built queue, whose CREATE_TX_QUEUE never passed, is
+ * released with destroy_queue set to 0. A registered QPL is always
+ * unregistered before its memory returns.
+ */
+static void gve_txq_free(struct gve_device *gdev,
+			 struct uk_netdev_tx_queue *txq, int destroy_queue)
+{
+	struct uk_alloc *a;
+
+	if (!txq)
+		return;
+	a = txq->alloc ? txq->alloc : drv_alloc;
+	if (destroy_queue)
+		gve_adminq_destroy_tx_queue(gdev, txq->qid);
+	if (txq->qpl_registered)
+		gve_adminq_unregister_page_list(gdev, txq->qpl_id);
+	if (txq->qpl_page_bus)
+		uk_free(a, txq->qpl_page_bus);
+	if (txq->qpl_pages)
+		uk_free(a, txq->qpl_pages);
+	if (txq->bounce_bufs)
+		uk_free(a, txq->bounce_bufs);
+	if (txq->dqo_compl_ring)
+		uk_free(a, txq->dqo_compl_ring);
+	if (txq->dqo_tx_ring)
+		uk_free(a, txq->dqo_tx_ring);
+	if (txq->gqi_tx_ring)
+		uk_free(a, txq->gqi_tx_ring);
+	if (txq->q_resources)
+		uk_free(a, txq->q_resources);
+	uk_free(a, txq);
+}
+
 static struct uk_netdev_tx_queue *gve_netdev_txq_configure(
-	struct uk_netdev *dev, uint16_t queue_id, uint16_t nb_desc __unused,
-	struct uk_netdev_txqueue_conf *conf __unused)
+	struct uk_netdev *dev, uint16_t queue_id, uint16_t nb_desc,
+	struct uk_netdev_txqueue_conf *conf)
 {
 	struct gve_device *gdev = to_gvedev(dev);
 	struct uk_netdev_tx_queue *txq;
 	union gve_adminq_command cmd;
 	uint32_t cmd_status = 0;
+	struct uk_alloc *a;
 	size_t bounce_sz;
 	int rc;
 
 	if (!gdev || queue_id >= 1)
 		return ERR2PTR(-EINVAL);
+	/*
+	 * The driver creates the ring at the device-reported size and
+	 * advertises that size through txq_info_get. nb_desc 0 selects
+	 * the driver default. Anything else breaks the advertised
+	 * window, so reject it.
+	 */
+	if (!gve_ring_request_ok(nb_desc, gdev->tx_desc_cnt))
+		return ERR2PTR(-EINVAL);
+	a = (conf && conf->a) ? conf->a : drv_alloc;
 
 	rc = gve_configure_resources(gdev);
 	if (rc != 0)
 		return ERR2PTR(rc);
 
-	txq = uk_zalloc(drv_alloc, sizeof(*txq));
+	/* Reconfiguration: tear the live queue down before recreating. */
+	if (gdev->txq) {
+		gve_txq_free(gdev, gdev->txq, 1);
+		gdev->txq = NULL;
+	}
+
+	txq = uk_zalloc(a, sizeof(*txq));
 	if (!txq)
 		return ERR2PTR(-ENOMEM);
-
+	txq->alloc = a;
 	txq->gdev = gdev;
 	txq->qid = queue_id;
 	txq->cnt = gdev->tx_desc_cnt;
 	txq->mask = txq->cnt - 1U;
 	txq->ntfy_id = (uint32_t)queue_id;
 
-	txq->q_resources = uk_memalign(drv_alloc, GVE_PAGE_SIZE, GVE_PAGE_SIZE);
-	if (!txq->q_resources)
-		return ERR2PTR(-ENOMEM);
+	txq->q_resources = uk_memalign(a, GVE_PAGE_SIZE, GVE_PAGE_SIZE);
+	if (!txq->q_resources) {
+		rc = -ENOMEM;
+		goto err_free;
+	}
 	memset(txq->q_resources, 0, GVE_PAGE_SIZE);
 
 	if (gdev->queue_format == GVE_DQO_RDA_FORMAT) {
@@ -632,12 +839,14 @@ static struct uk_netdev_tx_queue *gve_netdev_txq_configure(
 		comp_ring_sz = align_up_page(
 			(size_t)txq->comp_cnt * sizeof(struct gve_tx_compl_desc));
 
-		txq->dqo_tx_ring = uk_memalign(drv_alloc, GVE_PAGE_SIZE, tx_ring_sz);
-		txq->dqo_compl_ring = uk_memalign(drv_alloc, GVE_PAGE_SIZE, comp_ring_sz);
+		txq->dqo_tx_ring = uk_memalign(a, GVE_PAGE_SIZE, tx_ring_sz);
+		txq->dqo_compl_ring = uk_memalign(a, GVE_PAGE_SIZE, comp_ring_sz);
 		bounce_sz = align_up_page((size_t)txq->cnt * GVE_DEFAULT_RX_BUFFER_SIZE);
-		txq->bounce_bufs = uk_memalign(drv_alloc, GVE_PAGE_SIZE, bounce_sz);
-		if (!txq->dqo_tx_ring || !txq->dqo_compl_ring || !txq->bounce_bufs)
-			return ERR2PTR(-ENOMEM);
+		txq->bounce_bufs = uk_memalign(a, GVE_PAGE_SIZE, bounce_sz);
+		if (!txq->dqo_tx_ring || !txq->dqo_compl_ring || !txq->bounce_bufs) {
+			rc = -ENOMEM;
+			goto err_free;
+		}
 
 		memset(txq->dqo_tx_ring, 0, tx_ring_sz);
 		memset(txq->dqo_compl_ring, 0, comp_ring_sz);
@@ -658,29 +867,34 @@ static struct uk_netdev_tx_queue *gve_netdev_txq_configure(
 			(size_t)txq->cnt * sizeof(union gve_tx_desc));
 		uint32_t qpl_id = GVE_RAW_ADDRESSING_QPL_ID;
 
-		txq->gqi_tx_ring = uk_memalign(drv_alloc, GVE_PAGE_SIZE, tx_ring_sz);
-		if (!txq->gqi_tx_ring)
-			return ERR2PTR(-ENOMEM);
+		txq->gqi_tx_ring = uk_memalign(a, GVE_PAGE_SIZE, tx_ring_sz);
+		if (!txq->gqi_tx_ring) {
+			rc = -ENOMEM;
+			goto err_free;
+		}
 		memset(txq->gqi_tx_ring, 0, tx_ring_sz);
 
 		if (gdev->queue_format == GVE_GQI_QPL_FORMAT) {
 			txq->qpl_id = queue_id;
 			txq->num_qpl_pages = gdev->tx_pages_per_qpl ?
 					     gdev->tx_pages_per_qpl : 64U;
-			rc = gve_register_qpl(gdev, txq->qpl_id,
+			rc = gve_register_qpl(gdev, a, txq->qpl_id,
 					      txq->num_qpl_pages,
 					      &txq->qpl_pages,
 					      &txq->qpl_page_bus);
 			if (rc != 0)
-				return ERR2PTR(rc);
+				goto err_free;
+			txq->qpl_registered = 1;
 			qpl_id = txq->qpl_id;
 		} else {
 			bounce_sz = align_up_page(
 				(size_t)txq->cnt * GVE_DEFAULT_RX_BUFFER_SIZE);
-			txq->bounce_bufs = uk_memalign(drv_alloc, GVE_PAGE_SIZE,
+			txq->bounce_bufs = uk_memalign(a, GVE_PAGE_SIZE,
 						       bounce_sz);
-			if (!txq->bounce_bufs)
-				return ERR2PTR(-ENOMEM);
+			if (!txq->bounce_bufs) {
+				rc = -ENOMEM;
+				goto err_free;
+			}
 			memset(txq->bounce_bufs, 0, bounce_sz);
 		}
 
@@ -701,34 +915,86 @@ static struct uk_netdev_tx_queue *gve_netdev_txq_configure(
 	       queue_id, gve_queue_format_name(gdev->queue_format),
 	       rc, cmd_status);
 	if (rc != 0)
-		return ERR2PTR(rc);
+		goto err_free;
 
 	gdev->txq = txq;
 	return txq;
+
+err_free:
+	/* The queue never started: release the partial build only. */
+	gve_txq_free(gdev, txq, 0);
+	return ERR2PTR(rc);
+}
+
+/*
+ * Release one RX queue. Mirrors gve_txq_free: destroy the live queue
+ * on the device first, unregister a registered QPL, then free the
+ * memory through the queue allocator.
+ */
+static void gve_rxq_free(struct gve_device *gdev,
+			 struct uk_netdev_rx_queue *rxq, int destroy_queue)
+{
+	struct uk_alloc *a;
+
+	if (!rxq)
+		return;
+	a = rxq->alloc ? rxq->alloc : drv_alloc;
+	if (destroy_queue)
+		gve_adminq_destroy_rx_queue(gdev, rxq->qid);
+	if (rxq->qpl_registered)
+		gve_adminq_unregister_page_list(gdev, rxq->qpl_id);
+	if (rxq->qpl_page_bus)
+		uk_free(a, rxq->qpl_page_bus);
+	if (rxq->qpl_pages)
+		uk_free(a, rxq->qpl_pages);
+	if (rxq->dqo_rx_bufs)
+		uk_free(a, rxq->dqo_rx_bufs);
+	if (rxq->dqo_complq_ring)
+		uk_free(a, rxq->dqo_complq_ring);
+	if (rxq->dqo_bufq_ring)
+		uk_free(a, rxq->dqo_bufq_ring);
+	if (rxq->gqi_data_ring)
+		uk_free(a, rxq->gqi_data_ring);
+	if (rxq->gqi_desc_ring)
+		uk_free(a, rxq->gqi_desc_ring);
+	if (rxq->q_resources)
+		uk_free(a, rxq->q_resources);
+	uk_free(a, rxq);
 }
 
 static struct uk_netdev_rx_queue *gve_netdev_rxq_configure(
-	struct uk_netdev *dev, uint16_t queue_id, uint16_t nb_desc __unused,
+	struct uk_netdev *dev, uint16_t queue_id, uint16_t nb_desc,
 	struct uk_netdev_rxqueue_conf *conf)
 {
 	struct gve_device *gdev = to_gvedev(dev);
 	struct uk_netdev_rx_queue *rxq;
 	union gve_adminq_command cmd;
 	uint32_t cmd_status = 0;
+	struct uk_alloc *a;
 	uint32_t i;
 	int rc;
 
 	if (!gdev || !conf || !conf->alloc_rxpkts || queue_id >= 1)
 		return ERR2PTR(-EINVAL);
+	/* Same policy as the TX queue: device size or driver default. */
+	if (!gve_ring_request_ok(nb_desc, gdev->rx_desc_cnt))
+		return ERR2PTR(-EINVAL);
+	a = (conf->a) ? conf->a : drv_alloc;
 
 	rc = gve_configure_resources(gdev);
 	if (rc != 0)
 		return ERR2PTR(rc);
 
-	rxq = uk_zalloc(drv_alloc, sizeof(*rxq));
+	/* Reconfiguration: tear the live queue down before recreating. */
+	if (gdev->rxq) {
+		gve_rxq_free(gdev, gdev->rxq, 1);
+		gdev->rxq = NULL;
+	}
+
+	rxq = uk_zalloc(a, sizeof(*rxq));
 	if (!rxq)
 		return ERR2PTR(-ENOMEM);
-
+	rxq->alloc = a;
 	rxq->gdev = gdev;
 	rxq->qid = queue_id;
 	rxq->cnt = gdev->rx_desc_cnt;
@@ -737,9 +1003,11 @@ static struct uk_netdev_rx_queue *gve_netdev_rxq_configure(
 	rxq->alloc_rxpkts = conf->alloc_rxpkts;
 	rxq->alloc_rxpkts_argp = conf->alloc_rxpkts_argp;
 
-	rxq->q_resources = uk_memalign(drv_alloc, GVE_PAGE_SIZE, GVE_PAGE_SIZE);
-	if (!rxq->q_resources)
-		return ERR2PTR(-ENOMEM);
+	rxq->q_resources = uk_memalign(a, GVE_PAGE_SIZE, GVE_PAGE_SIZE);
+	if (!rxq->q_resources) {
+		rc = -ENOMEM;
+		goto err_free;
+	}
 	memset(rxq->q_resources, 0, GVE_PAGE_SIZE);
 
 	if (gdev->queue_format == GVE_DQO_RDA_FORMAT) {
@@ -756,11 +1024,13 @@ static struct uk_netdev_rx_queue *gve_netdev_rxq_configure(
 		bufs_sz = align_up_page(
 			(size_t)rxq->buf_cnt * GVE_DEFAULT_RX_BUFFER_SIZE);
 
-		rxq->dqo_bufq_ring = uk_memalign(drv_alloc, GVE_PAGE_SIZE, bufq_sz);
-		rxq->dqo_complq_ring = uk_memalign(drv_alloc, GVE_PAGE_SIZE, complq_sz);
-		rxq->dqo_rx_bufs = uk_memalign(drv_alloc, GVE_PAGE_SIZE, bufs_sz);
-		if (!rxq->dqo_bufq_ring || !rxq->dqo_complq_ring || !rxq->dqo_rx_bufs)
-			return ERR2PTR(-ENOMEM);
+		rxq->dqo_bufq_ring = uk_memalign(a, GVE_PAGE_SIZE, bufq_sz);
+		rxq->dqo_complq_ring = uk_memalign(a, GVE_PAGE_SIZE, complq_sz);
+		rxq->dqo_rx_bufs = uk_memalign(a, GVE_PAGE_SIZE, bufs_sz);
+		if (!rxq->dqo_bufq_ring || !rxq->dqo_complq_ring || !rxq->dqo_rx_bufs) {
+			rc = -ENOMEM;
+			goto err_free;
+		}
 
 		memset(rxq->dqo_bufq_ring, 0, bufq_sz);
 		memset(rxq->dqo_complq_ring, 0, complq_sz);
@@ -793,10 +1063,12 @@ static struct uk_netdev_rx_queue *gve_netdev_rxq_configure(
 			(size_t)rxq->cnt * sizeof(union gve_rx_data_slot));
 		uint32_t qpl_id = GVE_RAW_ADDRESSING_QPL_ID;
 
-		rxq->gqi_desc_ring = uk_memalign(drv_alloc, GVE_PAGE_SIZE, desc_sz);
-		rxq->gqi_data_ring = uk_memalign(drv_alloc, GVE_PAGE_SIZE, data_sz);
-		if (!rxq->gqi_desc_ring || !rxq->gqi_data_ring)
-			return ERR2PTR(-ENOMEM);
+		rxq->gqi_desc_ring = uk_memalign(a, GVE_PAGE_SIZE, desc_sz);
+		rxq->gqi_data_ring = uk_memalign(a, GVE_PAGE_SIZE, data_sz);
+		if (!rxq->gqi_desc_ring || !rxq->gqi_data_ring) {
+			rc = -ENOMEM;
+			goto err_free;
+		}
 
 		memset(rxq->gqi_desc_ring, 0, desc_sz);
 		memset(rxq->gqi_data_ring, 0, data_sz);
@@ -805,12 +1077,13 @@ static struct uk_netdev_rx_queue *gve_netdev_rxq_configure(
 		rxq->num_qpl_pages = rxq->cnt;
 		if (gdev->queue_format == GVE_GQI_QPL_FORMAT) {
 			rxq->qpl_id = gdev->max_tx_queues + queue_id;
-			rc = gve_register_qpl(gdev, rxq->qpl_id,
+			rc = gve_register_qpl(gdev, a, rxq->qpl_id,
 					      rxq->num_qpl_pages,
 					      &rxq->qpl_pages,
 					      &rxq->qpl_page_bus);
 			if (rc != 0)
-				return ERR2PTR(rc);
+				goto err_free;
+			rxq->qpl_registered = 1;
 			qpl_id = rxq->qpl_id;
 
 			for (i = 0; i < rxq->cnt; i++) {
@@ -819,10 +1092,12 @@ static struct uk_netdev_rx_queue *gve_netdev_rxq_configure(
 			}
 		} else {
 			rxq->qpl_pages = uk_memalign(
-				drv_alloc, GVE_PAGE_SIZE,
+				a, GVE_PAGE_SIZE,
 				(size_t)rxq->num_qpl_pages * GVE_PAGE_SIZE);
-			if (!rxq->qpl_pages)
-				return ERR2PTR(-ENOMEM);
+			if (!rxq->qpl_pages) {
+				rc = -ENOMEM;
+				goto err_free;
+			}
 			memset(rxq->qpl_pages, 0,
 			       (size_t)rxq->num_qpl_pages * GVE_PAGE_SIZE);
 
@@ -852,10 +1127,15 @@ static struct uk_netdev_rx_queue *gve_netdev_rxq_configure(
 	       queue_id, gve_queue_format_name(gdev->queue_format),
 	       rc, cmd_status);
 	if (rc != 0)
-		return ERR2PTR(rc);
+		goto err_free;
 
 	gdev->rxq = rxq;
 	return rxq;
+
+err_free:
+	/* The queue never started: release the partial build only. */
+	gve_rxq_free(gdev, rxq, 0);
+	return ERR2PTR(rc);
 }
 
 static int gve_netdev_start(struct uk_netdev *dev)
@@ -1289,15 +1569,17 @@ static int gve_add_dev(struct pci_device *pdev)
 	uint32_t dev_status, max_tx_q, max_rx_q;
 	const char *ver_str = "GVE-1.0.0\n";
 	const char *p;
-	union gve_adminq_command *adminq;
+	union gve_adminq_command *adminq = NULL;
 	uint64_t adminq_paddr;
-	struct gve_driver_info *drv_info;
-	uint8_t *desc_buf;
+	struct gve_driver_info *drv_info = NULL;
+	uint8_t *desc_buf = NULL;
 	struct gve_device_descriptor *desc;
 	union gve_adminq_command cmd;
 	uint32_t cmd_status = 0;
 	uint16_t num_opts, total_len, i;
-	uint8_t *opt_ptr;
+	uint32_t opt_off, desc_region;
+	int mapped_bar0 = 0;
+	int mapped_bar2 = 0;
 	int has_gqi_raw = 0;
 	int rc;
 
@@ -1331,11 +1613,19 @@ static int gve_add_dev(struct pci_device *pdev)
 	       (unsigned long long)bar2_paddr);
 
 	reg_bar0 = (volatile struct gve_registers *)gve_map_bar(bar0_paddr, 0);
-	db_bar2 = (volatile uint32_t *)gve_map_bar(bar2_paddr, 1);
-	if (!reg_bar0 || !db_bar2) {
-		printf("GATE_FAIL: gve BAR mapping failed\n");
-		return -ENOMEM;
+	if (!reg_bar0) {
+		printf("GATE_FAIL: gve BAR0 mapping failed\n");
+		rc = -ENOMEM;
+		goto err;
 	}
+	mapped_bar0 = 1;
+	db_bar2 = (volatile uint32_t *)gve_map_bar(bar2_paddr, 1);
+	if (!db_bar2) {
+		printf("GATE_FAIL: gve BAR2 mapping failed\n");
+		rc = -ENOMEM;
+		goto err;
+	}
+	mapped_bar2 = 1;
 	gdev->reg_bar0 = reg_bar0;
 	gdev->db_bar2 = db_bar2;
 
@@ -1358,7 +1648,8 @@ static int gve_add_dev(struct pci_device *pdev)
 	adminq = uk_memalign(drv_alloc, GVE_PAGE_SIZE, GVE_PAGE_SIZE);
 	if (!adminq) {
 		printf("GATE_FAIL: gve adminq allocation failed\n");
-		return -ENOMEM;
+		rc = -ENOMEM;
+		goto err;
 	}
 	memset(adminq, 0, GVE_PAGE_SIZE);
 	gdev->adminq = adminq;
@@ -1383,7 +1674,8 @@ static int gve_add_dev(struct pci_device *pdev)
 	drv_info = uk_memalign(drv_alloc, GVE_PAGE_SIZE, GVE_PAGE_SIZE);
 	if (!drv_info) {
 		printf("GATE_FAIL: gve driver_info allocation failed\n");
-		return -ENOMEM;
+		rc = -ENOMEM;
+		goto err;
 	}
 	memset(drv_info, 0, GVE_PAGE_SIZE);
 	drv_info->os_type = 1; /* Linux */
@@ -1417,7 +1709,8 @@ static int gve_add_dev(struct pci_device *pdev)
 	desc_buf = uk_memalign(drv_alloc, GVE_PAGE_SIZE, GVE_PAGE_SIZE);
 	if (!desc_buf) {
 		printf("GATE_FAIL: gve desc_buf allocation failed\n");
-		return -ENOMEM;
+		rc = -ENOMEM;
+		goto err;
 	}
 	memset(desc_buf, 0, GVE_PAGE_SIZE);
 
@@ -1434,7 +1727,7 @@ static int gve_add_dev(struct pci_device *pdev)
 	if (rc != 0) {
 		printf("GATE_FAIL: DESCRIBE_DEVICE failed with status=0x%x\n",
 		       cmd_status);
-		return rc;
+		goto err;
 	}
 
 	desc = (struct gve_device_descriptor *)desc_buf;
@@ -1467,21 +1760,32 @@ static int gve_add_dev(struct pci_device *pdev)
 	printf("  num_device_options:   %u (total_length=%u)\n",
 	       num_opts, total_len);
 
-	opt_ptr = desc_buf + sizeof(*desc);
+	/*
+	 * Walk the option TLVs inside a bounded region. The device
+	 * writes into the 4096-byte descriptor page and reports the
+	 * used length, header included, in total_length. Trust the
+	 * smaller of the two bounds. A parser may read a fixed struct
+	 * from a body only when that struct lies fully inside the
+	 * region and the declared body length covers it.
+	 */
+	desc_region = (total_len >= (uint16_t)sizeof(*desc) &&
+		       total_len <= (uint16_t)GVE_PAGE_SIZE)
+		      ? (uint32_t)total_len : (uint32_t)GVE_PAGE_SIZE;
+	opt_off = (uint32_t)sizeof(*desc);
 	for (i = 0; i < num_opts; i++) {
 		struct gve_device_option *opt;
 		uint16_t opt_id, opt_len;
 		uint32_t req_feat;
 		uint8_t *opt_body;
 
-		if ((size_t)(opt_ptr - desc_buf) + sizeof(*opt) > GVE_PAGE_SIZE)
+		if (!gve_tlv_hdr_fits(opt_off, desc_region, sizeof(*opt)))
 			break;
 
-		opt = (struct gve_device_option *)opt_ptr;
+		opt = (struct gve_device_option *)(desc_buf + opt_off);
 		opt_id = bswap16(opt->option_id);
 		opt_len = bswap16(opt->option_length);
 		req_feat = bswap32(opt->required_features_mask);
-		opt_body = opt_ptr + sizeof(*opt);
+		opt_body = desc_buf + opt_off + sizeof(*opt);
 
 		printf("  [Option %u] id=0x%x (%s) len=%u req_feat=0x%x",
 		       i, opt_id, gve_option_name(opt_id), opt_len, req_feat);
@@ -1490,7 +1794,9 @@ static int gve_add_dev(struct pci_device *pdev)
 			has_gqi_raw = 1;
 		} else if (opt_id == GVE_DEV_OPT_ID_GQI_RDA) {
 			gdev->has_gqi_rda = 1;
-			if (opt_len >= sizeof(struct gve_device_option_gqi_rda)) {
+			if (gve_tlv_body_fits(opt_off + sizeof(*opt), opt_len,
+					      sizeof(struct gve_device_option_gqi_rda),
+					      desc_region)) {
 				struct gve_device_option_gqi_rda *r =
 					(struct gve_device_option_gqi_rda *)opt_body;
 				printf(" sup_feat=0x%x",
@@ -1498,7 +1804,9 @@ static int gve_add_dev(struct pci_device *pdev)
 			}
 		} else if (opt_id == GVE_DEV_OPT_ID_GQI_QPL) {
 			gdev->has_gqi_qpl = 1;
-			if (opt_len >= sizeof(struct gve_device_option_gqi_qpl)) {
+			if (gve_tlv_body_fits(opt_off + sizeof(*opt), opt_len,
+					      sizeof(struct gve_device_option_gqi_qpl),
+					      desc_region)) {
 				struct gve_device_option_gqi_qpl *q =
 					(struct gve_device_option_gqi_qpl *)opt_body;
 				printf(" sup_feat=0x%x",
@@ -1506,7 +1814,9 @@ static int gve_add_dev(struct pci_device *pdev)
 			}
 		} else if (opt_id == GVE_DEV_OPT_ID_DQO_RDA) {
 			gdev->has_dqo_rda = 1;
-			if (opt_len >= sizeof(struct gve_device_option_dqo_rda)) {
+			if (gve_tlv_body_fits(opt_off + sizeof(*opt), opt_len,
+					      sizeof(struct gve_device_option_dqo_rda),
+					      desc_region)) {
 				struct gve_device_option_dqo_rda *d =
 					(struct gve_device_option_dqo_rda *)opt_body;
 				gdev->tx_comp_ring_entries =
@@ -1520,7 +1830,9 @@ static int gve_add_dev(struct pci_device *pdev)
 			}
 		} else if (opt_id == GVE_DEV_OPT_ID_DQO_QPL) {
 			gdev->has_dqo_qpl = 1;
-			if (opt_len >= sizeof(struct gve_device_option_dqo_qpl)) {
+			if (gve_tlv_body_fits(opt_off + sizeof(*opt), opt_len,
+					      sizeof(struct gve_device_option_dqo_qpl),
+					      desc_region)) {
 				struct gve_device_option_dqo_qpl *dq =
 					(struct gve_device_option_dqo_qpl *)opt_body;
 				printf(" sup_feat=0x%x tx_pages_qpl=%u rx_pages_qpl=%u",
@@ -1529,7 +1841,9 @@ static int gve_add_dev(struct pci_device *pdev)
 				       bswap16(dq->rx_pages_per_qpl));
 			}
 		} else if (opt_id == GVE_DEV_OPT_ID_JUMBO_FRAMES) {
-			if (opt_len >= sizeof(struct gve_device_option_jumbo_frames)) {
+			if (gve_tlv_body_fits(opt_off + sizeof(*opt), opt_len,
+					      sizeof(struct gve_device_option_jumbo_frames),
+					      desc_region)) {
 				struct gve_device_option_jumbo_frames *jf =
 					(struct gve_device_option_jumbo_frames *)opt_body;
 				gdev->max_mtu = bswap16(jf->max_mtu);
@@ -1538,7 +1852,7 @@ static int gve_add_dev(struct pci_device *pdev)
 		}
 		printf("\n");
 
-		opt_ptr += sizeof(*opt) + opt_len;
+		opt_off += (uint32_t)sizeof(*opt) + opt_len;
 	}
 
 	if (gdev->has_dqo_rda)
@@ -1563,19 +1877,41 @@ static int gve_add_dev(struct pci_device *pdev)
 	    !gve_ring_size_valid(gdev->rx_desc_cnt)) {
 		printf("GATE_FAIL: gve invalid ring size tx=%u rx=%u\n",
 		       gdev->tx_desc_cnt, gdev->rx_desc_cnt);
-		return -EINVAL;
+		rc = -EINVAL;
+		goto err;
 	}
 	if (gdev->queue_format == GVE_DQO_RDA_FORMAT &&
 	    (!gve_ring_size_valid(gdev->tx_comp_ring_entries) ||
 	     !gve_ring_size_valid(gdev->rx_buff_ring_entries))) {
 		printf("GATE_FAIL: gve invalid DQO ring size tx_comp=%u rx_buff=%u\n",
 		       gdev->tx_comp_ring_entries, gdev->rx_buff_ring_entries);
-		return -EINVAL;
+		rc = -EINVAL;
+		goto err;
 	}
 
 	if (gdev->mtu == 0) {
 		printf("GATE_FAIL: gve invalid MTU 0\n");
-		return -EINVAL;
+		rc = -EINVAL;
+		goto err;
+	}
+
+	/*
+	 * The receive path delivers one frame per 2048-byte buffer.
+	 * A jumbo advertisement would promise frames the receive path
+	 * cannot produce, so cap what info_get may advertise. Raise
+	 * the cap only together with multi-buffer RX.
+	 */
+	{
+		uint16_t capped = gve_max_mtu_capped(
+			gdev->max_mtu, GVE_DEFAULT_RX_BUFFER_SIZE);
+
+		if (capped != gdev->max_mtu)
+			printf("[gve] max_mtu clamped %u -> %u for single-buffer RX\n",
+			       gdev->max_mtu, capped);
+		gdev->max_mtu = capped;
+		if (gdev->mtu > gdev->max_mtu)
+			printf("[gve] Warning: device MTU %u exceeds the receive cap %u\n",
+			       gdev->mtu, gdev->max_mtu);
 	}
 
 	printf("========================================\n");
@@ -1590,11 +1926,33 @@ static int gve_add_dev(struct pci_device *pdev)
 	rc = uk_netdev_drv_register(&gdev->netdev, drv_alloc, DRIVER_NAME);
 	if (rc < 0) {
 		printf("GATE_FAIL: uk_netdev_drv_register failed rc=%d\n", rc);
-		return rc;
+		goto err;
 	}
 	printf("[gve] Registered uk_netdev id=%d (%s)\n", rc, DRIVER_NAME);
 
+	/*
+	 * The driver info and device descriptor only served the
+	 * handshake and parsing above. Nothing references them after
+	 * registration, so release them.
+	 */
+	uk_free(drv_alloc, desc_buf);
+	uk_free(drv_alloc, drv_info);
 	return 0;
+
+err:
+	/* Unwind every allocation and mapping this call made. */
+	if (desc_buf)
+		uk_free(drv_alloc, desc_buf);
+	if (drv_info)
+		uk_free(drv_alloc, drv_info);
+	if (adminq)
+		uk_free(drv_alloc, adminq);
+	if (mapped_bar2)
+		gve_unmap_bar(1);
+	if (mapped_bar0)
+		gve_unmap_bar(0);
+	uk_free(drv_alloc, gdev);
+	return rc;
 }
 
 static int gve_drv_init(struct uk_alloc *a)
