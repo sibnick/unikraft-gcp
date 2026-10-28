@@ -18,11 +18,20 @@
 #include <uk/netdev.h>
 #include <uk/netdev_core.h>
 #include <uk/netdev_driver.h>
+#include <uk/plat/time.h>
 #include <gve.h>
 
 #define DRIVER_NAME		"gve"
 #define GVE_PAGE_SIZE		4096UL
 #define GVE_PKT_BUF_ALIGN	2048UL
+/*
+ * Admin Queue completion bound. The Linux gve driver waits up to
+ * 10 s for one command. The guest is single-threaded here, so the
+ * wait is a busy loop with pause instead of a sleep.
+ */
+#define GVE_ADMINQ_TIMEOUT_MSEC	10000UL
+/* Bound for the link-up poll in netdev_start. */
+#define GVE_LINK_TIMEOUT_MSEC	2000UL
 
 static struct uk_alloc *drv_alloc;
 
@@ -124,6 +133,7 @@ struct gve_device {
 	uint32_t max_tx_queues;
 	uint32_t max_rx_queues;
 	uint64_t max_registered_pages;
+	uint64_t registered_pages;	/* pages in QPLs the device holds now */
 
 	uint32_t *counter_array;
 	struct gve_irq_db *irq_db_indices;
@@ -382,7 +392,7 @@ static int gve_adminq_exec(volatile struct gve_registers *reg_bar0,
 	uint32_t target;
 	uint32_t ev_cnt = 0;
 	uint32_t status;
-	int i;
+	__nsec deadline;
 
 	memcpy(&adminq[slot], cmd_in, sizeof(*cmd_in));
 	adminq[slot].status = GVE_ADMINQ_COMMAND_UNSET;
@@ -392,16 +402,26 @@ static int gve_adminq_exec(volatile struct gve_registers *reg_bar0,
 	target = *prod_cnt;
 	mmio_write32(&reg_bar0->adminq_doorbell, bswap32(target));
 
-	for (i = 0; i < 10000000; i++) {
+	/*
+	 * Time-based wait. ukplat_monotonic_clock() reads the
+	 * calibrated TSC clock, so the bound does not depend on the
+	 * loop speed or the CPU frequency of a particular machine
+	 * size.
+	 */
+	deadline = ukplat_monotonic_clock() +
+		   ukarch_time_msec_to_nsec(GVE_ADMINQ_TIMEOUT_MSEC);
+	for (;;) {
 		ev_cnt = bswap32(mmio_read32(&reg_bar0->adminq_event_counter));
 		if (ev_cnt == target)
+			break;
+		if (ukplat_monotonic_clock() >= deadline)
 			break;
 		__asm__ __volatile__("pause" ::: "memory");
 	}
 
 	if (ev_cnt != target) {
-		printf("[gve] AdminQ timeout: doorbell=%u event_counter=%u\n",
-		       target, ev_cnt);
+		uk_pr_err("gve: AdminQ timeout after %u ms: doorbell=%u event_counter=%u\n",
+			  (unsigned int)GVE_ADMINQ_TIMEOUT_MSEC, target, ev_cnt);
 		return -ETIMEDOUT;
 	}
 
@@ -429,8 +449,8 @@ static void gve_adminq_destroy_tx_queue(struct gve_device *gdev,
 	cmd.destroy_tx_queue.queue_id = bswap32(queue_id);
 	rc = gve_adminq_exec(gdev->reg_bar0, gdev->adminq,
 			     &gdev->adminq_prod_cnt, &cmd, &cmd_status);
-	printf("[gve] DESTROY_TX_QUEUE qid=%u rc=%d status=0x%x\n",
-	       queue_id, rc, cmd_status);
+	uk_pr_info("gve: DESTROY_TX_QUEUE qid=%u rc=%d status=0x%x\n",
+		   queue_id, rc, cmd_status);
 }
 
 static void gve_adminq_destroy_rx_queue(struct gve_device *gdev,
@@ -445,12 +465,13 @@ static void gve_adminq_destroy_rx_queue(struct gve_device *gdev,
 	cmd.destroy_rx_queue.queue_id = bswap32(queue_id);
 	rc = gve_adminq_exec(gdev->reg_bar0, gdev->adminq,
 			     &gdev->adminq_prod_cnt, &cmd, &cmd_status);
-	printf("[gve] DESTROY_RX_QUEUE qid=%u rc=%d status=0x%x\n",
-	       queue_id, rc, cmd_status);
+	uk_pr_info("gve: DESTROY_RX_QUEUE qid=%u rc=%d status=0x%x\n",
+		   queue_id, rc, cmd_status);
 }
 
 static void gve_adminq_unregister_page_list(struct gve_device *gdev,
-					    uint32_t qpl_id)
+					    uint32_t qpl_id,
+					    uint32_t num_pages)
 {
 	union gve_adminq_command cmd;
 	uint32_t cmd_status = 0;
@@ -461,8 +482,18 @@ static void gve_adminq_unregister_page_list(struct gve_device *gdev,
 	cmd.unreg_page_list.page_list_id = bswap32(qpl_id);
 	rc = gve_adminq_exec(gdev->reg_bar0, gdev->adminq,
 			     &gdev->adminq_prod_cnt, &cmd, &cmd_status);
-	printf("[gve] UNREGISTER_PAGE_LIST id=%u rc=%d status=0x%x\n",
-	       qpl_id, rc, cmd_status);
+	uk_pr_info("gve: UNREGISTER_PAGE_LIST id=%u rc=%d status=0x%x\n",
+		   qpl_id, rc, cmd_status);
+	/*
+	 * Release the driver-side budget share unconditionally. The
+	 * count mirrors what gve_register_qpl added on success. A
+	 * failed unregister only happens during unwinding, where the
+	 * device state no longer matters to this driver.
+	 */
+	if (gdev->registered_pages >= num_pages)
+		gdev->registered_pages -= num_pages;
+	else
+		gdev->registered_pages = 0;
 }
 
 static int gve_register_qpl(struct gve_device *gdev, struct uk_alloc *a,
@@ -477,12 +508,27 @@ static int gve_register_qpl(struct gve_device *gdev, struct uk_alloc *a,
 	uint32_t i;
 	int rc;
 
+	/*
+	 * Enforce the device page budget before any allocation. A
+	 * device that reports 0 sets no limit. The passing c3 device
+	 * reports 16384 pages, far above this driver's worst case of
+	 * 1024 RX plus 64 TX pages, so the check only refuses broken
+	 * or hostile descriptors.
+	 */
+	if (!gve_qpl_within_limit(gdev->registered_pages, num_pages,
+				  gdev->max_registered_pages)) {
+		uk_pr_err("gve: QPL id %u wants %u pages, budget is %lu of %llu used\n",
+			  qpl_id, num_pages,
+			  (unsigned long)gdev->registered_pages,
+			  (unsigned long long)gdev->max_registered_pages);
+		return -ENOMEM;
+	}
+
 	pages = uk_memalign(a, GVE_PAGE_SIZE,
 			    (size_t)num_pages * GVE_PAGE_SIZE);
 	if (!pages)
 		return -ENOMEM;
 	memset(pages, 0, (size_t)num_pages * GVE_PAGE_SIZE);
-
 	page_bus = uk_memalign(a, GVE_PAGE_SIZE,
 			       align_up_page((size_t)num_pages * sizeof(uint64_t)));
 	if (!page_bus) {
@@ -507,14 +553,15 @@ static int gve_register_qpl(struct gve_device *gdev, struct uk_alloc *a,
 
 	rc = gve_adminq_exec(gdev->reg_bar0, gdev->adminq,
 			     &gdev->adminq_prod_cnt, &cmd, &cmd_status);
-	printf("[gve] REGISTER_PAGE_LIST id=%u pages=%u rc=%d status=0x%x\n",
-	       qpl_id, num_pages, rc, cmd_status);
+	uk_pr_info("gve: REGISTER_PAGE_LIST id=%u pages=%u rc=%d status=0x%x\n",
+		   qpl_id, num_pages, rc, cmd_status);
 	if (rc != 0) {
 		uk_free(a, page_bus);
 		uk_free(a, pages);
 		return rc;
 	}
 
+	gdev->registered_pages += num_pages;
 	*pages_out = pages;
 	*page_bus_out = page_bus;
 	return 0;
@@ -577,10 +624,10 @@ static int gve_configure_resources(struct gve_device *gdev)
 
 		rc = gve_adminq_exec(gdev->reg_bar0, gdev->adminq,
 				     &gdev->adminq_prod_cnt, &cmd, &cmd_status);
-		printf("[gve] CONFIGURE_DEVICE_RESOURCES fmt=%s(%u) counters=%u irq_dbs=%u rc=%d status=0x%x\n",
-		       gve_queue_format_name(gdev->queue_format),
-		       (unsigned int)gdev->queue_format,
-		       gdev->num_event_counters, num_ntfy, rc, cmd_status);
+		uk_pr_info("gve: CONFIGURE_DEVICE_RESOURCES fmt=%s(%u) counters=%u irq_dbs=%u rc=%d status=0x%x\n",
+			   gve_queue_format_name(gdev->queue_format),
+			   (unsigned int)gdev->queue_format,
+			   gdev->num_event_counters, num_ntfy, rc, cmd_status);
 		if (rc == 0) {
 			gdev->num_ntfy_blks = num_ntfy;
 			break;
@@ -589,8 +636,8 @@ static int gve_configure_resources(struct gve_device *gdev)
 
 	if (rc != 0 && gdev->queue_format != GVE_GQI_QPL_FORMAT &&
 	    gdev->has_gqi_qpl) {
-		printf("[gve] Falling back from %s to GQI_QPL\n",
-		       gve_queue_format_name(gdev->queue_format));
+		uk_pr_info("gve: Falling back from %s to GQI_QPL\n",
+			   gve_queue_format_name(gdev->queue_format));
 		gdev->queue_format = GVE_GQI_QPL_FORMAT;
 		gve_adminq_fill_configure_resources(
 			&cmd,
@@ -601,8 +648,8 @@ static int gve_configure_resources(struct gve_device *gdev)
 			(uint8_t)gdev->queue_format);
 		rc = gve_adminq_exec(gdev->reg_bar0, gdev->adminq,
 				     &gdev->adminq_prod_cnt, &cmd, &cmd_status);
-		printf("[gve] CONFIGURE_DEVICE_RESOURCES (fallback GQI_QPL) rc=%d status=0x%x\n",
-		       rc, cmd_status);
+		uk_pr_info("gve: CONFIGURE_DEVICE_RESOURCES (fallback GQI_QPL) rc=%d status=0x%x\n",
+			   rc, cmd_status);
 		if (rc == 0)
 			gdev->num_ntfy_blks = ntfy_candidates[0];
 	}
@@ -633,11 +680,11 @@ static int gve_configure_resources(struct gve_device *gdev)
 
 		rc = gve_adminq_exec(gdev->reg_bar0, gdev->adminq,
 				     &gdev->adminq_prod_cnt, &cmd, &cmd_status);
-		printf("[gve] GET_PTYPE_MAP rc=%d status=0x%x\n",
-		       rc, cmd_status);
+		uk_pr_info("gve: GET_PTYPE_MAP rc=%d status=0x%x\n",
+			   rc, cmd_status);
 		if (rc != 0) {
-			printf("[gve] Warning: GET_PTYPE_MAP returned status=0x%x\n",
-			       cmd_status);
+			uk_pr_info("gve: Warning: GET_PTYPE_MAP returned status=0x%x\n",
+				   cmd_status);
 		}
 	}
 
@@ -759,7 +806,8 @@ static void gve_txq_free(struct gve_device *gdev,
 	if (destroy_queue)
 		gve_adminq_destroy_tx_queue(gdev, txq->qid);
 	if (txq->qpl_registered)
-		gve_adminq_unregister_page_list(gdev, txq->qpl_id);
+		gve_adminq_unregister_page_list(gdev, txq->qpl_id,
+						txq->num_qpl_pages);
 	if (txq->qpl_page_bus)
 		uk_free(a, txq->qpl_page_bus);
 	if (txq->qpl_pages)
@@ -911,9 +959,9 @@ static struct uk_netdev_tx_queue *gve_netdev_txq_configure(
 
 	rc = gve_adminq_exec(gdev->reg_bar0, gdev->adminq,
 			     &gdev->adminq_prod_cnt, &cmd, &cmd_status);
-	printf("[gve] CREATE_TX_QUEUE qid=%u fmt=%s rc=%d status=0x%x\n",
-	       queue_id, gve_queue_format_name(gdev->queue_format),
-	       rc, cmd_status);
+	uk_pr_info("gve: CREATE_TX_QUEUE qid=%u fmt=%s rc=%d status=0x%x\n",
+		   queue_id, gve_queue_format_name(gdev->queue_format),
+		   rc, cmd_status);
 	if (rc != 0)
 		goto err_free;
 
@@ -942,7 +990,8 @@ static void gve_rxq_free(struct gve_device *gdev,
 	if (destroy_queue)
 		gve_adminq_destroy_rx_queue(gdev, rxq->qid);
 	if (rxq->qpl_registered)
-		gve_adminq_unregister_page_list(gdev, rxq->qpl_id);
+		gve_adminq_unregister_page_list(gdev, rxq->qpl_id,
+						rxq->num_qpl_pages);
 	if (rxq->qpl_page_bus)
 		uk_free(a, rxq->qpl_page_bus);
 	if (rxq->qpl_pages)
@@ -1123,9 +1172,9 @@ static struct uk_netdev_rx_queue *gve_netdev_rxq_configure(
 
 	rc = gve_adminq_exec(gdev->reg_bar0, gdev->adminq,
 			     &gdev->adminq_prod_cnt, &cmd, &cmd_status);
-	printf("[gve] CREATE_RX_QUEUE qid=%u fmt=%s rc=%d status=0x%x\n",
-	       queue_id, gve_queue_format_name(gdev->queue_format),
-	       rc, cmd_status);
+	uk_pr_info("gve: CREATE_RX_QUEUE qid=%u fmt=%s rc=%d status=0x%x\n",
+		   queue_id, gve_queue_format_name(gdev->queue_format),
+		   rc, cmd_status);
 	if (rc != 0)
 		goto err_free;
 
@@ -1143,6 +1192,9 @@ static int gve_netdev_start(struct uk_netdev *dev)
 	struct gve_device *gdev = to_gvedev(dev);
 	uint32_t tx_db_idx, tx_cnt_idx;
 	uint32_t rx_db_idx, rx_cnt_idx;
+	uint32_t dev_status;
+	__nsec deadline;
+	int link_up = 0;
 
 	if (!gdev || !gdev->txq || !gdev->rxq)
 		return -EINVAL;
@@ -1158,28 +1210,48 @@ static int gve_netdev_start(struct uk_netdev *dev)
 	if (gdev->queue_format == GVE_DQO_RDA_FORMAT) {
 		mmio_write32(&gdev->db_bar2[rx_db_idx],
 			     gdev->rxq->dqo_bufq_tail);
-
-		if (gdev->irq_db_indices) {
-			if (gdev->irq_db_indices[0].index != 0) {
-				uint32_t irq_db0 = bswap32(gdev->irq_db_indices[0].index);
-
-				mmio_write32(&gdev->db_bar2[irq_db0],
-					     (3U << 3) | 1U);
-			}
-			if (gdev->irq_db_indices[1].index != 0) {
-				uint32_t irq_db1 = bswap32(gdev->irq_db_indices[1].index);
-
-				mmio_write32(&gdev->db_bar2[irq_db1],
-					     (3U << 3) | 1U);
-			}
-		}
+		/*
+		 * The driver never arms the interrupt translation
+		 * rings. It enables no MSI-X vector and receives every
+		 * packet by polling, so an ITR write would only let the
+		 * device raise interrupts nobody handles. The irq door
+		 * block array stays allocated because
+		 * CONFIGURE_DEVICE_RESOURCES requires it.
+		 */
 	} else {
 		mmio_write32(&gdev->db_bar2[rx_db_idx],
 			     bswap32(gdev->rxq->gqi_fill_cnt));
 	}
 
-	printf("[gve] Queue resources ready: TX0(db=%u, cnt=%u) RX0(db=%u, cnt=%u)\n",
-	       tx_db_idx, tx_cnt_idx, rx_db_idx, rx_cnt_idx);
+	uk_pr_info("gve: Queue resources ready: TX0(db=%u, cnt=%u) RX0(db=%u, cnt=%u)\n",
+		   tx_db_idx, tx_cnt_idx, rx_db_idx, rx_cnt_idx);
+
+	/*
+	 * Do not print the gate marker for a link-down device. Poll
+	 * the BAR0 link bit for a short bounded time: a freshly
+	 * created GCP instance reports the link up within
+	 * milliseconds. If the bit stays clear, fail the gate with
+	 * the register value in the log so the serial console shows
+	 * why.
+	 */
+	deadline = ukplat_monotonic_clock() +
+		   ukarch_time_msec_to_nsec(GVE_LINK_TIMEOUT_MSEC);
+	for (;;) {
+		dev_status = bswap32(mmio_read32(&gdev->reg_bar0->device_status));
+		if (gve_link_is_up(dev_status)) {
+			link_up = 1;
+			break;
+		}
+		if (ukplat_monotonic_clock() >= deadline)
+			break;
+		__asm__ __volatile__("pause" ::: "memory");
+	}
+	if (!link_up) {
+		printf("GATE_FAIL: gve link is down, device_status=0x%08x\n",
+		       dev_status);
+		return -ENOLINK;
+	}
+
 	printf("========================================\n");
 	printf("GATE_GVE_PASS\n");
 	printf("========================================\n");
@@ -1595,9 +1667,8 @@ static int gve_add_dev(struct pci_device *pdev)
 	dev = pdev->addr.devid;
 	func = pdev->addr.function;
 
-	printf("\n========================================\n");
-	printf("[gve] Probing gVNIC PCI device %04x:%02x:%02x.%x (1ae0:0042)\n",
-	       pdev->addr.domain, bus, dev, func);
+	uk_pr_info("gve: Probing gVNIC PCI device %04x:%02x:%02x.%x (1ae0:0042)\n",
+		   pdev->addr.domain, bus, dev, func);
 
 	/* Enable PCI memory space and bus mastering */
 	cmd_reg = pci_cfg_read32(bus, dev, func, PCI_COMMAND);
@@ -1608,9 +1679,9 @@ static int gve_add_dev(struct pci_device *pdev)
 	bar0_paddr = pci_read_bar(bus, dev, func, PCI_BASE_ADDRESS_0);
 	bar2_paddr = pci_read_bar(bus, dev, func, PCI_BASE_ADDRESS_2);
 
-	printf("[gve] PCI Revision: 0x%02x, BAR0 paddr: 0x%llx, BAR2 paddr: 0x%llx\n",
-	       rev, (unsigned long long)bar0_paddr,
-	       (unsigned long long)bar2_paddr);
+	uk_pr_info("gve: PCI Revision: 0x%02x, BAR0 paddr: 0x%llx, BAR2 paddr: 0x%llx\n",
+		   rev, (unsigned long long)bar0_paddr,
+		   (unsigned long long)bar2_paddr);
 
 	reg_bar0 = (volatile struct gve_registers *)gve_map_bar(bar0_paddr, 0);
 	if (!reg_bar0) {
@@ -1629,16 +1700,16 @@ static int gve_add_dev(struct pci_device *pdev)
 	gdev->reg_bar0 = reg_bar0;
 	gdev->db_bar2 = db_bar2;
 
-	printf("[gve] Mapped BAR0 vaddr=%p, BAR2 vaddr=%p\n",
-	       (const void *)reg_bar0, (const void *)db_bar2);
+	uk_pr_info("gve: Mapped BAR0 vaddr=%p, BAR2 vaddr=%p\n",
+		   (const void *)reg_bar0, (const void *)db_bar2);
 
 	dev_status = bswap32(mmio_read32(&reg_bar0->device_status));
 	max_tx_q = bswap32(mmio_read32(&reg_bar0->max_tx_queues));
 	max_rx_q = bswap32(mmio_read32(&reg_bar0->max_rx_queues));
 	gdev->max_tx_queues = max_tx_q;
 	gdev->max_rx_queues = max_rx_q;
-	printf("[gve] BAR0 device_status=0x%08x max_tx_queues=%u max_rx_queues=%u\n",
-	       dev_status, max_tx_q, max_rx_q);
+	uk_pr_info("gve: BAR0 device_status=0x%08x max_tx_queues=%u max_rx_queues=%u\n",
+		   dev_status, max_tx_q, max_rx_q);
 
 	/* Write driver version string byte-by-byte to BAR0 offset 0x1f */
 	for (p = ver_str; *p; p++)
@@ -1667,8 +1738,8 @@ static int gve_add_dev(struct pci_device *pdev)
 		mmio_write32(&reg_bar0->driver_status,
 			     bswap32(GVE_DRIVER_STATUS_RUN_MASK));
 	}
-	printf("[gve] Admin Queue initialized at paddr=0x%llx\n",
-	       (unsigned long long)adminq_paddr);
+	uk_pr_info("gve: Admin Queue initialized at paddr=0x%llx\n",
+		   (unsigned long long)adminq_paddr);
 
 	/* Issue VERIFY_DRIVER_COMPATIBILITY (0xF) advertising all queue formats */
 	drv_info = uk_memalign(drv_alloc, GVE_PAGE_SIZE, GVE_PAGE_SIZE);
@@ -1685,9 +1756,21 @@ static int gve_add_dev(struct pci_device *pdev)
 	drv_info->os_version_major = bswap32(6);
 	drv_info->os_version_minor = bswap32(8);
 	drv_info->os_version_sub = bswap32(0);
-	/* Advertise gqi_qpl (0) | gqi_rda (1) | dqo_qpl (2) | dqo_rda (3) = 0x0f */
-	drv_info->driver_capability_flags[0] = bswap64(0x0fULL) | 0x0fULL;
-	memcpy(drv_info->os_version_str1, "Unikraft 0.21.0", 15);
+	/*
+	 * Advertise the queue formats this driver can run as
+	 * big-endian capability bits. The whole flag word is
+	 * big-endian on the wire. DQO_QPL stays out: the datapath
+	 * does not implement it, so the driver must not claim it.
+	 */
+	{
+		uint64_t caps = (1ULL << GVE_DRIVER_CAPABILITY_GQI_QPL) |
+				(1ULL << GVE_DRIVER_CAPABILITY_GQI_RDA) |
+				(1ULL << GVE_DRIVER_CAPABILITY_DQO_RDA);
+
+		drv_info->driver_capability_flags[0] = bswap64(caps);
+	}
+	memcpy(drv_info->os_version_str1, "Unikraft 0.21.0",
+	       sizeof("Unikraft 0.21.0") - 1);
 
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.opcode = bswap32(GVE_ADMINQ_VERIFY_DRIVER_COMPATIBILITY);
@@ -1698,11 +1781,11 @@ static int gve_add_dev(struct pci_device *pdev)
 
 	rc = gve_adminq_exec(reg_bar0, adminq, &gdev->adminq_prod_cnt, &cmd,
 			     &cmd_status);
-	printf("[gve] VERIFY_DRIVER_COMPATIBILITY rc=%d status=0x%x\n",
-	       rc, cmd_status);
+	uk_pr_info("gve: VERIFY_DRIVER_COMPATIBILITY rc=%d status=0x%x\n",
+		   rc, cmd_status);
 	if (rc != 0 && cmd_status != GVE_ADMINQ_COMMAND_ERROR_UNIMPLEMENTED) {
-		printf("[gve] Warning: VERIFY_DRIVER_COMPATIBILITY returned 0x%x\n",
-		       cmd_status);
+		uk_pr_info("gve: Warning: VERIFY_DRIVER_COMPATIBILITY returned 0x%x\n",
+			   cmd_status);
 	}
 
 	/* Issue DESCRIBE_DEVICE (0x1) */
@@ -1723,7 +1806,7 @@ static int gve_add_dev(struct pci_device *pdev)
 
 	rc = gve_adminq_exec(reg_bar0, adminq, &gdev->adminq_prod_cnt, &cmd,
 			     &cmd_status);
-	printf("[gve] DESCRIBE_DEVICE rc=%d status=0x%x\n", rc, cmd_status);
+	uk_pr_info("gve: DESCRIBE_DEVICE rc=%d status=0x%x\n", rc, cmd_status);
 	if (rc != 0) {
 		printf("GATE_FAIL: DESCRIBE_DEVICE failed with status=0x%x\n",
 		       cmd_status);
@@ -1744,21 +1827,21 @@ static int gve_add_dev(struct pci_device *pdev)
 	gdev->rx_pages_per_qpl = bswap16(desc->rx_pages_per_qpl);
 	gdev->max_registered_pages = bswap64(desc->max_registered_pages);
 
-	printf("[gve] Device Descriptor:\n");
-	printf("  MAC address:          %02x:%02x:%02x:%02x:%02x:%02x\n",
-	       desc->mac[0], desc->mac[1], desc->mac[2],
-	       desc->mac[3], desc->mac[4], desc->mac[5]);
-	printf("  MTU:                  %u\n", gdev->mtu);
-	printf("  tx_queue_entries:     %u\n", gdev->tx_desc_cnt);
-	printf("  rx_queue_entries:     %u\n", gdev->rx_desc_cnt);
-	printf("  default_num_queues:   %u\n", bswap16(desc->default_num_queues));
-	printf("  max_registered_pages: %llu\n",
-	       (unsigned long long)gdev->max_registered_pages);
-	printf("  counters:             %u\n", gdev->num_event_counters);
-	printf("  tx_pages_per_qpl:     %u\n", gdev->tx_pages_per_qpl);
-	printf("  rx_pages_per_qpl:     %u\n", gdev->rx_pages_per_qpl);
-	printf("  num_device_options:   %u (total_length=%u)\n",
-	       num_opts, total_len);
+	uk_pr_info("gve: Device Descriptor:\n");
+	uk_pr_info("  MAC address:          %02x:%02x:%02x:%02x:%02x:%02x\n",
+		   desc->mac[0], desc->mac[1], desc->mac[2],
+		   desc->mac[3], desc->mac[4], desc->mac[5]);
+	uk_pr_info("  MTU:                  %u\n", gdev->mtu);
+	uk_pr_info("  tx_queue_entries:     %u\n", gdev->tx_desc_cnt);
+	uk_pr_info("  rx_queue_entries:     %u\n", gdev->rx_desc_cnt);
+	uk_pr_info("  default_num_queues:   %u\n", bswap16(desc->default_num_queues));
+	uk_pr_info("  max_registered_pages: %llu\n",
+		   (unsigned long long)gdev->max_registered_pages);
+	uk_pr_info("  counters:             %u\n", gdev->num_event_counters);
+	uk_pr_info("  tx_pages_per_qpl:     %u\n", gdev->tx_pages_per_qpl);
+	uk_pr_info("  rx_pages_per_qpl:     %u\n", gdev->rx_pages_per_qpl);
+	uk_pr_info("  num_device_options:   %u (total_length=%u)\n",
+		   num_opts, total_len);
 
 	/*
 	 * Walk the option TLVs inside a bounded region. The device
@@ -1777,6 +1860,11 @@ static int gve_add_dev(struct pci_device *pdev)
 		uint16_t opt_id, opt_len;
 		uint32_t req_feat;
 		uint8_t *opt_body;
+		uint32_t sup_feat = 0;
+		uint16_t pair1 = 0;
+		uint16_t pair2 = 0;
+		int has_sup = 0;
+		int pair_kind = 0;	/* 1: comp ring, 2: qpl pages, 3: max_mtu */
 
 		if (!gve_tlv_hdr_fits(opt_off, desc_region, sizeof(*opt)))
 			break;
@@ -1787,9 +1875,6 @@ static int gve_add_dev(struct pci_device *pdev)
 		req_feat = bswap32(opt->required_features_mask);
 		opt_body = desc_buf + opt_off + sizeof(*opt);
 
-		printf("  [Option %u] id=0x%x (%s) len=%u req_feat=0x%x",
-		       i, opt_id, gve_option_name(opt_id), opt_len, req_feat);
-
 		if (opt_id == GVE_DEV_OPT_ID_GQI_RAW_ADDRESSING) {
 			has_gqi_raw = 1;
 		} else if (opt_id == GVE_DEV_OPT_ID_GQI_RDA) {
@@ -1799,8 +1884,8 @@ static int gve_add_dev(struct pci_device *pdev)
 					      desc_region)) {
 				struct gve_device_option_gqi_rda *r =
 					(struct gve_device_option_gqi_rda *)opt_body;
-				printf(" sup_feat=0x%x",
-				       bswap32(r->supported_features_mask));
+				sup_feat = bswap32(r->supported_features_mask);
+				has_sup = 1;
 			}
 		} else if (opt_id == GVE_DEV_OPT_ID_GQI_QPL) {
 			gdev->has_gqi_qpl = 1;
@@ -1809,8 +1894,8 @@ static int gve_add_dev(struct pci_device *pdev)
 					      desc_region)) {
 				struct gve_device_option_gqi_qpl *q =
 					(struct gve_device_option_gqi_qpl *)opt_body;
-				printf(" sup_feat=0x%x",
-				       bswap32(q->supported_features_mask));
+				sup_feat = bswap32(q->supported_features_mask);
+				has_sup = 1;
 			}
 		} else if (opt_id == GVE_DEV_OPT_ID_DQO_RDA) {
 			gdev->has_dqo_rda = 1;
@@ -1823,10 +1908,9 @@ static int gve_add_dev(struct pci_device *pdev)
 					bswap16(d->tx_comp_ring_entries);
 				gdev->rx_buff_ring_entries =
 					bswap16(d->rx_buff_ring_entries);
-				printf(" sup_feat=0x%x tx_comp_entries=%u rx_buff_entries=%u",
-				       bswap32(d->supported_features_mask),
-				       gdev->tx_comp_ring_entries,
-				       gdev->rx_buff_ring_entries);
+				sup_feat = bswap32(d->supported_features_mask);
+				has_sup = 1;
+				pair_kind = 1;
 			}
 		} else if (opt_id == GVE_DEV_OPT_ID_DQO_QPL) {
 			gdev->has_dqo_qpl = 1;
@@ -1835,10 +1919,11 @@ static int gve_add_dev(struct pci_device *pdev)
 					      desc_region)) {
 				struct gve_device_option_dqo_qpl *dq =
 					(struct gve_device_option_dqo_qpl *)opt_body;
-				printf(" sup_feat=0x%x tx_pages_qpl=%u rx_pages_qpl=%u",
-				       bswap32(dq->supported_features_mask),
-				       bswap16(dq->tx_pages_per_qpl),
-				       bswap16(dq->rx_pages_per_qpl));
+				sup_feat = bswap32(dq->supported_features_mask);
+				pair1 = bswap16(dq->tx_pages_per_qpl);
+				pair2 = bswap16(dq->rx_pages_per_qpl);
+				has_sup = 1;
+				pair_kind = 2;
 			}
 		} else if (opt_id == GVE_DEV_OPT_ID_JUMBO_FRAMES) {
 			if (gve_tlv_body_fits(opt_off + sizeof(*opt), opt_len,
@@ -1847,10 +1932,40 @@ static int gve_add_dev(struct pci_device *pdev)
 				struct gve_device_option_jumbo_frames *jf =
 					(struct gve_device_option_jumbo_frames *)opt_body;
 				gdev->max_mtu = bswap16(jf->max_mtu);
-				printf(" max_mtu=%u", gdev->max_mtu);
+				pair1 = gdev->max_mtu;
+				pair_kind = 3;
 			}
 		}
-		printf("\n");
+
+		switch (pair_kind) {
+		case 1:
+			uk_pr_info("gve:   [Option %u] id=0x%x (%s) len=%u req_feat=0x%x sup_feat=0x%x tx_comp_entries=%u rx_buff_entries=%u\n",
+				   i, opt_id, gve_option_name(opt_id),
+				   opt_len, req_feat, sup_feat,
+				   gdev->tx_comp_ring_entries,
+				   gdev->rx_buff_ring_entries);
+			break;
+		case 2:
+			uk_pr_info("gve:   [Option %u] id=0x%x (%s) len=%u req_feat=0x%x sup_feat=0x%x tx_pages_qpl=%u rx_pages_qpl=%u\n",
+				   i, opt_id, gve_option_name(opt_id),
+				   opt_len, req_feat, sup_feat, pair1, pair2);
+			break;
+		case 3:
+			uk_pr_info("gve:   [Option %u] id=0x%x (%s) len=%u req_feat=0x%x max_mtu=%u\n",
+				   i, opt_id, gve_option_name(opt_id),
+				   opt_len, req_feat, pair1);
+			break;
+		default:
+			if (has_sup)
+				uk_pr_info("gve:   [Option %u] id=0x%x (%s) len=%u req_feat=0x%x sup_feat=0x%x\n",
+					   i, opt_id, gve_option_name(opt_id),
+					   opt_len, req_feat, sup_feat);
+			else
+				uk_pr_info("gve:   [Option %u] id=0x%x (%s) len=%u req_feat=0x%x\n",
+					   i, opt_id, gve_option_name(opt_id),
+					   opt_len, req_feat);
+			break;
+		}
 
 		opt_off += (uint32_t)sizeof(*opt) + opt_len;
 	}
@@ -1861,11 +1976,21 @@ static int gve_add_dev(struct pci_device *pdev)
 		gdev->queue_format = GVE_GQI_RDA_FORMAT;
 	else if (gdev->has_gqi_qpl)
 		gdev->queue_format = GVE_GQI_QPL_FORMAT;
-	else if (gdev->has_dqo_qpl)
-		gdev->queue_format = GVE_DQO_QPL_FORMAT;
+	/*
+	 * A DQO_QPL-only device is refused. The datapath else-branches
+	 * speak GQI, so selecting DQO_QPL here would build GQI rings
+	 * under a DQO_QPL label. Reject the format until a real DQO_QPL
+	 * path exists.
+	 */
+	if (gdev->queue_format == GVE_QUEUE_FORMAT_UNSPECIFIED) {
+		printf("GATE_FAIL: gve no supported queue format (dqo_qpl=%d not implemented)\n",
+		       gdev->has_dqo_qpl);
+		rc = -ENODEV;
+		goto err;
+	}
 
-	printf("[gve] Negotiated queue format: %s (%d)\n",
-	       gve_queue_format_name(gdev->queue_format), gdev->queue_format);
+	uk_pr_info("gve: Negotiated queue format: %s (%d)\n",
+		   gve_queue_format_name(gdev->queue_format), gdev->queue_format);
 
 	/*
 	 * All ring indexing uses cnt - 1 as a mask. Reject a device
@@ -1906,12 +2031,12 @@ static int gve_add_dev(struct pci_device *pdev)
 			gdev->max_mtu, GVE_DEFAULT_RX_BUFFER_SIZE);
 
 		if (capped != gdev->max_mtu)
-			printf("[gve] max_mtu clamped %u -> %u for single-buffer RX\n",
-			       gdev->max_mtu, capped);
+			uk_pr_info("gve: max_mtu clamped %u -> %u for single-buffer RX\n",
+				   gdev->max_mtu, capped);
 		gdev->max_mtu = capped;
 		if (gdev->mtu > gdev->max_mtu)
-			printf("[gve] Warning: device MTU %u exceeds the receive cap %u\n",
-			       gdev->mtu, gdev->max_mtu);
+			uk_pr_info("gve: Warning: device MTU %u exceeds the receive cap %u\n",
+				   gdev->mtu, gdev->max_mtu);
 	}
 
 	printf("========================================\n");
@@ -1928,7 +2053,7 @@ static int gve_add_dev(struct pci_device *pdev)
 		printf("GATE_FAIL: uk_netdev_drv_register failed rc=%d\n", rc);
 		goto err;
 	}
-	printf("[gve] Registered uk_netdev id=%d (%s)\n", rc, DRIVER_NAME);
+	uk_pr_info("gve: Registered uk_netdev id=%d (%s)\n", rc, DRIVER_NAME);
 
 	/*
 	 * The driver info and device descriptor only served the
