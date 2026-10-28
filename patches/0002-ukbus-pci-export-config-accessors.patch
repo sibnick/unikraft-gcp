@@ -1,0 +1,144 @@
+From: Nik <sibnick@gmail.com>
+Subject: [PATCH] drivers/ukbus/pci: export x86_64 config accessors
+
+Device drivers need configuration space reads and writes plus BAR
+decoding. The x86_64 ukbus/pci backend keeps the CF8/CFC port
+sequence private in its own file, so a driver that needs config
+access must repeat raw port I/O. The gVNIC driver carried such a
+private copy for this reason.
+
+Export uk_pci_read_config32, uk_pci_write_config32, and
+uk_pci_read_bar from the x86_64 backend and declare them in
+uk/bus/pci.h. The address build mirrors the CF8 sequence that the
+backend probe already uses. List the three symbols in
+exportsyms.uk. The build demotes every library symbol that is not
+listed there, so drivers in other libraries could not call them
+otherwise. Ticket 040c3378ff.
+---
+ drivers/ukbus/pci/arch/x86_64/pci_bus.c | 44 +++++++++++++++++++++++++++++
+ drivers/ukbus/pci/exportsyms.uk         |  3 ++
+ drivers/ukbus/pci/include/uk/bus/pci.h  | 50 +++++++++++++++++++++++++++++++++
+ 3 files changed, 97 insertions(+)
+
+diff --git a/drivers/ukbus/pci/arch/x86_64/pci_bus.c b/drivers/ukbus/pci/arch/x86_64/pci_bus.c
+index 279e399..9146bb3 100644
+--- a/drivers/ukbus/pci/arch/x86_64/pci_bus.c
++++ b/drivers/ukbus/pci/arch/x86_64/pci_bus.c
+@@ -240,3 +240,47 @@ int arch_pci_probe(struct uk_alloc *pha)
+ 
+ 	return 0;
+ }
++
++/*
++ * Build the CF8 address for one function and one 4-byte aligned
++ * configuration offset.
++ */
++static inline __u32 pci_conf_addr(const struct pci_address *addr,
++				  __u8 offset)
++{
++	return (__u32)PCI_ENABLE_BIT
++		| ((__u32)addr->bus << PCI_BUS_SHIFT)
++		| ((__u32)addr->devid << PCI_DEVICE_SHIFT)
++		| ((__u32)addr->function << PCI_FUNCTION_SHIFT)
++		| ((__u32)offset & 0xfcU);
++}
++
++__u32 uk_pci_read_config32(const struct pci_address *addr, __u8 offset)
++{
++	uk_arch_x86_64_outl(PCI_CONFIG_ADDR, pci_conf_addr(addr, offset));
++	return uk_arch_x86_64_inl(PCI_CONFIG_DATA);
++}
++
++void uk_pci_write_config32(const struct pci_address *addr, __u8 offset,
++			   __u32 value)
++{
++	uk_arch_x86_64_outl(PCI_CONFIG_ADDR, pci_conf_addr(addr, offset));
++	uk_arch_x86_64_outl(PCI_CONFIG_DATA, value);
++}
++
++__u64 uk_pci_read_bar(const struct pci_address *addr, __u8 bar)
++{
++	__u32 low;
++	__u64 base;
++
++	low = uk_pci_read_config32(addr, bar);
++	if (low & 0x1U) { /* I/O space BAR. The value is a port number. */
++		return (__u64)(low & ~0x3U);
++	}
++
++	base = (__u64)(low & ~0xfU);
++	if (((low >> 1) & 0x3U) == 0x2U) { /* 64-bit memory BAR */
++		base |= (__u64)uk_pci_read_config32(addr, bar + 4) << 32;
++	}
++	return base;
++}
+diff --git a/drivers/ukbus/pci/exportsyms.uk b/drivers/ukbus/pci/exportsyms.uk
+index ca0612b..44ebf35 100644
+--- a/drivers/ukbus/pci/exportsyms.uk
++++ b/drivers/ukbus/pci/exportsyms.uk
+@@ -1 +1,4 @@
+ _pci_register_driver
++uk_pci_read_config32
++uk_pci_write_config32
++uk_pci_read_bar
+diff --git a/drivers/ukbus/pci/include/uk/bus/pci.h b/drivers/ukbus/pci/include/uk/bus/pci.h
+index a38ab91..039d3ca 100644
+--- a/drivers/ukbus/pci/include/uk/bus/pci.h
++++ b/drivers/ukbus/pci/include/uk/bus/pci.h
+@@ -300,6 +300,56 @@ static struct pci_bus_handler ph __unused;
+ 
+ struct pci_driver *pci_find_driver(struct pci_device_id *id);
+ 
++/*
++ * Configuration space access for x86_64. The implementation uses the
++ * CF8/CFC port pair and lives in
++ * drivers/ukbus/pci/arch/x86_64/pci_bus.c. Drivers must call these
++ * functions instead of repeating the port I/O sequence.
++ */
++
++/**
++ * Read one word from PCI configuration space.
++ *
++ * @param addr
++ *  The address of the function on the bus.
++ * @param offset
++ *  Byte offset into configuration space. The access is aligned down
++ *  to a 4-byte boundary, like every CF8/CFC access.
++ * @return
++ *  The 32-bit word at the aligned offset. A missing device reads
++ *  back as 0xFFFFFFFF.
++ */
++__u32 uk_pci_read_config32(const struct pci_address *addr, __u8 offset);
++
++/**
++ * Write one word to PCI configuration space.
++ *
++ * @param addr
++ *  The address of the function on the bus.
++ * @param offset
++ *  Byte offset into configuration space. The access is aligned down
++ *  to a 4-byte boundary, like every CF8/CFC access.
++ * @param value
++ *  The 32-bit word to store.
++ */
++void uk_pci_write_config32(const struct pci_address *addr, __u8 offset,
++			   __u32 value);
++
++/**
++ * Resolve the bus address encoded in a Base Address Register.
++ *
++ * @param addr
++ *  The address of the function on the bus.
++ * @param bar
++ *  Byte offset of the register: PCI_BASE_ADDRESS_0 through
++ *  PCI_BASE_ADDRESS_5.
++ * @return
++ *  The decoded address. For an I/O space register this is the port
++ *  number. For a 64-bit memory register the two halves are joined.
++ *  A disabled register returns 0.
++ */
++__u64 uk_pci_read_bar(const struct pci_address *addr, __u8 bar);
++
+ #ifdef __cplusplus
+ }
+ #endif

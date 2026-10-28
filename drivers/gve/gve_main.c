@@ -168,72 +168,6 @@ static inline size_t align_up_page(size_t sz)
 	return (sz + (GVE_PAGE_SIZE - 1UL)) & ~(GVE_PAGE_SIZE - 1UL);
 }
 
-static inline void outl_port(uint16_t port, uint32_t val)
-{
-	__asm__ __volatile__("outl %0, %w1" :: "a"(val), "Nd"(port));
-}
-
-static inline uint32_t inl_port(uint16_t port)
-{
-	uint32_t val;
-
-	__asm__ __volatile__("inl %w1, %0" : "=a"(val) : "Nd"(port));
-	return val;
-}
-
-/*
- * Direct CF8/CFC configuration access. Unikraft 0.21 exports no
- * ukbus accessor for config space or BARs: the core keeps its own
- * CF8/CFC sequence private in drivers/ukbus/pci/arch/x86_64. These
- * helpers mirror that sequence. Switch them to a shared ukbus API
- * when the core exports one (ticket for M7).
- */
-static uint32_t pci_cfg_read32(uint8_t bus, uint8_t dev, uint8_t func,
-			       uint8_t offset)
-{
-	uint32_t addr;
-
-	addr = (1U << 31) |
-	       ((uint32_t)bus << 16) |
-	       ((uint32_t)dev << 11) |
-	       ((uint32_t)func << 8) |
-	       ((uint32_t)offset & 0xfcU);
-	outl_port(PCI_CONFIG_ADDR, addr);
-	return inl_port(PCI_CONFIG_DATA);
-}
-
-static void pci_cfg_write32(uint8_t bus, uint8_t dev, uint8_t func,
-			    uint8_t offset, uint32_t val)
-{
-	uint32_t addr;
-
-	addr = (1U << 31) |
-	       ((uint32_t)bus << 16) |
-	       ((uint32_t)dev << 11) |
-	       ((uint32_t)func << 8) |
-	       ((uint32_t)offset & 0xfcU);
-	outl_port(PCI_CONFIG_ADDR, addr);
-	outl_port(PCI_CONFIG_DATA, val);
-}
-
-static uint64_t pci_read_bar(uint8_t bus, uint8_t dev, uint8_t func,
-			     uint8_t reg)
-{
-	uint32_t lo = pci_cfg_read32(bus, dev, func, reg);
-	uint64_t addr;
-
-	if (lo & 0x1U)
-		return (uint64_t)(lo & ~0x3U);
-
-	addr = (uint64_t)(lo & ~0xfU);
-	if (((lo >> 1) & 0x3U) == 0x2U) {
-		uint32_t hi = pci_cfg_read32(bus, dev, func, reg + 4);
-
-		addr |= ((uint64_t)hi << 32);
-	}
-	return addr;
-}
-
 /*
  * Return the PDPT entry this driver uses for a BAR slot, or NULL
  * when the slot index is invalid. Slots 0 and 1 map PDPT entries 4
@@ -1671,13 +1605,14 @@ static int gve_add_dev(struct pci_device *pdev)
 		   pdev->addr.domain, bus, dev, func);
 
 	/* Enable PCI memory space and bus mastering */
-	cmd_reg = pci_cfg_read32(bus, dev, func, PCI_COMMAND);
+	cmd_reg = uk_pci_read_config32(&pdev->addr, PCI_COMMAND);
 	cmd_reg |= (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
-	pci_cfg_write32(bus, dev, func, PCI_COMMAND, cmd_reg);
+	uk_pci_write_config32(&pdev->addr, PCI_COMMAND, cmd_reg);
 
-	rev = (uint8_t)(pci_cfg_read32(bus, dev, func, PCI_CLASS_REVISION) & 0xffU);
-	bar0_paddr = pci_read_bar(bus, dev, func, PCI_BASE_ADDRESS_0);
-	bar2_paddr = pci_read_bar(bus, dev, func, PCI_BASE_ADDRESS_2);
+	rev = (uint8_t)(uk_pci_read_config32(&pdev->addr,
+					     PCI_CLASS_REVISION) & 0xffU);
+	bar0_paddr = uk_pci_read_bar(&pdev->addr, PCI_BASE_ADDRESS_0);
+	bar2_paddr = uk_pci_read_bar(&pdev->addr, PCI_BASE_ADDRESS_2);
 
 	uk_pr_info("gve: PCI Revision: 0x%02x, BAR0 paddr: 0x%llx, BAR2 paddr: 0x%llx\n",
 		   rev, (unsigned long long)bar0_paddr,
