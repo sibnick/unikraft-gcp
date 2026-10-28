@@ -20,6 +20,7 @@ UKG_RUN="${1:-${UKG_RUN:-$(ukg_default_run_id)}}"
 ukg_validate_run_id "${UKG_RUN}"
 export UKG_RUN
 IMAGE_NAME="${2:-${UKG_RUN}-img}"
+ukg_validate_image_name "${IMAGE_NAME}" "${UKG_RUN}"
 INSTANCE_NAME="${UKG_RUN}-srv"
 SERIAL_LOG="$(ukg_mk_serial_log "${UKG_RUN}")"
 
@@ -86,19 +87,32 @@ for i in $(seq 1 40); do
         VIRTIO_PASS=1
         break
     fi
+    if grep -q "GATE_FAIL" "${SERIAL_LOG}"; then
+        echo ""
+        echo "[FAIL] GATE_FAIL found after attempt ${i}! Stop polling." >&2
+        break
+    fi
     echo -n "."
 done
 echo ""
+
+# Final capture before the verdict. A failure marker can appear after
+# the pass marker, so the last serial state decides. Ticket 06ea1706a7.
+if [ "${VIRTIO_PASS}" -eq 1 ]; then
+    sleep 3
+    gcloud compute instances get-serial-port-output "${INSTANCE_NAME}" \
+        --zone="${GCP_ZONE}" --project="${GCP_PROJECT}" > "${SERIAL_LOG}" 2>&1 || true
+fi
 
 echo "--- Serial Console Output ---"
 cat "${SERIAL_LOG}"
 echo "-----------------------------"
 
-if [ "${VIRTIO_PASS}" -eq 1 ]; then
+if [ "${VIRTIO_PASS}" -eq 1 ] && ! grep -q "GATE_FAIL" "${SERIAL_LOG}"; then
     echo "[PASS] Gate A2 completed successfully: GATE_VIRTIO_PASS verified."
     exit 0
 else
-    echo "[FAIL] GATE_VIRTIO_PASS not found in serial console output!" >&2
+    echo "[FAIL] GATE_VIRTIO_PASS not verified: marker missing or a GATE_FAIL present!" >&2
     echo "The teardown trap now deletes this run's resources. Export KEEP_RES=1 before the next run to keep them." >&2
     exit 1
 fi

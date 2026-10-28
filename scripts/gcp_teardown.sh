@@ -6,7 +6,7 @@
 # failed gcloud call cannot abort the script and strand the resource
 # classes that come later. Failures are counted and reported with a
 # non-zero exit code at the end. Tickets: 8c0f80d874 4a7a2ca6f5
-# e3effabf78 (M5) 4347c2a8e6 (N4) f3df948f2c.
+# e3effabf78 (M5) 4347c2a8e6 (N4) f3df948f2c 74936642ce.
 # Usage: gcp_teardown.sh <run-id>. The run id is mandatory. The
 # project-wide sweep needs the explicit opt-in UKG_TEARDOWN_ALL=1.
 set -euo pipefail
@@ -31,7 +31,10 @@ RUN_ID="${1:-}"
 # Ticket f3df948f2c.
 if [ -n "${RUN_ID}" ]; then
     ukg_validate_run_id "${RUN_ID}"
-    NAME_FILTER="name ~ \"^${RUN_ID}\""
+    # Anchored exact-boundary match: the run id itself or a name with
+    # one of the derived suffixes. A loose prefix such as ^ukg-test
+    # would also delete ukg-test-2 resources. Ticket 74936642ce.
+    NAME_FILTER="name ~ \"$(ukg_run_name_regex "${RUN_ID}")\""
 elif [ "${UKG_TEARDOWN_ALL:-0}" = "1" ]; then
     # Explicit opt-in for the project-wide sweep. It deletes every
     # ukg- resource and storage object in the project.
@@ -167,13 +170,24 @@ clean_gcs_objects() {
         return 0
     fi
     echo "[INFO] Cleaning Cloud Storage objects in gs://${GCP_BUCKET}..."
-    local prefix="ukg-*"
+    # Run-scoped cleanup removes the exact objects that the run
+    # scripts upload: one per run-derived image name. An earlier
+    # ${RUN_ID}* wildcard could also delete another run's objects,
+    # for example ukg-test-2 objects during a ukg-test teardown.
+    # Ticket 74936642ce. A custom image name outside the derived set
+    # is out of reach here. The leak audit below still reports it.
     if [ -n "${RUN_ID}" ]; then
-        prefix="${RUN_ID}*"
+        local obj
+        for obj in "${RUN_ID}-img-disk.tar.gz" \
+                   "${RUN_ID}-srv-img-disk.tar.gz" \
+                   "${RUN_ID}-cli-img-disk.tar.gz"; do
+            gcloud storage rm "gs://${GCP_BUCKET}/${obj}" 2>/dev/null || true
+        done
+        return 0
     fi
     # A wildcard with no match exits non-zero. That is a normal
     # "nothing to delete" case here, so no failure is recorded.
-    gcloud storage rm --recursive "gs://${GCP_BUCKET}/${prefix}" 2>/dev/null || true
+    gcloud storage rm --recursive "gs://${GCP_BUCKET}/ukg-*" 2>/dev/null || true
 }
 
 # 6. Leak Audit per skills/gcloud-compute/SKILL.md Section 5

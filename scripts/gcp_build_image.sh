@@ -26,6 +26,11 @@ DISK_RAW="${BUILD_DIR}/disk.raw"
 IMAGE_NAME="${2:-${UKG_RUN}-img}"
 CMDLINE_ARGS="${3:-}"
 
+# Validate before any filesystem or cloud operation. The name feeds a
+# local tar path, an upload object, and an image delete call. A
+# path-like or foreign value must never reach those. Ticket 5e6a2acd8a.
+ukg_validate_image_name "${IMAGE_NAME}" "${UKG_RUN}"
+
 if [ -z "${GCP_PROJECT}" ]; then
     echo "[ERROR] GCP_PROJECT is not set." >&2
     exit 1

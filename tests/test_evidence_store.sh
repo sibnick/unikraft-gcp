@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: BSD-3-Clause
 # Host test for the evidence-store step in scripts/lib/gcp_lib.sh.
-# Ticket c16353731a.
+# Tickets c16353731a cf185ab6fd.
 #
 # The test needs Fossil on the host. It builds a throwaway checkout
 # in a temporary directory, so fossil uv commands never touch this
@@ -173,6 +173,101 @@ else
     echo "FAIL - trap path stored the log in the artifact store" \
         "(have: ${trap_stored})"
 fi
+
+# Case 7: a passed gate over a failed cleanup or kept resources
+# stores PARTIAL, never PASS. Ticket cf185ab6fd.
+UKG_RUN="ukg-test-0004"
+UKG_EVIDENCE_LOG="${WORK}/partial1.log"
+printf 'GATE_GVE_ADMINQ_PASS\n' >"${UKG_EVIDENCE_LOG}"
+out="$(ukg_store_evidence 0 1 0 2>&1)"
+check_contains "cleanup failure downgrades PASS to PARTIAL" "${out}" \
+    "run ukg-test-0004: PARTIAL"
+check_contains "PARTIAL names the cleanup failure" "${out}" \
+    "teardown or the leak audit failed"
+UKG_RUN="ukg-test-0005"
+out="$(ukg_store_evidence 0 0 1 2>&1)"
+check_contains "kept resources downgrade PASS to PARTIAL" "${out}" \
+    "run ukg-test-0005: PARTIAL"
+check_contains "PARTIAL names the KEEP_RES retention" "${out}" \
+    "KEEP_RES kept billable resources"
+UKG_RUN="ukg-test-0006"
+out="$(ukg_store_evidence 1 1 0 2>&1)"
+check_contains "failed gate stays FAIL with failed cleanup" "${out}" \
+    "run ukg-test-0006: FAIL"
+
+# Case 8: the trap turns a zero gate exit into 1 when teardown fails,
+# and stores PARTIAL.
+STUB_FAIL="${WORK}/stub_teardown_fail.sh"
+cat >"${STUB_FAIL}" <<'EOF'
+#!/usr/bin/env bash
+echo "STUB_TEARDOWN_FAIL $1"
+exit 3
+EOF
+chmod +x "${STUB_FAIL}"
+CHILD2="${WORK}/child_run_fail_cleanup.sh"
+cat >"${CHILD2}" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+source "${ROOT_DIR}/scripts/lib/gcp_lib.sh"
+UKG_REPO_ROOT="${CO}"
+UKG_TEARDOWN_SCRIPT="${STUB_FAIL}"
+UKG_RUN="ukg-test-0007"
+UKG_GATE="B1"
+UKG_TICKET="cafebabeee"
+UKG_EVIDENCE_LOG="${WORK}/trap_fail.log"
+printf 'GATE_GVE_ADMINQ_PASS\n' >"\${UKG_EVIDENCE_LOG}"
+ukg_install_teardown_trap
+exit 0
+EOF
+out="$(bash "${CHILD2}" 2>&1)"
+rc=$?
+if [ "${rc}" -eq 1 ]; then
+    PASS_COUNT=$((PASS_COUNT + 1))
+    echo "ok   - trap turns a zero gate exit into 1 when cleanup fails"
+else
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo "FAIL - trap turns a zero gate exit into 1 when cleanup fails" \
+        "(rc: ${rc})"
+fi
+check_contains "trap with failed cleanup stores PARTIAL" "${out}" \
+    "run ukg-test-0007: PARTIAL"
+
+# Case 9: KEEP_RES skips teardown, keeps the exit code, but the
+# stored result is PARTIAL.
+CHILD3="${WORK}/child_run_keep.sh"
+cat >"${CHILD3}" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+source "${ROOT_DIR}/scripts/lib/gcp_lib.sh"
+UKG_REPO_ROOT="${CO}"
+UKG_TEARDOWN_SCRIPT="${STUB}"
+UKG_RUN="ukg-test-0008"
+UKG_GATE="B2"
+UKG_TICKET="cafebabeee"
+UKG_EVIDENCE_LOG="${WORK}/trap_keep.log"
+printf 'GATE_GVE_PASS\n' >"\${UKG_EVIDENCE_LOG}"
+export KEEP_RES=1
+ukg_install_teardown_trap
+exit 0
+EOF
+out="$(bash "${CHILD3}" 2>&1)"
+rc=$?
+if [ "${rc}" -eq 0 ]; then
+    PASS_COUNT=$((PASS_COUNT + 1))
+    echo "ok   - KEEP_RES run preserves the zero exit code"
+else
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo "FAIL - KEEP_RES run preserves the zero exit code (rc: ${rc})"
+fi
+if printf '%s' "${out}" | grep -qF "STUB_TEARDOWN_DONE"; then
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo "FAIL - KEEP_RES skips the teardown script"
+else
+    PASS_COUNT=$((PASS_COUNT + 1))
+    echo "ok   - KEEP_RES skips the teardown script"
+fi
+check_contains "KEEP_RES run stores PARTIAL" "${out}" \
+    "run ukg-test-0008: PARTIAL"
 
 echo ""
 echo "test_evidence_store: ${PASS_COUNT} passed, ${FAIL_COUNT} failed"
