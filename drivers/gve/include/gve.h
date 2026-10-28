@@ -7,11 +7,18 @@
 #define __UK_DRV_GVE_H__
 
 #include <stdint.h>
+#include <stddef.h>
 
 #define GVE_PCI_VENDOR_ID		0x1ae0
 #define GVE_PCI_DEVICE_ID		0x0042
 
-/* BAR0 register layout (big-endian fields) */
+/*
+ * BAR0 register layout (big-endian fields). Natural alignment
+ * already reproduces the hardware offsets, so the struct stays
+ * unpacked: passing &reg_bar0->member to the mmio helpers then
+ * causes no -Waddress-of-packed-member warning. The offsetof checks
+ * below pin the layout against the device contract.
+ */
 struct gve_registers {
 	uint32_t device_status;
 	uint32_t driver_status;
@@ -25,7 +32,7 @@ struct gve_registers {
 	uint32_t adminq_base_address_hi;
 	uint32_t adminq_base_address_lo;
 	uint16_t adminq_length;
-} __attribute__((packed));
+};
 
 /* Driver status flags */
 #define GVE_DRIVER_STATUS_RUN_MASK	(1U << 0)
@@ -346,6 +353,13 @@ union gve_rx_data_slot {
 #define GVE_RXF_TCP		(1U << 6)
 #define GVE_RXF_UDP		(1U << 7)
 #define GVE_RXF_ERR		(1U << 11)
+/*
+ * flags_seq holds the RX flags and the sequence number in
+ * big-endian byte order. GVE_RXFLG() byteswaps the whole word so
+ * the host-bit GVE_RXF_* masks above can be applied directly. The
+ * macro performs no other transformation. GVE_SEQNO() extracts the
+ * low three bits from the same swapped word.
+ */
 #define GVE_RXFLG(x)		__builtin_bswap16(x)
 #define GVE_SEQNO(x)		((uint8_t)(__builtin_bswap16(x) & 0x7U))
 
@@ -374,9 +388,6 @@ struct gve_rx_desc {
 #define GVE_COMPL_TYPE_DQO_DESC			0x4U
 #define GVE_COMPL_TYPE_DQO_MISS			0x1U
 #define GVE_COMPL_TYPE_DQO_REINJECTION		0x3U
-
-#define GVE_ITR_NO_UPDATE_DQO			(3U << 3)
-#define GVE_ITR_ENABLE_BIT_DQO			(1U << 0)
 
 struct gve_tx_pkt_desc_dqo {
 	uint64_t buf_addr;
@@ -493,7 +504,28 @@ struct gve_rx_compl_desc_dqo {
 	uint32_t ts;                      /* Offset 28..31 */
 } __attribute__((packed, aligned(32)));
 
-_Static_assert(sizeof(struct gve_registers) == 42, "gve_registers size");
+_Static_assert(offsetof(struct gve_registers, device_status) == 0,
+	       "device_status offset");
+_Static_assert(offsetof(struct gve_registers, driver_status) == 4,
+	       "driver_status offset");
+_Static_assert(offsetof(struct gve_registers, max_tx_queues) == 8,
+	       "max_tx_queues offset");
+_Static_assert(offsetof(struct gve_registers, max_rx_queues) == 12,
+	       "max_rx_queues offset");
+_Static_assert(offsetof(struct gve_registers, adminq_pfn) == 16,
+	       "adminq_pfn offset");
+_Static_assert(offsetof(struct gve_registers, adminq_doorbell) == 20,
+	       "adminq_doorbell offset");
+_Static_assert(offsetof(struct gve_registers, adminq_event_counter) == 24,
+	       "adminq_event_counter offset");
+_Static_assert(offsetof(struct gve_registers, driver_version) == 31,
+	       "driver_version offset");	/* BAR0 + 0x1f */
+_Static_assert(offsetof(struct gve_registers, adminq_base_address_hi) == 32,
+	       "adminq_base_address_hi offset");
+_Static_assert(offsetof(struct gve_registers, adminq_base_address_lo) == 36,
+	       "adminq_base_address_lo offset");
+_Static_assert(offsetof(struct gve_registers, adminq_length) == 40,
+	       "adminq_length offset");
 _Static_assert(sizeof(struct gve_driver_info) == 304, "gve_driver_info size");
 _Static_assert(sizeof(struct gve_device_descriptor) == 40, "gve_device_descriptor size");
 _Static_assert(sizeof(struct gve_device_option) == 8, "gve_device_option size");
@@ -841,6 +873,33 @@ static inline int gve_rx_refill_should_ring(uint32_t unnotified,
 					    uint32_t thresh)
 {
 	return unnotified >= thresh;
+}
+
+/*
+ * Decide whether the device reports an established link. Pass the
+ * host-endian value of the big-endian BAR0 device_status register.
+ * Passing cloud runs read device_status = 0x00000004 with the link
+ * up, so bit GVE_DEVICE_STATUS_LINK_STATUS_MASK is the link bit on
+ * this device. Return 1 when the link is up and 0 when down.
+ */
+static inline int gve_link_is_up(uint32_t dev_status)
+{
+	return (dev_status & GVE_DEVICE_STATUS_LINK_STATUS_MASK) != 0U;
+}
+
+/*
+ * Decide whether one QPL registration stays inside the device page
+ * budget. max_registered_pages comes from the device descriptor. A
+ * device that reports 0 sets no limit, so the check passes. total is
+ * the page count the driver already registered. Return 1 when the
+ * registration fits and 0 when the driver must refuse it.
+ */
+static inline int gve_qpl_within_limit(uint64_t total, uint64_t num_pages,
+				       uint64_t max_pages)
+{
+	if (max_pages == 0ULL)
+		return 1;
+	return (total + num_pages) <= max_pages;
 }
 
 #endif /* __UK_DRV_GVE_H__ */

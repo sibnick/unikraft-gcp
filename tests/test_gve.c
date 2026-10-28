@@ -12,31 +12,12 @@
 #include <assert.h>
 #include <gve.h>
 
-static void test_struct_sizes(void)
-{
-	assert(sizeof(struct gve_registers) == 42);
-	assert(sizeof(struct gve_driver_info) == 304);
-	assert(sizeof(struct gve_device_descriptor) == 40);
-	assert(sizeof(struct gve_device_option) == 8);
-	assert(sizeof(struct gve_irq_db) == 64);
-	assert(sizeof(struct gve_queue_resources) == 64);
-	assert(sizeof(struct gve_ptype_lut) == 2048);
-	assert(sizeof(struct gve_adminq_configure_device_resources) == 40);
-	assert(sizeof(struct gve_adminq_register_page_list) == 24);
-	assert(sizeof(struct gve_adminq_create_tx_queue) == 48);
-	assert(sizeof(struct gve_adminq_create_rx_queue) == 56);
-	assert(sizeof(struct gve_adminq_get_ptype_map) == 16);
-	assert(sizeof(union gve_adminq_command) == 64);
-	assert(sizeof(union gve_tx_desc) == 16);
-	assert(sizeof(union gve_rx_data_slot) == 8);
-	assert(sizeof(struct gve_rx_desc) == 64);
-	assert(sizeof(struct gve_tx_pkt_desc_dqo) == 16);
-	assert(sizeof(struct gve_tx_general_context_desc_dqo) == 16);
-	assert(sizeof(union gve_tx_desc_dqo) == 16);
-	assert(sizeof(struct gve_tx_compl_desc) == 8);
-	assert(sizeof(struct gve_rx_desc_dqo) == 32);
-	assert(sizeof(struct gve_rx_compl_desc_dqo) == 32);
-}
+/*
+ * Struct layout stays verified by the _Static_assert checks in
+ * gve.h. They fire at compile time on every build that includes the
+ * header, this test included. A runtime copy repeated them without
+ * adding coverage. Ticket c1a76baff0 N3.
+ */
 
 static void test_adminq_configure_resources(void)
 {
@@ -641,9 +622,42 @@ static void test_rx_refill_doorbell(void)
 	assert(gve_rx_refill_should_ring(33U, GVE_RX_BUF_THRESH_DQO) != 0);
 }
 
+/*
+ * Link state gate for GATE_GVE_PASS in netdev_start. The caller
+ * passes the host-endian BAR0 device_status value. Passing cloud
+ * runs report 0x00000004 with the link up. Only
+ * GVE_DEVICE_STATUS_LINK_STATUS_MASK decides. Ticket c1a76baff0 L3.
+ */
+static void test_link_state(void)
+{
+	assert(gve_link_is_up(0x00000004U));	/* passing cloud runs */
+	assert(gve_link_is_up(0x0000000CU));	/* link plus other bits */
+	assert(!gve_link_is_up(0x00000000U));	/* link down */
+	assert(!gve_link_is_up(0x00000001U));	/* done bit only */
+	assert(!gve_link_is_up(0x00000002U));	/* reset bit only */
+}
+
+/*
+ * QPL page budget enforcement before REGISTER_PAGE_LIST. The
+ * passing c3 device reports 16384 pages. A device that reports 0
+ * sets no limit. Ticket c1a76baff0 L4.
+ */
+static void test_qpl_limit(void)
+{
+	/* Driver worst case: 1024 RX pages plus 64 TX pages. */
+	assert(gve_qpl_within_limit(0ULL, 1024ULL, 16384ULL));
+	assert(gve_qpl_within_limit(1024ULL, 64ULL, 16384ULL));
+	/* The last page inside the budget passes. */
+	assert(gve_qpl_within_limit(16320ULL, 64ULL, 16384ULL));
+	/* One page over the budget fails. */
+	assert(!gve_qpl_within_limit(16321ULL, 64ULL, 16384ULL));
+	assert(!gve_qpl_within_limit(16384ULL, 1ULL, 16384ULL));
+	/* max_pages 0 means the device set no limit. */
+	assert(gve_qpl_within_limit(0xFFFFFFFFFFFFFFFFULL, 1ULL, 0ULL));
+}
+
 int main(void)
 {
-	test_struct_sizes();
 	test_adminq_configure_resources();
 	test_adminq_create_queues();
 	test_gqi_datapath_descriptors();
@@ -661,6 +675,8 @@ int main(void)
 	test_max_mtu_cap();
 	test_tlv_bounds();
 	test_ring_request();
+	test_link_state();
+	test_qpl_limit();
 	printf("test_gve: all unit tests passed\n");
 	return 0;
 }
