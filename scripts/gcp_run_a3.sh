@@ -166,6 +166,26 @@ for i in $(seq 1 60); do
 done
 echo ""
 
+# Final capture before the verdict. A failure marker can appear after
+# both pass markers, so re-read the logs and re-evaluate both gates.
+# The combined evidence log then also carries the final state. Ticket
+# 06ea1706a7.
+if [ "${PING_PASS}" -eq 1 ] && [ "${NET_PASS}" -eq 1 ]; then
+    sleep 3
+    gcloud compute instances get-serial-port-output "${SRV_NAME}" \
+        --zone="${GCP_ZONE}" --project="${GCP_PROJECT}" > "${SRV_LOG}" 2>&1 || true
+    gcloud compute instances get-serial-port-output "${CLI_NAME}" \
+        --zone="${GCP_ZONE}" --project="${GCP_PROJECT}" > "${CLI_LOG}" 2>&1 || true
+    PING_PASS=0
+    NET_PASS=0
+    if ukg_gate_ping_pass "${SRV_LOG}" "${CLI_LOG}"; then
+        PING_PASS=1
+    fi
+    if ukg_gate_net_pass "${SRV_LOG}" "${CLI_LOG}"; then
+        NET_PASS=1
+    fi
+fi
+
 # Combine logs for the evidence contract. The teardown trap stores
 # the file as reports/<run-id>-serial.log in fossil uv after the
 # leak audit. Ticket c16353731a.

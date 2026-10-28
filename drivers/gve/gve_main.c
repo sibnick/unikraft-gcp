@@ -1974,10 +1974,6 @@ static int gve_add_dev(struct pci_device *pdev)
 				   gdev->mtu, gdev->max_mtu);
 	}
 
-	printf("========================================\n");
-	printf("GATE_GVE_ADMINQ_PASS\n");
-	printf("========================================\n");
-
 	/* Register with uk_netdev */
 	gdev->netdev.ops = &gve_netdev_ops;
 	gdev->netdev.rx_one = gve_netdev_recv;
@@ -1989,6 +1985,16 @@ static int gve_add_dev(struct pci_device *pdev)
 		goto err;
 	}
 	uk_pr_info("gve: Registered uk_netdev id=%d (%s)\n", rc, DRIVER_NAME);
+
+	/*
+	 * Print the gate marker only after every fallible step of the
+	 * probe succeeded. Registration was the last one, so no
+	 * GATE_FAIL can follow this marker in the same probe. Ticket
+	 * 06ea1706a7.
+	 */
+	printf("========================================\n");
+	printf("GATE_GVE_ADMINQ_PASS\n");
+	printf("========================================\n");
 
 	/*
 	 * The driver info and device descriptor only served the
