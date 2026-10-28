@@ -5,6 +5,10 @@ CONFIG_KVM_BOOT_PROTO_MULTIBOOT=y
 CONFIG_KVM_PCI=y
 CONFIG_LIBUKBOOT=y
 CONFIG_LIBUKBOOT_BANNER_POWEREDBY=y
+# Keep driver and kernel INFO diagnostics on the serial console. The
+# ukprint default is ERR only, which hides gve probe diagnostics that
+# the evidence contract relies on. Ticket c1a76baff0.
+CONFIG_LIBUKPRINT_KLVL_INFO=y
 CONFIG_LIBUKCONSOLE=y
 CONFIG_LIBNS16550=y
 CONFIG_LIBNS16550_EARLY_CONSOLE=y
