@@ -53,6 +53,16 @@ For every run store, in this order:
 
 Do not report a pass without the stored serial log.
 
+The run scripts automate step 1. After teardown and the leak audit,
+the teardown trap stores the combined serial log with
+`fossil uv add`, prints the `fossil uv ls -l` confirmation, and
+prints the exact `fossil ticket change` command for the mapped
+ticket. Each script defaults the mapped ticket to its phase ticket.
+Override it with `UKG_TICKET` for a regression run. The operator
+runs the printed ticket command by hand. A reused run id never
+overwrites stored evidence in silence; the script prints a replace
+command instead. Ticket c16353731a.
+
 ## 4. Build Discipline
 
 1. Pin the Unikraft core with a `Kraftfile` at a release tag. Start at

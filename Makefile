@@ -18,6 +18,7 @@ test-host:
 	@cc -Wall -Wextra -Werror -std=c11 -Idrivers/gve/include tests/test_gve.c -o /tmp/test_gve
 	@/tmp/test_gve
 	@rm -f /tmp/test_gve
+	@bash tests/test_evidence_store.sh
 
 lint:
 	@# Run from scripts/ so ShellCheck resolves the source= directives.
