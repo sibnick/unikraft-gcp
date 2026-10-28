@@ -23,6 +23,16 @@ IMAGE_NAME="${2:-${UKG_RUN}-img}"
 INSTANCE_NAME="${UKG_RUN}-srv"
 SERIAL_LOG="$(ukg_mk_serial_log "${UKG_RUN}")"
 
+# Evidence contract wiring. The teardown trap stores this log as
+# reports/<run-id>-serial.log with fossil uv after the leak audit,
+# and prints the exact fossil ticket change command for the mapped
+# ticket. The default is the phase ticket from the validation skill.
+# Override UKG_TICKET for a regression run driven by another ticket.
+# Ticket c16353731a.
+UKG_GATE="A2"
+UKG_EVIDENCE_LOG="${SERIAL_LOG}"
+UKG_TICKET="${UKG_TICKET:-a5504bc848}"
+
 if [ -z "${GCP_PROJECT}" ]; then
     echo "[ERROR] GCP_PROJECT is not set." >&2
     exit 1

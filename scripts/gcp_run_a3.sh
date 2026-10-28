@@ -42,6 +42,16 @@ SRV_LOG="$(ukg_mk_serial_log "${UKG_RUN}-srv")"
 CLI_LOG="$(ukg_mk_serial_log "${UKG_RUN}-cli")"
 COMBINED_LOG="$(ukg_mk_serial_log "${UKG_RUN}")"
 
+# Evidence contract wiring. The teardown trap stores the combined log
+# as reports/<run-id>-serial.log with fossil uv after the leak audit,
+# and prints the exact fossil ticket change command for the mapped
+# ticket. The default is the phase ticket from the validation skill.
+# Override UKG_TICKET for a regression run driven by another ticket.
+# Ticket c16353731a.
+UKG_GATE="A3"
+UKG_EVIDENCE_LOG="${COMBINED_LOG}"
+UKG_TICKET="${UKG_TICKET:-84e256b934}"
+
 if [ -z "${GCP_PROJECT}" ] || [ -z "${GCP_ZONE}" ]; then
     echo "[ERROR] GCP_PROJECT and GCP_ZONE must be set." >&2
     exit 1
@@ -156,8 +166,9 @@ for i in $(seq 1 60); do
 done
 echo ""
 
-# Combine logs for evidence contract. Store the file as
-# reports/<run-id>-serial.log in fossil uv.
+# Combine logs for the evidence contract. The teardown trap stores
+# the file as reports/<run-id>-serial.log in fossil uv after the
+# leak audit. Ticket c16353731a.
 {
     echo "=== SERVER SERIAL CONSOLE OUTPUT (${SRV_NAME}) ==="
     cat "${SRV_LOG}" 2>/dev/null || true
