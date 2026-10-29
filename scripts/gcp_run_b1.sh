@@ -19,6 +19,15 @@ GCP_PROJECT="${GCP_PROJECT:-$(gcloud config get-value project 2>/dev/null || tru
 GCP_ZONE="${GCP_ZONE:-$(gcloud config get-value compute/zone 2>/dev/null || true)}"
 UKG_RUN="${1:-${UKG_RUN:-$(ukg_default_run_id)}}"
 ukg_validate_run_id "${UKG_RUN}"
+
+# Every run uploads a disk image to Cloud Storage. Require the
+# bucket before any billable call. Ticket afc0a00b06.
+if [ -z "${GCP_BUCKET:-}" ]; then
+    echo "[ERROR] GCP_BUCKET is not set." >&2
+    echo "[ERROR] Every run uploads a disk image to Cloud Storage." >&2
+    echo "[ERROR] Set GCP_BUCKET in .env." >&2
+    exit 1
+fi
 export UKG_RUN
 IMAGE_NAME="${2:-${UKG_RUN}-img}"
 ukg_validate_image_name "${IMAGE_NAME}" "${UKG_RUN}"

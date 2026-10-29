@@ -117,6 +117,139 @@ else
     ok "net gate vetoes a fail marker"
 fi
 
+# 4. Run-scoped delete filter. The filter must carry the run label
+# branch and keep the anchored name branch. Ticket 3a59523e76.
+FILTER="$(ukg_run_delete_filter "ukg-x")"
+if [[ "${FILTER}" == *'(labels.run="ukg-x")'* ]]; then
+    ok "delete filter carries the run label branch"
+else
+    bad "delete filter carries the run label branch"
+fi
+# Extract the name regex from the filter and reuse it as in teardown.
+FREGEX="${FILTER##*name ~ \"}"
+FREGEX="${FREGEX%\")*}"
+if [[ "ukg-x-srv" =~ ${FREGEX} ]]; then
+    ok "delete filter name branch matches own derived name"
+else
+    bad "delete filter name branch matches own derived name"
+fi
+if [[ "ukg-x-2-srv" =~ ${FREGEX} ]]; then
+    bad "delete filter name branch rejects extending run id"
+else
+    ok "delete filter name branch rejects extending run id"
+fi
+if [[ "foreign-disk" =~ ${FREGEX} ]]; then
+    bad "delete filter name branch rejects foreign name"
+else
+    ok "delete filter name branch rejects foreign name"
+fi
+
+# 5. Cloud Storage rm classification. Missing object is clean, other
+# errors are real. Ticket afc0a00b06.
+gcs_ok() { ukg_gcs_rm_ok "$1" "$2"; }
+gcs_ok 0 "" && ok "gcs rm accepts exit 0" || bad "gcs rm accepts exit 0"
+gcs_ok 1 "No URLs matched: gs://b/ukg-x-img-disk.tar.gz" \
+    && ok "gcs rm accepts wildcard miss" || bad "gcs rm accepts wildcard miss"
+gcs_ok 1 "googleapi: Error 404: Not Found" \
+    && ok "gcs rm accepts 404 miss" || bad "gcs rm accepts 404 miss"
+gcs_ok 1 "Error: PERMISSION_DENIED: insufficient rights" \
+    && bad "gcs rm records permission error" \
+    || ok "gcs rm records permission error"
+gcs_ok 2 "" && bad "gcs rm records silent failure" \
+    || ok "gcs rm records silent failure"
+
+# 6. Script-level teardown behavior against a stub gcloud in a
+# throwaway checkout. No real cloud call happens.
+STUBBIN="${WORK}/stubbin"
+mkdir -p "${STUBBIN}"
+cat >"${STUBBIN}/gcloud" <<'EOF'
+#!/usr/bin/env bash
+args="$*"
+if [[ "${args}" == *"storage rm"* ]]; then
+    case "${STUB_GCS_MODE:-empty}" in
+        missing)
+            echo "Command failed to remove objects: No URLs matched" \
+                "gs://test-bucket/x" >&2
+            exit 1 ;;
+        denied)
+            echo "Error: PERMISSION_DENIED: does not have permission" >&2
+            exit 1 ;;
+        *) exit 0 ;;
+    esac
+fi
+# All list commands report an empty project.
+exit 0
+EOF
+chmod +x "${STUBBIN}/gcloud"
+CO2="${WORK}/checkout"
+mkdir -p "${CO2}/scripts/lib"
+cp "${ROOT_DIR}/scripts/gcp_teardown.sh" "${CO2}/scripts/gcp_teardown.sh"
+cp "${ROOT_DIR}/scripts/lib/gcp_lib.sh" "${CO2}/scripts/lib/gcp_lib.sh"
+# The guarded assignments keep a value that the test exports, even an
+# empty one. GCP_BUCKET stays unset for the unknown-audit case.
+cat >"${CO2}/.env" <<'EOF'
+GCP_PROJECT="${GCP_PROJECT-test-proj}"
+GCP_ZONE="${GCP_ZONE-us-east4-a}"
+GCP_BUCKET="${GCP_BUCKET-test-bucket}"
+EOF
+
+run_teardown() {
+    # $1: extra env assignments, $2: run id or empty.
+    local extra="$1" rid="$2"
+    shift 2
+    env ${extra} PATH="${STUBBIN}:${PATH}" "${CO2}/scripts/gcp_teardown.sh" \
+        ${rid:+"${rid}"} </dev/null 2>&1
+}
+
+out="$(run_teardown "STUB_GCS_MODE=denied" ukg-x-1)" && rc=0 || rc=$?
+if [ "${rc}" -ne 0 ]; then
+    ok "permission-denied storage rm fails the teardown"
+else
+    bad "permission-denied storage rm fails the teardown"
+fi
+if printf '%s' "${out}" | grep -q "Cloud Storage delete failed"; then
+    ok "permission-denied storage rm names the failure"
+else
+    bad "permission-denied storage rm names the failure"
+fi
+
+out="$(run_teardown "STUB_GCS_MODE=missing" ukg-x-2)" && rc=0 || rc=$?
+if [ "${rc}" -eq 0 ]; then
+    ok "absent storage object stays a clean teardown"
+else
+    bad "absent storage object stays a clean teardown (rc: ${rc})"
+fi
+
+out="$(run_teardown "GCP_BUCKET=" ukg-x-3)" && rc=0 || rc=$?
+if [ "${rc}" -ne 0 ]; then
+    ok "unset bucket fails the audit as unknown"
+else
+    bad "unset bucket fails the audit as unknown"
+fi
+if printf '%s' "${out}" | grep -q "unknown, not clean"; then
+    ok "unset bucket audit prints the unknown reason"
+else
+    bad "unset bucket audit prints the unknown reason"
+fi
+
+out="$(UKG_TEARDOWN_ALL=1 run_teardown "UKG_TEARDOWN_ALL=1" "")" \
+    && rc=0 || rc=$?
+if [ "${rc}" -ne 0 ]; then
+    ok "sweep without confirmation refuses on a non-terminal"
+else
+    bad "sweep without confirmation refuses on a non-terminal"
+fi
+if printf '%s' "${out}" | grep -q "needs a terminal"; then
+    ok "sweep refusal names the terminal requirement"
+else
+    bad "sweep refusal names the terminal requirement"
+fi
+if printf '%s' "${out}" | grep -q "Resources the sweep would delete"; then
+    ok "sweep lists resources before refusing"
+else
+    bad "sweep lists resources before refusing"
+fi
+
 echo ""
 echo "test_gate_logic: ${PASS_COUNT} passed, ${FAIL_COUNT} failed"
 [ "${FAIL_COUNT}" -eq 0 ]

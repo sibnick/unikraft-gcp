@@ -6,7 +6,8 @@
 # failed gcloud call cannot abort the script and strand the resource
 # classes that come later. Failures are counted and reported with a
 # non-zero exit code at the end. Tickets: 8c0f80d874 4a7a2ca6f5
-# e3effabf78 (M5) 4347c2a8e6 (N4) f3df948f2c 74936642ce.
+# e3effabf78 (M5) 4347c2a8e6 (N4) f3df948f2c 74936642ce
+# afc0a00b06 3a59523e76.
 # Usage: gcp_teardown.sh <run-id>. The run id is mandatory. The
 # project-wide sweep needs the explicit opt-in UKG_TEARDOWN_ALL=1.
 set -euo pipefail
@@ -31,10 +32,14 @@ RUN_ID="${1:-}"
 # Ticket f3df948f2c.
 if [ -n "${RUN_ID}" ]; then
     ukg_validate_run_id "${RUN_ID}"
-    # Anchored exact-boundary match: the run id itself or a name with
-    # one of the derived suffixes. A loose prefix such as ^ukg-test
-    # would also delete ukg-test-2 resources. Ticket 74936642ce.
-    NAME_FILTER="name ~ \"$(ukg_run_name_regex "${RUN_ID}")\""
+    # Match the run label or an exact-boundary name. AGENTS.md
+    # section 5 requires the run label on every billable resource,
+    # so the label branch is the primary one. The anchored name
+    # branch stays: Compute Engine auto-creates instance boot disks
+    # without labels, and only the name ties them to the run. The
+    # anchored regex keeps run ukg-test from matching ukg-test-2
+    # resources. Tickets 74936642ce 3a59523e76.
+    NAME_FILTER="$(ukg_run_delete_filter "${RUN_ID}")"
 elif [ "${UKG_TEARDOWN_ALL:-0}" = "1" ]; then
     # Explicit opt-in for the project-wide sweep. It deletes every
     # ukg- resource and storage object in the project.
@@ -80,6 +85,61 @@ elif [ "${UKG_TEARDOWN_ALL:-0}" = "1" ]; then
     echo "[WARNING] project, also from other sessions."
 fi
 echo "=================================================="
+
+# Project-wide sweep gate. The sweep deletes other sessions' work, so
+# it lists the current ukg- resources first and asks for a typed
+# confirmation that names the project. Without a terminal it refuses.
+# UKG_TEARDOWN_FORCE=1 skips the prompt when the review happened
+# elsewhere, for example in an approved automation.
+# Ticket 3a59523e76.
+print_sweep_class() {
+    local label="$1"
+    shift
+    local out
+    if ! out="$("$@" --project="${GCP_PROJECT}" \
+        --filter="${AUDIT_FILTER}" --format="value(name)" 2>/dev/null)"; then
+        echo "  ${label}: list failed, content unknown."
+        return 0
+    fi
+    if [ -n "${out}" ]; then
+        echo "  ${label}:"
+        printf '%s\n' "${out}" | sed 's/^/    /'
+    else
+        echo "  ${label}: none."
+    fi
+}
+
+confirm_sweep() {
+    local reply
+    if [ "${UKG_TEARDOWN_FORCE:-0}" = "1" ]; then
+        echo "[WARNING] UKG_TEARDOWN_FORCE=1: sweep proceeds without review."
+        return 0
+    fi
+    echo "[INFO] Resources the sweep would delete:"
+    print_sweep_class "instances" gcloud compute instances list
+    print_sweep_class "images" gcloud compute images list --no-standard-images
+    print_sweep_class "disks" gcloud compute disks list
+    print_sweep_class "firewall rules" gcloud compute firewall-rules list
+    echo ""
+    if [ ! -t 0 ]; then
+        echo "[ERROR] The sweep confirmation needs a terminal." >&2
+        echo "[ERROR] Run this command interactively, or set" >&2
+        echo "[ERROR] UKG_TEARDOWN_FORCE=1 when the review happened" >&2
+        echo "[ERROR] elsewhere." >&2
+        exit 1
+    fi
+    printf "Type SWEEP %s to delete every ukg- resource listed above.\n" \
+        "${GCP_PROJECT}"
+    read -r reply
+    if [ "${reply}" != "SWEEP ${GCP_PROJECT}" ]; then
+        echo "[ABORT] Confirmation text did not match. Nothing was deleted."
+        exit 1
+    fi
+}
+
+if [ -z "${RUN_ID}" ] && [ "${UKG_TEARDOWN_ALL:-0}" = "1" ]; then
+    confirm_sweep
+fi
 
 # 1. Instances
 delete_instances() {
@@ -164,9 +224,31 @@ delete_firewall_rules() {
 }
 
 # 5. Cloud Storage objects
+
+# Remove one Cloud Storage object or wildcard and classify errors.
+# An absent object is a normal nothing-to-delete case. Auth,
+# permission, or service errors are recorded as teardown failures
+# instead of disappearing behind "|| true". Ticket afc0a00b06.
+remove_gcs_object() {
+    local url="$1"
+    shift
+    local out="" rc=0
+    out="$(gcloud storage rm "$@" "${url}" 2>&1)" || rc=$?
+    if ukg_gcs_rm_ok "${rc}" "${out}"; then
+        return 0
+    fi
+    record_failure "Cloud Storage delete failed for ${url} (rc=${rc})."
+    printf '%s\n' "${out}" >&2
+    # Return 0: a recorded failure already fails the run at the end,
+    # and the teardown must continue with the remaining classes and
+    # the leak audit under set -e.
+    return 0
+}
+
 clean_gcs_objects() {
     if [ -z "${GCP_BUCKET}" ]; then
         echo "[INFO] GCP_BUCKET is not set. Skipping Cloud Storage cleanup."
+        echo "[INFO] The leak audit reports storage as unknown in this case."
         return 0
     fi
     echo "[INFO] Cleaning Cloud Storage objects in gs://${GCP_BUCKET}..."
@@ -181,13 +263,14 @@ clean_gcs_objects() {
         for obj in "${RUN_ID}-img-disk.tar.gz" \
                    "${RUN_ID}-srv-img-disk.tar.gz" \
                    "${RUN_ID}-cli-img-disk.tar.gz"; do
-            gcloud storage rm "gs://${GCP_BUCKET}/${obj}" 2>/dev/null || true
+            remove_gcs_object "gs://${GCP_BUCKET}/${obj}"
         done
         return 0
     fi
-    # A wildcard with no match exits non-zero. That is a normal
-    # "nothing to delete" case here, so no failure is recorded.
-    gcloud storage rm --recursive "gs://${GCP_BUCKET}/ukg-*" 2>/dev/null || true
+    # A wildcard with no match is the "No URLs matched" case handled
+    # inside remove_gcs_object. The sweep scope is the whole ukg-
+    # prefix, so it recurses into prefixes.
+    remove_gcs_object "gs://${GCP_BUCKET}/ukg-*" --recursive
 }
 
 # 6. Leak Audit per skills/gcloud-compute/SKILL.md Section 5
@@ -212,7 +295,13 @@ audit_class() {
 
 audit_gcs_objects() {
     if [ -z "${GCP_BUCKET}" ]; then
-        echo "[SKIP] GCP_BUCKET is not set. Cannot audit Cloud Storage objects."
+        # Every run script uploads a disk image to Cloud Storage, so
+        # an unset bucket makes the storage result unknown. Unknown
+        # is not clean. Ticket afc0a00b06.
+        echo "[FAIL] GCP_BUCKET is not set. Cloud Storage objects are" \
+            "unknown, not clean." >&2
+        LEAK=1
+        record_failure "Audit skipped: Cloud Storage objects (GCP_BUCKET unset)"
         return 0
     fi
     local out=""
