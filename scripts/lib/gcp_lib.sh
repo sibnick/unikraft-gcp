@@ -8,7 +8,7 @@
 # Sourced by: gcp_run_a1.sh gcp_run_a2.sh gcp_run_a3.sh gcp_run_b1.sh
 # gcp_run_b2.sh gcp_run_b3.sh gcp_build_image.sh gcp_teardown.sh
 # Tickets: 1c76a66b26 4a7a2ca6f5 e3effabf78 4347c2a8e6 c16353731a
-# 06ea1706a7 5e6a2acd8a 74936642ce cf185ab6fd
+# 06ea1706a7 5e6a2acd8a 74936642ce cf185ab6fd afc0a00b06 3a59523e76
 
 # Directory of this file, the path of the teardown script, and the
 # root of this Fossil checkout. The evidence store step needs the
@@ -75,6 +75,38 @@ ukg_validate_image_name() {
         echo "[ERROR] and start with the run id '${owner}-'." >&2
         exit 1
     fi
+}
+
+# Print the delete filter for one run id. The filter matches the run
+# label that AGENTS.md section 5 requires on every billable resource,
+# or a name from the anchored run-name regex. The name branch stays
+# because Compute Engine auto-creates instance boot disks without
+# labels, and only the name ties those disks to the run. Ticket
+# 3a59523e76.
+# Arg $1: run id.
+ukg_run_delete_filter() {
+    local id="$1"
+    echo "(labels.run=\"${id}\") OR (name ~ \"$(ukg_run_name_regex "${id}")\")"
+}
+
+# Classify one gcloud storage rm result. An absent object is a
+# nothing-to-delete case, not a failure. Auth, permission, and other
+# service errors must be recorded by the caller instead of hidden
+# behind "|| true". Ticket afc0a00b06.
+# Arg $1: exit code of the rm call. Arg $2: combined output.
+# Returns 0 when the result is acceptable, 1 on a real error.
+ukg_gcs_rm_ok() {
+    local rc="$1" out="${2:-}"
+    if [ "${rc}" -eq 0 ]; then
+        return 0
+    fi
+    # gcloud reports an absent object as "No URLs matched" for a
+    # wildcard or as an HTTP 404 "not found" for an exact name.
+    # Both mean the object is already gone.
+    if printf '%s' "${out}" | grep -qiE "No URLs matched|404|not found"; then
+        return 0
+    fi
+    return 1
 }
 
 # Print the zone fallback list, one zone per line, duplicates removed.

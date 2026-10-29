@@ -49,6 +49,7 @@ struct uk_netdev_tx_queue {
 	uint16_t comp_cnt;
 	uint16_t comp_mask;
 	uint32_t ntfy_id;
+	uint32_t db_idx;	/* device BAR2 doorbell index, checked at configure */
 	struct gve_queue_resources *q_resources;
 	uint8_t *bounce_bufs;
 
@@ -80,6 +81,7 @@ struct uk_netdev_rx_queue {
 	uint16_t buf_cnt;
 	uint16_t buf_mask;
 	uint32_t ntfy_id;
+	uint32_t db_idx;	/* device BAR2 doorbell index, checked at configure */
 	struct gve_queue_resources *q_resources;
 	uk_netdev_alloc_rxpkts alloc_rxpkts;
 	void *alloc_rxpkts_argp;
@@ -111,6 +113,8 @@ struct gve_device {
 	struct pci_device *pdev;
 	volatile struct gve_registers *reg_bar0;
 	volatile uint32_t *db_bar2;
+	uint64_t bar0_size;	/* BAR0 byte size from the config-space probe */
+	uint64_t bar2_size;	/* BAR2 byte size from the config-space probe */
 	union gve_adminq_command *adminq;
 	uint32_t adminq_prod_cnt;
 
@@ -246,6 +250,24 @@ static void gve_unmap_bar(int slot)
 	__asm__ __volatile__("movq %0, %%cr3" :: "r"(cr3) : "memory");
 }
 
+/*
+ * Read one BAR size with the standard config-space probe: save the
+ * BAR, write all ones, read the decode mask, and restore the BAR.
+ * Nothing maps or accesses the BAR while it holds the probe value,
+ * so the write cannot disturb the running system. Return the size
+ * in bytes, decoded by gve_bar_size_from_mask(). Ticket ad4bd33ab8.
+ */
+static uint64_t gve_bar_size(struct pci_device *pdev, uint32_t bar_off)
+{
+	uint32_t orig = uk_pci_read_config32(&pdev->addr, bar_off);
+	uint32_t mask;
+
+	uk_pci_write_config32(&pdev->addr, bar_off, 0xffffffffU);
+	mask = uk_pci_read_config32(&pdev->addr, bar_off);
+	uk_pci_write_config32(&pdev->addr, bar_off, orig);
+	return gve_bar_size_from_mask(mask);
+}
+
 static inline uint32_t mmio_read32(const volatile uint32_t *reg)
 {
 	uint32_t val = *reg;
@@ -368,11 +390,13 @@ static int gve_adminq_exec(volatile struct gve_registers *reg_bar0,
 
 /*
  * Teardown commands. They run on error unwinding and on queue
- * reconfiguration. A failed teardown only logs: the caller is
- * already unwinding and cannot recover further.
+ * reconfiguration. They return the AdminQ status so the caller can
+ * decide whether the device still holds the memory the queue owns.
+ * A failed destroy or unregister means the device may still DMA
+ * into those buffers.
  */
-static void gve_adminq_destroy_tx_queue(struct gve_device *gdev,
-					uint16_t queue_id)
+static int gve_adminq_destroy_tx_queue(struct gve_device *gdev,
+				       uint16_t queue_id)
 {
 	union gve_adminq_command cmd;
 	uint32_t cmd_status = 0;
@@ -385,10 +409,11 @@ static void gve_adminq_destroy_tx_queue(struct gve_device *gdev,
 			     &gdev->adminq_prod_cnt, &cmd, &cmd_status);
 	uk_pr_info("gve: DESTROY_TX_QUEUE qid=%u rc=%d status=0x%x\n",
 		   queue_id, rc, cmd_status);
+	return rc;
 }
 
-static void gve_adminq_destroy_rx_queue(struct gve_device *gdev,
-					uint16_t queue_id)
+static int gve_adminq_destroy_rx_queue(struct gve_device *gdev,
+				       uint16_t queue_id)
 {
 	union gve_adminq_command cmd;
 	uint32_t cmd_status = 0;
@@ -401,11 +426,12 @@ static void gve_adminq_destroy_rx_queue(struct gve_device *gdev,
 			     &gdev->adminq_prod_cnt, &cmd, &cmd_status);
 	uk_pr_info("gve: DESTROY_RX_QUEUE qid=%u rc=%d status=0x%x\n",
 		   queue_id, rc, cmd_status);
+	return rc;
 }
 
-static void gve_adminq_unregister_page_list(struct gve_device *gdev,
-					    uint32_t qpl_id,
-					    uint32_t num_pages)
+static int gve_adminq_unregister_page_list(struct gve_device *gdev,
+					   uint32_t qpl_id,
+					   uint32_t num_pages)
 {
 	union gve_adminq_command cmd;
 	uint32_t cmd_status = 0;
@@ -419,15 +445,19 @@ static void gve_adminq_unregister_page_list(struct gve_device *gdev,
 	uk_pr_info("gve: UNREGISTER_PAGE_LIST id=%u rc=%d status=0x%x\n",
 		   qpl_id, rc, cmd_status);
 	/*
-	 * Release the driver-side budget share unconditionally. The
-	 * count mirrors what gve_register_qpl added on success. A
-	 * failed unregister only happens during unwinding, where the
-	 * device state no longer matters to this driver.
+	 * Release the driver-side budget share on success only. The
+	 * count mirrors what gve_register_qpl added on success. When
+	 * the unregister fails, the caller leaks the page list, so
+	 * the budget share stays charged: that memory never returns
+	 * to the pool.
 	 */
-	if (gdev->registered_pages >= num_pages)
-		gdev->registered_pages -= num_pages;
-	else
-		gdev->registered_pages = 0;
+	if (rc == 0) {
+		if (gdev->registered_pages >= num_pages)
+			gdev->registered_pages -= num_pages;
+		else
+			gdev->registered_pages = 0;
+	}
+	return rc;
 }
 
 static int gve_register_qpl(struct gve_device *gdev, struct uk_alloc *a,
@@ -591,6 +621,20 @@ static int gve_configure_resources(struct gve_device *gdev)
 	if (rc != 0)
 		goto fail;
 
+	/*
+	 * The driver writes doorbell blocks as 32-bit words at
+	 * db_bar2[db_index], so the area covering every block must
+	 * fit inside the BAR2 window it maps. Refuse the device when
+	 * the negotiated block count does not fit. Ticket 7af135385d.
+	 */
+	if ((uint64_t)gdev->num_ntfy_blks * 4ULL > gdev->bar2_size) {
+		printf("GATE_FAIL: gve num_ntfy_blks=%u exceeds BAR2 size=%llu\n",
+		       gdev->num_ntfy_blks,
+		       (unsigned long long)gdev->bar2_size);
+		rc = -ENODEV;
+		goto fail;
+	}
+
 	if (gdev->queue_format == GVE_DQO_RDA_FORMAT) {
 		if (!gdev->ptype_lut_dqo) {
 			gdev->ptype_lut_dqo = uk_memalign(
@@ -733,15 +777,29 @@ static void gve_txq_free(struct gve_device *gdev,
 			 struct uk_netdev_tx_queue *txq, int destroy_queue)
 {
 	struct uk_alloc *a;
+	int rc = 0;
 
 	if (!txq)
 		return;
 	a = txq->alloc ? txq->alloc : drv_alloc;
 	if (destroy_queue)
-		gve_adminq_destroy_tx_queue(gdev, txq->qid);
+		rc |= gve_adminq_destroy_tx_queue(gdev, txq->qid);
 	if (txq->qpl_registered)
-		gve_adminq_unregister_page_list(gdev, txq->qpl_id,
-						txq->num_qpl_pages);
+		rc |= gve_adminq_unregister_page_list(gdev, txq->qpl_id,
+						      txq->num_qpl_pages);
+	if (rc != 0) {
+		/*
+		 * The device did not confirm that it released the
+		 * queue or the page list. It can still DMA into these
+		 * buffers, so freeing them would corrupt whatever the
+		 * allocator hands out next. Leak the whole queue on
+		 * purpose: the pointers simply go out of scope.
+		 * Ticket 888a2b2e1d.
+		 */
+		uk_pr_err("gve: TX queue qid=%u teardown failed, leaking queue memory\n",
+			  txq->qid);
+		return;
+	}
 	if (txq->qpl_page_bus)
 		uk_free(a, txq->qpl_page_bus);
 	if (txq->qpl_pages)
@@ -899,8 +957,33 @@ static struct uk_netdev_tx_queue *gve_netdev_txq_configure(
 	if (rc != 0)
 		goto err_free;
 
+	/*
+	 * The device filled q_resources during CREATE. Validate its
+	 * doorbell index once here and keep the host-endian value in
+	 * txq->db_idx for every later BAR2 write. An index at or
+	 * above num_ntfy_blks, or one whose 32-bit word falls beyond
+	 * BAR2, must fail the queue setup instead of writing to other
+	 * MMIO or RAM. Ticket 7af135385d.
+	 */
+	txq->db_idx = bswap32(txq->q_resources->db_index);
+	if (!gve_doorbell_in_range(txq->db_idx, gdev->num_ntfy_blks,
+				   gdev->bar2_size)) {
+		printf("GATE_FAIL: gve TX doorbell index %u out of range (num_ntfy=%u bar2_size=%llu)\n",
+		       txq->db_idx, gdev->num_ntfy_blks,
+		       (unsigned long long)gdev->bar2_size);
+		rc = -EIO;
+		goto err_destroy;
+	}
+	uk_pr_info("gve: TX0 doorbell index %u accepted (num_ntfy=%u)\n",
+		   txq->db_idx, gdev->num_ntfy_blks);
+
 	gdev->txq = txq;
 	return txq;
+
+err_destroy:
+	/* CREATE succeeded, so the device holds the queue: destroy it. */
+	gve_txq_free(gdev, txq, 1);
+	return ERR2PTR(rc);
 
 err_free:
 	/* The queue never started: release the partial build only. */
@@ -917,15 +1000,27 @@ static void gve_rxq_free(struct gve_device *gdev,
 			 struct uk_netdev_rx_queue *rxq, int destroy_queue)
 {
 	struct uk_alloc *a;
+	int rc = 0;
 
 	if (!rxq)
 		return;
 	a = rxq->alloc ? rxq->alloc : drv_alloc;
 	if (destroy_queue)
-		gve_adminq_destroy_rx_queue(gdev, rxq->qid);
+		rc |= gve_adminq_destroy_rx_queue(gdev, rxq->qid);
 	if (rxq->qpl_registered)
-		gve_adminq_unregister_page_list(gdev, rxq->qpl_id,
-						rxq->num_qpl_pages);
+		rc |= gve_adminq_unregister_page_list(gdev, rxq->qpl_id,
+						      rxq->num_qpl_pages);
+	if (rc != 0) {
+		/*
+		 * Same rule as gve_txq_free: the device may still DMA
+		 * into these buffers after a failed teardown, so leak
+		 * the queue on purpose instead of freeing live DMA
+		 * memory. Ticket 888a2b2e1d.
+		 */
+		uk_pr_err("gve: RX queue qid=%u teardown failed, leaking queue memory\n",
+			  rxq->qid);
+		return;
+	}
 	if (rxq->qpl_page_bus)
 		uk_free(a, rxq->qpl_page_bus);
 	if (rxq->qpl_pages)
@@ -1112,8 +1207,30 @@ static struct uk_netdev_rx_queue *gve_netdev_rxq_configure(
 	if (rc != 0)
 		goto err_free;
 
+	/*
+	 * Same rule as the TX path: validate the device-reported RX
+	 * doorbell index once and store it for the datapath. Ticket
+	 * 7af135385d.
+	 */
+	rxq->db_idx = bswap32(rxq->q_resources->db_index);
+	if (!gve_doorbell_in_range(rxq->db_idx, gdev->num_ntfy_blks,
+				   gdev->bar2_size)) {
+		printf("GATE_FAIL: gve RX doorbell index %u out of range (num_ntfy=%u bar2_size=%llu)\n",
+		       rxq->db_idx, gdev->num_ntfy_blks,
+		       (unsigned long long)gdev->bar2_size);
+		rc = -EIO;
+		goto err_destroy;
+	}
+	uk_pr_info("gve: RX0 doorbell index %u accepted (num_ntfy=%u)\n",
+		   rxq->db_idx, gdev->num_ntfy_blks);
+
 	gdev->rxq = rxq;
 	return rxq;
+
+err_destroy:
+	/* CREATE succeeded, so the device holds the queue: destroy it. */
+	gve_rxq_free(gdev, rxq, 1);
+	return ERR2PTR(rc);
 
 err_free:
 	/* The queue never started: release the partial build only. */
@@ -1135,10 +1252,26 @@ static int gve_netdev_start(struct uk_netdev *dev)
 
 	__asm__ __volatile__("mfence" ::: "memory");
 
-	tx_db_idx = bswap32(gdev->txq->q_resources->db_index);
+	tx_db_idx = gdev->txq->db_idx;
 	tx_cnt_idx = bswap32(gdev->txq->q_resources->counter_index);
-	rx_db_idx = bswap32(gdev->rxq->q_resources->db_index);
+	rx_db_idx = gdev->rxq->db_idx;
 	rx_cnt_idx = bswap32(gdev->rxq->q_resources->counter_index);
+
+	/*
+	 * Defense in depth: the queue configure path already checked
+	 * both indices, so this only catches a queue that reached
+	 * start without that check. The first RX doorbell write below
+	 * must never leave the notification area. Ticket 7af135385d.
+	 */
+	if (!gve_doorbell_in_range(tx_db_idx, gdev->num_ntfy_blks,
+				   gdev->bar2_size) ||
+	    !gve_doorbell_in_range(rx_db_idx, gdev->num_ntfy_blks,
+				   gdev->bar2_size)) {
+		printf("GATE_FAIL: gve doorbell index out of range at start: tx=%u rx=%u num_ntfy=%u bar2_size=%llu\n",
+		       tx_db_idx, rx_db_idx, gdev->num_ntfy_blks,
+		       (unsigned long long)gdev->bar2_size);
+		return -EIO;
+	}
 
 	/* Post initial RX buffers via BAR2 doorbell */
 	if (gdev->queue_format == GVE_DQO_RDA_FORMAT) {
@@ -1299,7 +1432,7 @@ static int gve_netdev_xmit(struct uk_netdev *dev,
 	tot_len = acc.total;
 	padded_len = gve_tx_pad_len(tot_len);
 
-	tx_db_idx = bswap32(queue->q_resources->db_index);
+	tx_db_idx = queue->db_idx;	/* validated at queue configure */
 
 	if (gdev->queue_format == GVE_DQO_RDA_FORMAT) {
 		uint32_t ctx_slot;
@@ -1414,7 +1547,7 @@ static int gve_netdev_recv(struct uk_netdev *dev,
 		return -EINVAL;
 
 	*pkt = NULL;
-	rx_db_idx = bswap32(queue->q_resources->db_index);
+	rx_db_idx = queue->db_idx;	/* validated at queue configure */
 
 	if (gdev->queue_format == GVE_DQO_RDA_FORMAT) {
 		struct gve_rx_compl_desc_dqo *cdesc =
@@ -1613,10 +1746,37 @@ static int gve_add_dev(struct pci_device *pdev)
 					     PCI_CLASS_REVISION) & 0xffU);
 	bar0_paddr = uk_pci_read_bar(&pdev->addr, PCI_BASE_ADDRESS_0);
 	bar2_paddr = uk_pci_read_bar(&pdev->addr, PCI_BASE_ADDRESS_2);
+	gdev->bar0_size = gve_bar_size(pdev, PCI_BASE_ADDRESS_0);
+	gdev->bar2_size = gve_bar_size(pdev, PCI_BASE_ADDRESS_2);
 
-	uk_pr_info("gve: PCI Revision: 0x%02x, BAR0 paddr: 0x%llx, BAR2 paddr: 0x%llx\n",
+	uk_pr_info("gve: PCI Revision: 0x%02x, BAR0 paddr: 0x%llx size: %llu, BAR2 paddr: 0x%llx size: %llu\n",
 		   rev, (unsigned long long)bar0_paddr,
-		   (unsigned long long)bar2_paddr);
+		   (unsigned long long)gdev->bar0_size,
+		   (unsigned long long)bar2_paddr,
+		   (unsigned long long)gdev->bar2_size);
+
+	/*
+	 * gve_map_bar maps one 1 GiB-aligned window per slot, so each
+	 * BAR must sit fully inside one window. BAR0 must also cover
+	 * the whole register layout, or a short BAR would let register
+	 * reads run past the device memory. Refuse the device
+	 * otherwise. Ticket ad4bd33ab8.
+	 */
+	if (!gve_bar_fits_window(bar0_paddr, gdev->bar0_size) ||
+	    gdev->bar0_size < sizeof(struct gve_registers)) {
+		printf("GATE_FAIL: gve BAR0 unusable paddr=0x%llx size=%llu\n",
+		       (unsigned long long)bar0_paddr,
+		       (unsigned long long)gdev->bar0_size);
+		rc = -ENODEV;
+		goto err;
+	}
+	if (!gve_bar_fits_window(bar2_paddr, gdev->bar2_size)) {
+		printf("GATE_FAIL: gve BAR2 unusable paddr=0x%llx size=%llu\n",
+		       (unsigned long long)bar2_paddr,
+		       (unsigned long long)gdev->bar2_size);
+		rc = -ENODEV;
+		goto err;
+	}
 
 	reg_bar0 = (volatile struct gve_registers *)gve_map_bar(bar0_paddr, 0);
 	if (!reg_bar0) {

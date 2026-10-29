@@ -20,6 +20,15 @@ GCP_PROJECT="${GCP_PROJECT:-$(gcloud config get-value project 2>/dev/null || tru
 GCP_ZONE="${GCP_ZONE:-$(gcloud config get-value compute/zone 2>/dev/null || true)}"
 UKG_RUN="${1:-${UKG_RUN:-$(ukg_default_run_id)}}"
 ukg_validate_run_id "${UKG_RUN}"
+
+# Every run uploads a disk image to Cloud Storage. Require the
+# bucket before any billable call. Ticket afc0a00b06.
+if [ -z "${GCP_BUCKET:-}" ]; then
+    echo "[ERROR] GCP_BUCKET is not set." >&2
+    echo "[ERROR] Every run uploads a disk image to Cloud Storage." >&2
+    echo "[ERROR] Set GCP_BUCKET in .env." >&2
+    exit 1
+fi
 export UKG_RUN
 
 SRV_NAME="${UKG_RUN}-srv"
@@ -95,7 +104,8 @@ if ! gcloud compute firewall-rules describe "${FIREWALL_NAME}" --project="${GCP_
         --direction=INGRESS \
         --allow=icmp,udp:9000 \
         --source-ranges="${SUBNET}" \
-        --target-tags=ukg-vm
+        --target-tags=ukg-vm \
+        --labels=run="${UKG_RUN}"
 fi
 
 # 4. Delete existing instances if present (rerunnable requirement)

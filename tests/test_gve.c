@@ -656,6 +656,66 @@ static void test_qpl_limit(void)
 	assert(gve_qpl_within_limit(0xFFFFFFFFFFFFFFFFULL, 1ULL, 0ULL));
 }
 
+static void test_bar_window(void)
+{
+	/* Real values from cloud run ukg-1029-003609: both BARs sit
+	   fully inside the 0xc0000000 1 GiB window. */
+	assert(gve_bar_fits_window(0xc0203000ULL, 65536ULL));
+	assert(gve_bar_fits_window(0xc0100000ULL, 1048576ULL));
+	/* A missing BAR (base 0) or a size of 0 fails. */
+	assert(!gve_bar_fits_window(0ULL, 4096ULL));
+	assert(!gve_bar_fits_window(0xc0200000ULL, 0ULL));
+	/* Exactly one window fits; one byte more is refused. */
+	assert(gve_bar_fits_window(0xc0000000ULL, 1ULL << 30));
+	assert(!gve_bar_fits_window(0xc0000000ULL, (1ULL << 30) + 1ULL));
+	/* A BAR that crosses a 1 GiB boundary is refused: the driver
+	   maps only one window per slot. */
+	assert(!gve_bar_fits_window(0xbfffffffULL, 2ULL));
+	assert(!gve_bar_fits_window(0xc0000000ULL - 4096ULL, 8192ULL));
+	/* The last byte is inclusive: a BAR that ends exactly on the
+	   window boundary fits. */
+	assert(gve_bar_fits_window(0xc0000000ULL + (1ULL << 30) - 4096ULL,
+				   4096ULL));
+}
+
+static void test_bar_size_decode(void)
+{
+	/* 64 KiB memory BAR: mask holds the inverse size, low four
+	   bits hold the BAR type. */
+	assert(gve_bar_size_from_mask(0xffff0004U) == 65536ULL);
+	/* 1 MiB with other type bits set: the type must not change
+	   the size. */
+	assert(gve_bar_size_from_mask(0xfff0000cU) == 1048576ULL);
+	assert(gve_bar_size_from_mask(0xfff00000U) == 1048576ULL);
+	/* 4 MiB. */
+	assert(gve_bar_size_from_mask(0xffc00000U) == 4194304ULL);
+	/* An unimplemented BAR reads back all ones and decodes to 16
+	   bytes, below every valid register layout, so the probe
+	   rejects it. */
+	assert(gve_bar_size_from_mask(0xffffffffU) == 16ULL);
+}
+
+static void test_doorbell_range(void)
+{
+	/* Cloud device: 2 notification blocks in a 1 MiB BAR2. Both
+	   valid indexes pass. */
+	assert(gve_doorbell_in_range(0U, 2U, 1048576ULL));
+	assert(gve_doorbell_in_range(1U, 2U, 1048576ULL));
+	/* Index at or above the block count is refused, including the
+	   unbounded 32-bit value an unconfigured page could hold. */
+	assert(!gve_doorbell_in_range(2U, 2U, 1048576ULL));
+	assert(!gve_doorbell_in_range(0xFFFFFFFFU, 2U, 1048576ULL));
+	assert(!gve_doorbell_in_range(0U, 0U, 1048576ULL));
+	/* The 4-byte write must end inside BAR2: index 0 with a 4-byte
+	   BAR2 fits, a 3-byte BAR2 does not. */
+	assert(gve_doorbell_in_range(0U, 1U, 4ULL));
+	assert(!gve_doorbell_in_range(0U, 1U, 3ULL));
+	/* The last block of 256 inside exactly 1024 bytes fits; one
+	   byte short is refused. */
+	assert(gve_doorbell_in_range(255U, 256U, 1024ULL));
+	assert(!gve_doorbell_in_range(255U, 256U, 1023ULL));
+}
+
 int main(void)
 {
 	test_adminq_configure_resources();
@@ -677,6 +737,9 @@ int main(void)
 	test_ring_request();
 	test_link_state();
 	test_qpl_limit();
+	test_bar_window();
+	test_bar_size_decode();
+	test_doorbell_range();
 	printf("test_gve: all unit tests passed\n");
 	return 0;
 }
