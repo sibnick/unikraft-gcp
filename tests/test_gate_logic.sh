@@ -157,6 +157,12 @@ gcs_ok 1 "Error: PERMISSION_DENIED: insufficient rights" \
     || ok "gcs rm records permission error"
 gcs_ok 2 "" && bad "gcs rm records silent failure" \
     || ok "gcs rm records silent failure"
+# Exact absent-object text captured from run ukg-1029-010754: current
+# gcloud phrasing must stay classified as nothing-to-delete.
+gcs_ok 1 "ERROR: (gcloud.storage.rm) The following URLs matched no objects or files:
+gs://bucket/ukg-x-img-disk.tar.gz" \
+    && ok "gcs rm accepts current absent-object text" \
+    || bad "gcs rm accepts current absent-object text"
 
 # 6. Script-level teardown behavior against a stub gcloud in a
 # throwaway checkout. No real cloud call happens.
@@ -171,10 +177,26 @@ if [[ "${args}" == *"storage rm"* ]]; then
             echo "Command failed to remove objects: No URLs matched" \
                 "gs://test-bucket/x" >&2
             exit 1 ;;
+        current-missing)
+            echo "ERROR: (gcloud.storage.rm) The following URLs" \
+                "matched no objects or files:" >&2
+            echo "gs://test-bucket/x" >&2
+            exit 1 ;;
         denied)
             echo "Error: PERMISSION_DENIED: does not have permission" >&2
             exit 1 ;;
         *) exit 0 ;;
+    esac
+fi
+if [[ "${args}" == *"get-serial-port-output"* ]]; then
+    case "${STUB_SERIAL_MODE:-ok}" in
+        fail)
+            echo "ERROR: (gcloud.compute.instances.get-serial-port-output)" \
+                "connection refused" >&2
+            exit 1 ;;
+        *)
+            echo "stub serial content"
+            exit 0 ;;
     esac
 fi
 # All list commands report an empty project.
@@ -248,6 +270,37 @@ if printf '%s' "${out}" | grep -q "Resources the sweep would delete"; then
     ok "sweep lists resources before refusing"
 else
     bad "sweep lists resources before refusing"
+fi
+
+# 7. Serial capture. A failed fetch must keep the previous log, and a
+# good fetch must replace it. Ticket 0bc13135d7.
+CAP="${WORK}/cap.log"
+(
+    export PATH="${STUBBIN}:${PATH}" GCP_ZONE=test-zone \
+        GCP_PROJECT=test-proj STUB_SERIAL_MODE=ok
+    ukg_serial_capture inst "${CAP}"
+) && ok "serial capture succeeds with the stub" \
+    || bad "serial capture succeeds with the stub"
+if [ -f "${CAP}" ] && grep -q "stub serial content" "${CAP}"; then
+    ok "serial capture stores the fetched content"
+else
+    bad "serial capture stores the fetched content"
+fi
+(
+    export PATH="${STUBBIN}:${PATH}" GCP_ZONE=test-zone \
+        GCP_PROJECT=test-proj STUB_SERIAL_MODE=fail
+    ukg_serial_capture inst "${CAP}"
+) && bad "failed serial capture returns non-zero" \
+    || ok "failed serial capture returns non-zero"
+if grep -q "stub serial content" "${CAP}"; then
+    ok "failed serial capture keeps the previous log"
+else
+    bad "failed serial capture keeps the previous log"
+fi
+if [ ! -e "${CAP}.new" ]; then
+    ok "failed serial capture removes the temp file"
+else
+    bad "failed serial capture removes the temp file"
 fi
 
 echo ""

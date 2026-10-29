@@ -107,8 +107,11 @@ if ! gcloud compute firewall-rules describe "${FIREWALL_NAME}" --project="${GCP_
         --direction=INGRESS \
         --allow=icmp,udp:9000 \
         --source-ranges="${SUBNET}" \
-        --target-tags=ukg-vm \
-        --labels=run="${UKG_RUN}"
+        --target-tags=ukg-vm
+    # Firewall rules support no labels on GA, beta, or alpha gcloud
+    # (verified on SDK 591.0.0), so this rule stays unlabeled. The
+    # teardown delete filter covers it through the anchored name
+    # branch. Ticket 3a59523e76.
 fi
 
 # The zone fallback list comes from ukg_zone_list. Override it with
@@ -201,11 +204,9 @@ NET_PASS=0
 for i in $(seq 1 70); do
     sleep 3
 
-    gcloud compute instances get-serial-port-output "${SRV_NAME}" \
-        --zone="${GCP_ZONE}" --project="${GCP_PROJECT}" > "${SRV_LOG}" 2>&1 || true
+    ukg_serial_capture "${SRV_NAME}" "${SRV_LOG}" || true
 
-    gcloud compute instances get-serial-port-output "${CLI_NAME}" \
-        --zone="${GCP_ZONE}" --project="${GCP_PROJECT}" > "${CLI_LOG}" 2>&1 || true
+    ukg_serial_capture "${CLI_NAME}" "${CLI_LOG}" || true
 
     if ukg_gate_ping_pass "${SRV_LOG}" "${CLI_LOG}"; then
         PING_PASS=1
@@ -231,10 +232,8 @@ echo ""
 # 06ea1706a7.
 if [ "${PING_PASS}" -eq 1 ] && [ "${NET_PASS}" -eq 1 ]; then
     sleep 3
-    gcloud compute instances get-serial-port-output "${SRV_NAME}" \
-        --zone="${GCP_ZONE}" --project="${GCP_PROJECT}" > "${SRV_LOG}" 2>&1 || true
-    gcloud compute instances get-serial-port-output "${CLI_NAME}" \
-        --zone="${GCP_ZONE}" --project="${GCP_PROJECT}" > "${CLI_LOG}" 2>&1 || true
+    ukg_serial_capture "${SRV_NAME}" "${SRV_LOG}" || true
+    ukg_serial_capture "${CLI_NAME}" "${CLI_LOG}" || true
     PING_PASS=0
     NET_PASS=0
     if ukg_gate_ping_pass "${SRV_LOG}" "${CLI_LOG}"; then

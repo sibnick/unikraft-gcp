@@ -129,8 +129,7 @@ echo "[INFO] Polling serial console output for GATE_GVE_PASS..."
 GVE_PASS=0
 for i in $(seq 1 40); do
     sleep 3
-    gcloud compute instances get-serial-port-output "${INSTANCE_NAME}" \
-        --zone="${GCP_ZONE}" --project="${GCP_PROJECT}" > "${SERIAL_LOG}" 2>&1 || true
+    ukg_serial_capture "${INSTANCE_NAME}" "${SERIAL_LOG}" || true
 
     if grep -q "GATE_GVE_PASS" "${SERIAL_LOG}"; then
         echo "[SUCCESS] GATE_GVE_PASS found after attempt ${i}!"
@@ -150,8 +149,7 @@ echo ""
 # the pass marker, so the last serial state decides. Ticket 06ea1706a7.
 if [ "${GVE_PASS}" -eq 1 ]; then
     sleep 3
-    gcloud compute instances get-serial-port-output "${INSTANCE_NAME}" \
-        --zone="${GCP_ZONE}" --project="${GCP_PROJECT}" > "${SERIAL_LOG}" 2>&1 || true
+    ukg_serial_capture "${INSTANCE_NAME}" "${SERIAL_LOG}" || true
 fi
 
 echo "--- Serial Console Output ---"
