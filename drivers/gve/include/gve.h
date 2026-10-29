@@ -902,4 +902,63 @@ static inline int gve_qpl_within_limit(uint64_t total, uint64_t num_pages,
 	return (total + num_pages) <= max_pages;
 }
 
+#define GVE_BAR_WINDOW_SIZE	(1ULL << 30)	/* one 1 GiB PDPT window */
+
+/*
+ * Decide whether one BAR fits the driver's single-window mapping.
+ * gve_map_bar maps one 1 GiB-aligned physical window per BAR slot.
+ * The map therefore only works when the BAR is present, at most
+ * 1 GiB large, and fully inside one 1 GiB-aligned window. A BAR
+ * that crosses a window boundary would land only partly in the map,
+ * so the driver must refuse such a device. Return 1 when the window
+ * covers the whole BAR and 0 otherwise. Ticket ad4bd33ab8.
+ */
+static inline int gve_bar_fits_window(uint64_t base, uint64_t size)
+{
+	if (base == 0ULL || size == 0ULL)
+		return 0;
+	if (size > GVE_BAR_WINDOW_SIZE)
+		return 0;
+	if ((base >> 30) != ((base + size - 1ULL) >> 30))
+		return 0;
+	return 1;
+}
+
+/*
+ * Decode a memory BAR size from the config-space size probe. The
+ * probe writes all ones to the BAR and reads the decode mask back.
+ * For a memory BAR the low four bits carry the type; the address
+ * bits hold the inverse size mask. A BAR that is not implemented
+ * reads back all ones and decodes to 16 bytes, which no caller
+ * accepts because the smallest register layout is larger. Return
+ * the size in bytes. Ticket ad4bd33ab8.
+ */
+static inline uint64_t gve_bar_size_from_mask(uint32_t mask)
+{
+	uint64_t bits = (uint64_t)(mask & ~0xfU);
+
+	return (~bits & 0xffffffffULL) + 1ULL;
+}
+
+/*
+ * Decide whether one device-reported doorbell index is safe for a
+ * 32-bit write into BAR2. The driver writes db_bar2[db_index], so
+ * the index must stay below the number of notification blocks the
+ * driver configured with the device, and the last accessed byte
+ * must stay inside the BAR2 window. Return 1 when the write fits
+ * and 0 when the driver must refuse the queue. Ticket 7af135385d.
+ */
+static inline int gve_doorbell_in_range(uint32_t db_idx, uint32_t num_ntfy,
+					uint64_t bar2_size)
+{
+	uint64_t last_byte;
+
+	if (num_ntfy == 0U)
+		return 0;
+	if (db_idx >= num_ntfy)
+		return 0;
+	last_byte = (uint64_t)db_idx * 4ULL + 3ULL;
+	return last_byte < bar2_size;
+}
+
 #endif /* __UK_DRV_GVE_H__ */
