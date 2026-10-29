@@ -113,7 +113,7 @@ ukg_install_teardown_trap
 if [ "${UKG_TARGET}" = "unikraft" ]; then
     echo "[INFO] Building server image ${SRV_IMG}..."
     "${SCRIPT_DIR}/gcp_build_image.sh" "${ROOT_DIR}/samples/httpreply" "${SRV_IMG}" \
-        "netdev.ip=${SRV_IP}/${NETMASK}:${GATEWAY} -- ip=${SRV_IP}/${NETMASK} gw=${GATEWAY}"
+        "netdev.ip=${SRV_IP}/${NETMASK}:${GATEWAY} -- peer=${CLI_IP} ip=${SRV_IP}/${NETMASK} gw=${GATEWAY}"
 fi
 
 # 2. Render the wrk client startup script. Everything it prints goes

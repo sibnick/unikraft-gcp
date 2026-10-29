@@ -237,6 +237,8 @@ static void drive_stack(void)
 static int bring_up_netif(int argc, char *argv[])
 {
 	const char *ip_param = NULL, *mask_param = NULL, *gw_param = NULL;
+	const char *peer_param[8];
+	int peer_n = 0;
 	ip4_addr_t my_ip, my_mask, my_gw;
 	int i;
 
@@ -247,6 +249,8 @@ static int bring_up_netif(int argc, char *argv[])
 			mask_param = argv[i] + 5;
 		else if (strncmp(argv[i], "gw=", 3) == 0)
 			gw_param = argv[i] + 3;
+		else if (strncmp(argv[i], "peer=", 5) == 0 && peer_n < 8)
+			peer_param[peer_n++] = argv[i] + 5;
 	}
 
 	if (!netif_default) {
@@ -305,6 +309,24 @@ static int bring_up_netif(int argc, char *argv[])
 
 		/* The gateway itself needs the static entry too. */
 		set_gcp_static_arp(&my_gw);
+
+		/* Boot-time ARP for the benchmark client. lwIP sends the
+		 * SYN-ACK inside the stack, before accept() can run, so
+		 * the per-accept entry below is too late for the
+		 * handshake. The run scripts pass peer=<client ip> for
+		 * exactly this. Ticket 73b23402f0. */
+		for (i = 0; i < peer_n; i++) {
+			ip4_addr_t peer_ip;
+
+			if (ip4addr_aton(peer_param[i], &peer_ip) == 1) {
+				set_gcp_static_arp(&peer_ip);
+				printf("Static ARP added for peer %s\n",
+				       peer_param[i]);
+			} else {
+				printf("[WARN] Unparsable peer %s\n",
+				       peer_param[i]);
+			}
+		}
 	}
 
 	if (!(netif_is_up(netif_default) && netif_is_link_up(netif_default)) &&

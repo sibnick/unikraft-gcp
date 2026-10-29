@@ -21,8 +21,15 @@ no response byte is dropped.
 | :--- | :--- | :--- |
 | Driver | `lib-ena` | `drivers/gve` (`CONFIG_LIBGVE`) |
 | Address | DHCP | `ip=<ip>/<bits>:<gw>` app parameter, like `samples/networkload` |
-| ARP | device resolves | static entry per accepted client, GCP does not answer ARP (ticket [2569ff0157]) |
+| ARP | device resolves | static entry at boot for `peer=<client ip>` plus one per accepted client, GCP does not answer ARP (ticket [2569ff0157]) |
 | Gate markers | none | `GATE_HTTP_READY`, `GATE_HTTP_FIRST_200`, `GATE_FAIL: <reason>` |
+
+The `peer=` boot argument matters: lwIP answers a TCP SYN inside the stack,
+before `accept()` runs. The static ARP entry for the client must exist
+before the first SYN-ACK, or the handshake never completes. Cloud run
+scripts pass `peer=<client ip>`. The per-accept entry stays as a safety
+net for later clients. Run `ukg-1030-001423-236500` proved the missing
+entry: the listener was up, the client SYN arrived, no SYN-ACK left.
 
 ## Build
 
