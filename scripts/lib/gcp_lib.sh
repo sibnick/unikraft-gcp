@@ -416,3 +416,85 @@ ukg_wrk_ok() {
     fi
     return 0
 }
+
+# Parse one combined C1/C2 serial log into a single CSV data row
+# without header. Columns:
+#   run,gate,stack,machine,concurrency,throughput,p50_ms,p99_ms,p999_ms,errors,loss_pct
+# Gate detection: a wrk Requests/sec report is C1, a PROBE_RESULT line
+# is C2. Throughput is requests per second for C1 and packets per
+# second for C2. The parser reads the stack from the combined log
+# header (target:/server: unikraft|linux) and the run id from the
+# client banner. The machine type never reaches the serial console,
+# so the caller passes it as the second argument. Percentiles are
+# normalized to milliseconds; wrk prints us, ms, or s by magnitude.
+# Returns 1 when the log carries neither report. Ticket a1134318f5.
+ukg_ab_parse() {
+    local log="$1"
+    local machine="${2:-unknown}"
+    local gate=""
+    [ -s "${log}" ] || return 1
+    if grep -q "Requests/sec:" "${log}" 2>/dev/null; then
+        gate="C1"
+    elif grep -q "PROBE_RESULT" "${log}" 2>/dev/null; then
+        gate="C2"
+    else
+        return 1
+    fi
+    awk -v gate="${gate}" -v machine="${machine}" \
+        -v defrun="$(basename "${log}" .log)" '
+    function toms(v,   n) {
+        n = v + 0
+        if (v ~ /ms$/) return n
+        if (v ~ /us$/) return n / 1000
+        if (v ~ /s$/)  return n * 1000
+        return n
+    }
+    { gsub(/\r/, "") }
+    run == "" && match($0, /run=ukg-[A-Za-z0-9-]+/) {
+        run = substr($0, RSTART + 4, RLENGTH - 4)
+    }
+    stack == "" && ($0 ~ /target: (unikraft|linux)/ || $0 ~ /server: (unikraft|linux)/) {
+        stack = ($0 ~ /unikraft/) ? "unikraft" : "linux"
+    }
+    gate == "C1" && $0 ~ /threads and [0-9]+ connections/ {
+        line = $0
+        gsub(/[^0-9]+/, " ", line)
+        split(line, na, " ")
+        conc = na[2]
+    }
+    gate == "C1" && $0 ~ /^Requests\/sec:/ { rps = $2 }
+    gate == "C1" && $0 ~ /^[ \t]*50%[ \t]/    { p50 = toms($2) }
+    gate == "C1" && $0 ~ /^[ \t]*90%[ \t]/    { p90 = toms($2) }
+    gate == "C1" && $0 ~ /^[ \t]*99%[ \t]/    { p99 = toms($2) }
+    gate == "C1" && $0 ~ /^[ \t]*99\.9%[ \t]/ { p999 = toms($2) }
+    gate == "C1" && $0 ~ /Socket errors:/ {
+        line = $0
+        sub(/.*Socket errors:/, "", line)
+        gsub(/[^0-9]+/, " ", line)
+        n = split(line, ea, " ")
+        for (i = 1; i <= n; i++) if (ea[i] != "") sockerr += ea[i]
+    }
+    gate == "C1" && $0 ~ /^Non-2xx responses:/ { non2xx = $NF }
+    gate == "C2" && $0 ~ /^PROBE_RESULT / {
+        n = split($0, kv, /[ =]+/)
+        for (i = 2; i + 1 <= n; i += 2) val[kv[i]] = kv[i + 1]
+    }
+    END {
+        if (run == "") run = defrun
+        if (stack == "") stack = "unknown"
+        if (gate == "C1") {
+            if (rps == "") exit 1
+            printf "%s,%s,%s,%s,%s,%s,%.3f,%.3f,%.3f,%d,\n", \
+                run, gate, stack, machine, conc, rps, \
+                p50, p99, p999, sockerr + non2xx
+        } else {
+            if (!("p50_us" in val)) exit 1
+            printf "%s,%s,%s,%s,1,%s,%.3f,%.3f,%.3f,%d,%s\n", \
+                run, gate, stack, machine, val["rate"], \
+                val["p50_us"] / 1000, val["p99_us"] / 1000, \
+                val["p999_us"] / 1000, val["sent"] - val["recv"], \
+                val["loss_pct"]
+        }
+    }
+    ' "${log}"
+}

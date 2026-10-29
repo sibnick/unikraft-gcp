@@ -24,6 +24,7 @@ test-host:
 	@rm -f /tmp/test_gve
 	@bash tests/test_evidence_store.sh
 	@bash tests/test_gate_logic.sh
+	@bash tests/test_ab_report.sh
 
 lint:
 	@# Run from scripts/ so ShellCheck resolves the source= directives.

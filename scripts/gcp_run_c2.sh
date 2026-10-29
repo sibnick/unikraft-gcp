@@ -228,10 +228,15 @@ def main():
         print("  Mean +/- StdDev:  {:9.2f} +/- {:.2f} us".format(mean / 1000.0, std / 1000.0))
     else:
         print("  no echoes received")
-    print("PROBE_RESULT loss_pct={:.2f} p50_us={:.2f} p99_us={:.2f}".format(
-        loss_pct,
-        percentile(samples, 50) / 1000.0,
-        percentile(samples, 99) / 1000.0))
+    print("PROBE_RESULT loss_pct={:.2f} p50_us={:.2f} p90_us={:.2f} p99_us={:.2f} "
+          "p999_us={:.2f} mean_us={:.2f} sent={} recv={} rate={:.0f}".format(
+              loss_pct,
+              percentile(samples, 50) / 1000.0,
+              percentile(samples, 90) / 1000.0,
+              percentile(samples, 99) / 1000.0,
+              percentile(samples, 99.9) / 1000.0,
+              mean / 1000.0,
+              sent, received, rate))
     return 0 if (received > 0 and lost == 0) else 1
 
 
