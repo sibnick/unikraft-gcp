@@ -466,7 +466,7 @@ ukg_ab_parse() {
     gate == "C1" && $0 ~ /^[ \t]*50%[ \t]/    { p50 = toms($2) }
     gate == "C1" && $0 ~ /^[ \t]*90%[ \t]/    { p90 = toms($2) }
     gate == "C1" && $0 ~ /^[ \t]*99%[ \t]/    { p99 = toms($2) }
-    gate == "C1" && $0 ~ /^[ \t]*99\.9%[ \t]/ { p999 = toms($2) }
+    gate == "C1" && $0 ~ /^[ \t]*99\.9%[ \t]/ { p999 = toms($2); has999 = 1 }
     gate == "C1" && $0 ~ /Socket errors:/ {
         line = $0
         sub(/.*Socket errors:/, "", line)
@@ -484,9 +484,10 @@ ukg_ab_parse() {
         if (stack == "") stack = "unknown"
         if (gate == "C1") {
             if (rps == "") exit 1
-            printf "%s,%s,%s,%s,%s,%s,%.3f,%.3f,%.3f,%d,\n", \
+            v999 = has999 ? sprintf("%.3f", p999) : ""
+            printf "%s,%s,%s,%s,%s,%s,%.3f,%.3f,%s,%d,\n", \
                 run, gate, stack, machine, conc, rps, \
-                p50, p99, p999, sockerr + non2xx
+                p50, p99, v999, sockerr + non2xx
         } else {
             if (!("p50_us" in val)) exit 1
             printf "%s,%s,%s,%s,1,%s,%.3f,%.3f,%.3f,%d,%s\n", \

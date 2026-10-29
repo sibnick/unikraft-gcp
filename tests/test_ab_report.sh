@@ -58,6 +58,19 @@ else
     bad "C1 row sums socket errors and non-2xx responses (got ${row})"
 fi
 
+# 2b. Plain wrk --latency on Ubuntu 24.04 prints 50/75/90/99 only,
+# no 99.9% line, exactly as captured in run ukg-1030-004040-290322.
+# The p99.9 CSV field must stay blank, never a misleading zero.
+printf '=== SERVER SERIAL CONSOLE OUTPUT (ukg-fixg-srv, target: unikraft) ===\r\n\r\n=== CLIENT SERIAL CONSOLE OUTPUT (ukg-fixg-cli) ===\r\nC1CLIENT start run=ukg-fixg target=10.150.0.10 threads=2 connections=50 duration=10s\r\n  2 threads and 50 connections\r\n  Latency Distribution\r\n     50%%  283.00us\r\n     75%%  358.00us\r\n     90%%  472.00us\r\n     99%%  837.00us\r\n  1051700 requests in 10.10s, 150.45MB read\r\nRequests/sec: 104130.35\r\n' \
+    > "${WORK}/c1_no999.log"
+row="$(ukg_ab_parse "${WORK}/c1_no999.log" "c3-standard-4")"
+expected="ukg-fixg,C1,unikraft,c3-standard-4,50,104130.35,0.283,0.837,,0,"
+if [ "${row}" = "${expected}" ]; then
+    ok "C1 row keeps p99.9 blank when wrk printed no 99.9%% line"
+else
+    bad "C1 row keeps p99.9 blank when wrk printed no 99.9%% line (got ${row})"
+fi
+
 row="$(ukg_ab_parse "${WORK}/c2.log" "c3-standard-4")"
 expected="ukg-fix2,C2,linux,c3-standard-4,1,4851,0.155,0.480,0.900,1,0.01"
 if [ "${row}" = "${expected}" ]; then
