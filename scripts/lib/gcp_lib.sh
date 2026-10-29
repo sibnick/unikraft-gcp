@@ -6,10 +6,11 @@
 # for the evidence store step.
 #
 # Sourced by: gcp_run_a1.sh gcp_run_a2.sh gcp_run_a3.sh gcp_run_b1.sh
-# gcp_run_b2.sh gcp_run_b3.sh gcp_build_image.sh gcp_teardown.sh
+# gcp_run_b2.sh gcp_run_b3.sh gcp_run_c1.sh gcp_run_c2.sh
+# gcp_build_image.sh gcp_teardown.sh
 # Tickets: 1c76a66b26 4a7a2ca6f5 e3effabf78 4347c2a8e6 c16353731a
 # 06ea1706a7 5e6a2acd8a 74936642ce cf185ab6fd afc0a00b06 3a59523e76
-# 0bc13135d7 eec304d8cf
+# 0bc13135d7 eec304d8cf 4c76b4d84d a5874d85fe
 
 # Directory of this file, the path of the teardown script, and the
 # root of this Fossil checkout. The evidence store step needs the
@@ -341,4 +342,77 @@ ukg_gate_ping_pass() {
         return 0
     fi
     return 1
+}
+
+# Authoritative pair gate check: HTTP benchmark (gate C1). Passes only
+# when the server log shows the unikernel served a page
+# (GATE_HTTP_FIRST_200), the client log shows a clean wrk run
+# (GATE_HTTP_BENCH_PASS), and neither log shows a GATE_FAIL or a
+# client-side GATE_HTTP_BENCH_FAIL. The server half proves the unikernel
+# datapath; the client half proves the measured load. Ticket 4c76b4d84d.
+# Arg $1: server log path. Arg $2: client log path. Returns 0 on pass.
+ukg_gate_http_pass() {
+    local srv_log="$1"
+    local cli_log="$2"
+    grep -q "GATE_HTTP_FIRST_200" "${srv_log}" 2>/dev/null || return 1
+    grep -q "GATE_HTTP_BENCH_PASS" "${cli_log}" 2>/dev/null || return 1
+    if grep -q "GATE_FAIL" "${cli_log}" 2>/dev/null; then
+        return 1
+    fi
+    if grep -q "GATE_FAIL" "${srv_log}" 2>/dev/null; then
+        return 1
+    fi
+    if grep -q "GATE_HTTP_BENCH_FAIL" "${cli_log}" 2>/dev/null; then
+        return 1
+    fi
+    return 0
+}
+
+# Authoritative pair gate check: UDP latency (gate C2). Passes only
+# when the server log shows the unikernel echo server came up
+# (GATE_HFT_READY), the client log shows a lossless RTT run
+# (GATE_HFT_RTT_PASS), and neither log shows a failure marker.
+# Ticket 238f7cbd91 a5874d85fe.
+# Arg $1: server log path. Arg $2: client log path. Returns 0 on pass.
+ukg_gate_hft_pass() {
+    local srv_log="$1"
+    local cli_log="$2"
+    grep -q "GATE_HFT_READY" "${srv_log}" 2>/dev/null || return 1
+    grep -q "GATE_HFT_RTT_PASS" "${cli_log}" 2>/dev/null || return 1
+    if grep -q "GATE_FAIL" "${cli_log}" 2>/dev/null; then
+        return 1
+    fi
+    if grep -q "GATE_FAIL" "${srv_log}" 2>/dev/null; then
+        return 1
+    fi
+    if grep -q "GATE_HFT_RTT_FAIL" "${cli_log}" 2>/dev/null; then
+        return 1
+    fi
+    return 0
+}
+
+# Decide the wrk verdict from one wrk report file. Returns 0 (pass) only
+# when Requests/sec is a number above zero and the report shows no
+# socket errors and no non-2xx responses. A wrk run that finished but
+# hit socket errors, timeouts, or non-2xx responses is a fail, the same
+# rule the ENA httpreply tables apply (they report a Socket Errors
+# column and expect 0). Arg $1: report file. The file may be a raw
+# GCP serial log, so strip carriage returns before parsing.
+# Ticket 4c76b4d84d.
+ukg_wrk_ok() {
+    local rep="$1"
+    local rps
+    [ -s "${rep}" ] || return 1
+    rps="$(tr -d '\r' <"${rep}" | awk '/Requests\/sec:/ { v=$2 } END { print v }')"
+    case "${rps}" in
+        ''|*[!0-9.]*) return 1 ;;
+    esac
+    awk -v r="${rps}" 'BEGIN { exit !(r > 0) }' || return 1
+    if tr -d '\r' <"${rep}" | grep -qE "Socket errors:.*[1-9]"; then
+        return 1
+    fi
+    if tr -d '\r' <"${rep}" | grep -qE "Non-2xx responses:"; then
+        return 1
+    fi
+    return 0
 }
