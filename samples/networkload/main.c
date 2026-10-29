@@ -199,6 +199,42 @@ static int do_ping(const char *peer_ip, int timeout_sec)
 	return -1;
 }
 
+/*
+ * Decide whether one received buffer is a data echo this client must
+ * count, and record its bytes. A packet counts once per sequence
+ * number: rx_seen carries one bit per sequence number, so duplicate
+ * echoes do not inflate the result. End-of-stream echoes, short
+ * packets, foreign magic values, and packets from a source other
+ * than the configured peer never count. Return 1 when the packet was
+ * newly counted, 0 otherwise. Ticket fc5f2e64de.
+ */
+static int client_record_echo(const struct netload_pkt *rx_hdr, ssize_t len,
+			      const struct sockaddr_in *from,
+			      const struct sockaddr_in *expect,
+			      uint8_t *rx_seen, uint32_t count,
+			      uint64_t *bytes)
+{
+	uint32_t seqno;
+
+	if (len < (ssize_t)sizeof(struct netload_pkt))
+		return 0;
+	if (ntohl(rx_hdr->magic) != NETLOAD_MAGIC)
+		return 0;
+	if (ntohl(rx_hdr->flags) != 0U)
+		return 0;	/* end-of-stream echo: control, not data */
+	if (from->sin_addr.s_addr != expect->sin_addr.s_addr ||
+	    from->sin_port != expect->sin_port)
+		return 0;	/* not from the configured peer */
+	seqno = ntohl(rx_hdr->seq);
+	if (seqno == 0U || seqno > count)
+		return 0;	/* not one of the sequence numbers we sent */
+	if (rx_seen[seqno / 8U] & (uint8_t)(1U << (seqno % 8U)))
+		return 0;	/* duplicate echo */
+	rx_seen[seqno / 8U] |= (uint8_t)(1U << (seqno % 8U));
+	*bytes += (uint64_t)len * 2ULL;	/* bidirectional: TX + RX */
+	return 1;
+}
+
 static int run_client(const char *peer_ip, int port, uint32_t count, size_t pkt_size)
 {
 	int fd;
@@ -206,6 +242,7 @@ static int run_client(const char *peer_ip, int port, uint32_t count, size_t pkt_
 	struct timeval tv;
 	uint8_t *tx_buf;
 	uint8_t *rx_buf;
+	uint8_t *rx_seen;
 	struct netload_pkt *hdr;
 	uint32_t seq;
 	uint32_t rx_count = 0;
@@ -214,11 +251,19 @@ static int run_client(const char *peer_ip, int port, uint32_t count, size_t pkt_
 
 	if (pkt_size < sizeof(struct netload_pkt))
 		pkt_size = sizeof(struct netload_pkt);
+	if (count == 0U) {
+		printf("[CLIENT] Error: packet count is 0\n");
+		return -1;
+	}
 
 	tx_buf = malloc(pkt_size);
 	rx_buf = malloc(pkt_size + 128);
-	if (!tx_buf || !rx_buf) {
+	rx_seen = calloc((count + 8U) / 8U, 1);
+	if (!tx_buf || !rx_buf || !rx_seen) {
 		printf("[CLIENT] Error: Out of memory\n");
+		free(tx_buf);
+		free(rx_buf);
+		free(rx_seen);
 		return -1;
 	}
 
@@ -227,6 +272,7 @@ static int run_client(const char *peer_ip, int port, uint32_t count, size_t pkt_
 		printf("[CLIENT] Error creating socket: %d\n", errno);
 		free(tx_buf);
 		free(rx_buf);
+		free(rx_seen);
 		return -1;
 	}
 
@@ -286,10 +332,11 @@ static int run_client(const char *peer_ip, int port, uint32_t count, size_t pkt_
 					       (struct sockaddr *)&from, &from_len);
 				if (ret <= 0)
 					break;
-				struct netload_pkt *rx_hdr = (struct netload_pkt *)rx_buf;
-				if (ntohl(rx_hdr->magic) == NETLOAD_MAGIC) {
+				if (client_record_echo(
+					    (const struct netload_pkt *)rx_buf, ret,
+					    &from, &dst, rx_seen, count,
+					    &total_bytes)) {
 					rx_count++;
-					total_bytes += (uint64_t)ret * 2; /* bidirectional: TX + RX */
 					got_any = 1;
 				}
 			}
@@ -300,7 +347,7 @@ static int run_client(const char *peer_ip, int port, uint32_t count, size_t pkt_
 
 		if (seq % 200 == 0 || seq == count) {
 			uint32_t pct = (seq > 0) ? (rx_count * 100U / seq) : 0U;
-			printf("[CLIENT] Progress: %u/%u packets echoed (%u%%)\n",
+			printf("[CLIENT] Progress: %u/%u packets uniquely echoed (%u%%)\n",
 			       rx_count, seq, pct);
 		}
 	}
@@ -324,11 +371,10 @@ static int run_client(const char *peer_ip, int port, uint32_t count, size_t pkt_
 					       (struct sockaddr *)&from, &from_len);
 			if (ret <= 0)
 				break;
-			struct netload_pkt *rx_hdr = (struct netload_pkt *)rx_buf;
-			if (ntohl(rx_hdr->magic) == NETLOAD_MAGIC) {
+			if (client_record_echo(
+				    (const struct netload_pkt *)rx_buf, ret,
+				    &from, &dst, rx_seen, count, &total_bytes))
 				rx_count++;
-				total_bytes += (uint64_t)ret * 2;
-			}
 		}
 		if (rx_count >= count)
 			break;
@@ -348,7 +394,7 @@ static int run_client(const char *peer_ip, int port, uint32_t count, size_t pkt_
 	printf("Networkload Client Benchmark Summary:\n");
 	printf("Target:             %s:%d\n", peer_ip, port);
 	printf("Packets sent:       %u\n", count);
-	printf("Packets echoed:     %u (%u%% received)\n", rx_count, pct_rx);
+	printf("Unique echoes:      %u (%u%% of sent)\n", rx_count, pct_rx);
 	printf("Total data (bi-dir): %lu bytes\n", (unsigned long)total_bytes);
 	printf("Duration:           %llu.%03llu seconds\n",
 	       (unsigned long long)(duration_ms / 1000ULL),
@@ -362,15 +408,24 @@ static int run_client(const char *peer_ip, int port, uint32_t count, size_t pkt_
 	close(fd);
 	free(tx_buf);
 	free(rx_buf);
+	free(rx_seen);
 
-	if (rx_count > count / 2) {
+	/*
+	 * Pass only when at least 99 percent of the sequence numbers
+	 * echoed exactly once. The old half-of-packets threshold
+	 * passed a run that lost half the traffic, and the old counter
+	 * also counted end-of-stream echoes and duplicates. Ticket
+	 * fc5f2e64de.
+	 */
+	if ((uint64_t)rx_count * 100ULL >= (uint64_t)count * 99ULL) {
 		printf("GATE_NET_PASS\n");
 		printf("GATE_THROUGHPUT_PASS\n");
 		printf("========================================\n\n");
 		return 0;
 	}
 
-	printf("GATE_FAIL: insufficient packets received\n");
+	printf("GATE_FAIL: only %u of %u unique echoes, below 99 percent\n",
+	       rx_count, count);
 	return -1;
 }
 
@@ -385,6 +440,17 @@ static int run_server(const char *peer_ip, int port)
 	uint64_t total_bytes = 0;
 	__nsec first_rx_ns = 0;
 	__nsec last_rx_ns = 0;
+	in_addr_t peer_sin = 0;
+	int has_peer = 0;
+	/*
+	 * Sources that already have a static ARP entry. One entry per
+	 * source is added on the first packet from that source. The
+	 * old code rewrote the entry for every packet, which wasted
+	 * work on the hot path and let any sender grow the ARP table
+	 * pressure. Ticket 2569ff0157.
+	 */
+	in_addr_t seen_src[8];
+	unsigned int seen_n = 0;
 
 	buf = malloc(buf_size);
 	if (!buf) {
@@ -417,8 +483,11 @@ static int run_server(const char *peer_ip, int port)
 
 	if (peer_ip) {
 		ip4_addr_t peer_addr;
-		if (ip4addr_aton(peer_ip, &peer_addr) == 1)
+		if (ip4addr_aton(peer_ip, &peer_addr) == 1) {
 			set_gcp_static_arp(&peer_addr);
+			peer_sin = peer_addr.addr;
+			has_peer = 1;
+		}
 	}
 
 	printf("[SERVER] Listening on UDP port %d (direct echo mode)...\n", port);
@@ -440,23 +509,63 @@ static int run_server(const char *peer_ip, int port)
 		if (n > 0) {
 			struct netload_pkt *hdr = (struct netload_pkt *)buf;
 			__nsec now = ukplat_monotonic_clock();
+			unsigned int k;
+			int known = 0;
 
-			if (!first_rx_ns) {
-				first_rx_ns = now;
-				char from_ip_str[16] = {0};
-				ip4addr_ntoa_r((const ip4_addr_t *)&cli_addr.sin_addr, from_ip_str, sizeof(from_ip_str));
-				printf("[SERVER] First packet received from %s:%d (len=%zd)\n",
-				       from_ip_str, ntohs(cli_addr.sin_port), n);
+			/*
+			 * Keep one static ARP entry per source for the
+			 * echo reply. Add it on the first packet from
+			 * that source only. After the table is full,
+			 * new sources get no entry: the echo reply to
+			 * them fails, which is the safe direction for
+			 * an unexpected sender.
+			 */
+			for (k = 0; k < seen_n; k++) {
+				if (seen_src[k] == cli_addr.sin_addr.s_addr) {
+					known = 1;
+					break;
+				}
 			}
-			last_rx_ns = now;
+			if (!known && seen_n < (sizeof(seen_src) /
+						 sizeof(seen_src[0]))) {
+				ip4_addr_t cli_ip;
 
-			/* Ensure static ARP mapping to gateway MAC for replying */
-			ip4_addr_t cli_ip;
-			cli_ip.addr = cli_addr.sin_addr.s_addr;
-			set_gcp_static_arp(&cli_ip);
+				cli_ip.addr = cli_addr.sin_addr.s_addr;
+				set_gcp_static_arp(&cli_ip);
+				seen_src[seen_n++] = cli_addr.sin_addr.s_addr;
+			}
 
 			if (n >= (ssize_t)sizeof(struct netload_pkt) &&
 			    ntohl(hdr->magic) == NETLOAD_MAGIC) {
+				if (ntohl(hdr->flags) == 1U) {
+					/*
+					 * End-of-stream frame: control,
+					 * not payload. Echo it, keep it
+					 * out of the counters, and stop
+					 * only when it comes from the
+					 * configured peer. Any other
+					 * host cannot stop this server.
+					 * Ticket 2569ff0157.
+					 */
+					sendto(fd, buf, (size_t)n, 0,
+					       (struct sockaddr *)&cli_addr,
+					       cli_len);
+					if (has_peer &&
+					    cli_addr.sin_addr.s_addr == peer_sin) {
+						printf("[SERVER] End of stream received from client.\n");
+						break;
+					}
+					continue;
+				}
+
+				if (!first_rx_ns) {
+					first_rx_ns = now;
+					char from_ip_str[16] = {0};
+					ip4addr_ntoa_r((const ip4_addr_t *)&cli_addr.sin_addr, from_ip_str, sizeof(from_ip_str));
+					printf("[SERVER] First packet received from %s:%d (len=%zd)\n",
+					       from_ip_str, ntohs(cli_addr.sin_port), n);
+				}
+				last_rx_ns = now;
 				rx_pkts++;
 				total_bytes += (uint64_t)n * 2; /* bidirectional: RX + TX */
 
@@ -465,12 +574,6 @@ static int run_server(const char *peer_ip, int port)
 				       (struct sockaddr *)&cli_addr, cli_len);
 				if (tx_ret < 0 && (rx_pkts <= 5 || rx_pkts % 200 == 0))
 					printf("[SERVER] sendto echo error: %d\n", errno);
-
-				if (ntohl(hdr->flags) == 1) {
-					/* End-of-stream signaled */
-					printf("[SERVER] End of stream received from client.\n");
-					break;
-				}
 
 				if (rx_pkts % 200 == 0) {
 					printf("[SERVER] Echoed %u packets (%lu bytes)...\n",
