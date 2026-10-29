@@ -357,10 +357,11 @@ for z in ${ZONE_LIST}; do
 done
 
 # Create helper for the server VM. The unikraft flavor boots the
-# custom image. The linux flavor boots the Ubuntu image with the
-# native-build startup script. Both VMs stay internal: the gate
-# reads evidence from the serial console and the pair talks inside
-# the VPC, so each GVNIC gets no address.
+# custom image and stays internal: its GVNIC gets no address. The
+# linux flavor builds server.c with apt-installed gcc, so it takes an
+# external IPv4. Canonical's GCE Ubuntu mirrors are public, not
+# Google-internal like Debian's mirror, so an internal-only Ubuntu
+# cannot apt-get (proved by run ukg-1030-003058-269783).
 ukg_c2_create_srv() {
     local z="$1"
     if [ "${UKG_TARGET}" = "unikraft" ]; then
@@ -379,7 +380,7 @@ ukg_c2_create_srv() {
             --project="${GCP_PROJECT}" \
             --machine-type="${MACHINE_TYPE}" \
             --boot-disk-type=pd-balanced \
-            --network-interface="nic-type=GVNIC,no-address,private-network-ip=${SRV_IP}" \
+            --network-interface="nic-type=GVNIC,private-network-ip=${SRV_IP}" \
             --image-family="${UBUNTU_FAMILY}" \
             --image-project="${UBUNTU_PROJECT}" \
             --metadata-from-file="startup-script=${SRV_SCRIPT}" \
@@ -388,7 +389,10 @@ ukg_c2_create_srv() {
     fi
 }
 
-# Create helper for the probe client VM in the candidate zone.
+# Create helper for the probe client VM. The probe itself needs no
+# install, but the VM still takes an external IPv4 for one apt-get
+# pass, so a broken image self-heals and so future probes can add
+# tools. Our own firewall rules stay internal-only.
 ukg_c2_create_cli() {
     local z="$1"
     gcloud compute instances create "${CLI_NAME}" \
@@ -396,7 +400,7 @@ ukg_c2_create_cli() {
         --project="${GCP_PROJECT}" \
         --machine-type="${CLIENT_MACHINE}" \
         --boot-disk-type=pd-balanced \
-        --network-interface="nic-type=GVNIC,no-address,private-network-ip=${CLI_IP}" \
+        --network-interface="nic-type=GVNIC,private-network-ip=${CLI_IP}" \
         --image-family="${UBUNTU_FAMILY}" \
         --image-project="${UBUNTU_PROJECT}" \
         --metadata-from-file="startup-script=${CLI_SCRIPT}" \
