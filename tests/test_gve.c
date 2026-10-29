@@ -697,23 +697,38 @@ static void test_bar_size_decode(void)
 
 static void test_doorbell_range(void)
 {
-	/* Cloud device: 2 notification blocks in a 1 MiB BAR2. Both
-	   valid indexes pass. */
-	assert(gve_doorbell_in_range(0U, 2U, 1048576ULL));
-	assert(gve_doorbell_in_range(1U, 2U, 1048576ULL));
-	/* Index at or above the block count is refused, including the
-	   unbounded 32-bit value an unconfigured page could hold. */
-	assert(!gve_doorbell_in_range(2U, 2U, 1048576ULL));
-	assert(!gve_doorbell_in_range(0xFFFFFFFFU, 2U, 1048576ULL));
-	assert(!gve_doorbell_in_range(0U, 0U, 1048576ULL));
-	/* The 4-byte write must end inside BAR2: index 0 with a 4-byte
-	   BAR2 fits, a 3-byte BAR2 does not. */
-	assert(gve_doorbell_in_range(0U, 1U, 4ULL));
-	assert(!gve_doorbell_in_range(0U, 1U, 3ULL));
-	/* The last block of 256 inside exactly 1024 bytes fits; one
-	   byte short is refused. */
-	assert(gve_doorbell_in_range(255U, 256U, 1024ULL));
-	assert(!gve_doorbell_in_range(255U, 256U, 1023ULL));
+	/* Device truth from every passing cloud run: GCP gVNIC
+	   allocates sparse doorbell indexes far above num_ntfy_blks,
+	   for example RX0 db=132096 and TX0 db=133120 with
+	   num_ntfy_blks=2. Both fit the 1 MiB BAR2 window. */
+	assert(gve_doorbell_in_range(132096U, 1048576ULL));
+	assert(gve_doorbell_in_range(133120U, 1048576ULL));
+	assert(gve_doorbell_in_range(0U, 1048576ULL));
+	assert(gve_doorbell_in_range(1U, 2U * 4096ULL));
+	/* The 4-byte write must end inside BAR2: the last valid index
+	   of a 4-byte BAR2 is 0, and of a 1 MiB BAR2 is 262143. */
+	assert(gve_doorbell_in_range(0U, 4ULL));
+	assert(!gve_doorbell_in_range(0U, 3ULL));
+	assert(!gve_doorbell_in_range(0U, 0ULL));
+	assert(gve_doorbell_in_range(262143U, 1048576ULL));
+	assert(!gve_doorbell_in_range(262144U, 1048576ULL));
+	/* A huge device value cannot steer a write outside the window. */
+	assert(!gve_doorbell_in_range(0xFFFFFFFFU, 1048576ULL));
+}
+
+static void test_ntfy_cap(void)
+{
+	/* Cloud device: 64 counters, requested 2 or 8 (max_tx 4 plus
+	   max_rx 4). Both stay uncapped. */
+	assert(gve_ntfy_cap(2U, 64U) == 2U);
+	assert(gve_ntfy_cap(8U, 64U) == 8U);
+	/* A request above the counter budget is capped to it. */
+	assert(gve_ntfy_cap(2048U, 64U) == 64U);
+	assert(gve_ntfy_cap(64U, 64U) == 64U);
+	/* Below two blocks the driver cannot run one queue pair. */
+	assert(gve_ntfy_cap(2U, 1U) == 0U);
+	assert(gve_ntfy_cap(2U, 0U) == 0U);
+	assert(gve_ntfy_cap(1U, 64U) == 0U);
 }
 
 int main(void)
@@ -740,6 +755,7 @@ int main(void)
 	test_bar_window();
 	test_bar_size_decode();
 	test_doorbell_range();
+	test_ntfy_cap();
 	printf("test_gve: all unit tests passed\n");
 	return 0;
 }

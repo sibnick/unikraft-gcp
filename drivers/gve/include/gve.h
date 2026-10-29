@@ -943,22 +943,42 @@ static inline uint64_t gve_bar_size_from_mask(uint32_t mask)
 /*
  * Decide whether one device-reported doorbell index is safe for a
  * 32-bit write into BAR2. The driver writes db_bar2[db_index], so
- * the index must stay below the number of notification blocks the
- * driver configured with the device, and the last accessed byte
- * must stay inside the BAR2 window. Return 1 when the write fits
- * and 0 when the driver must refuse the queue. Ticket 7af135385d.
+ * the last accessed byte must stay inside the BAR2 window.
+ *
+ * Device truth from cloud runs: GCP gVNIC allocates sparse device
+ * indexes far above num_ntfy_blks. Passing runs show RX0 db=132096
+ * and TX0 db=133120 with num_ntfy_blks=2. num_ntfy_blks bounds the
+ * interrupt notification ids, not the doorbell indexes, so the
+ * window bound alone is the correct check: any index inside it
+ * cannot write outside the mapped BAR2. Run ukg-1029-010754 proved
+ * the earlier num_ntfy bound rejects valid device values. Return 1
+ * when the write fits and 0 when the driver must refuse the queue.
+ * Ticket 7af135385d.
  */
-static inline int gve_doorbell_in_range(uint32_t db_idx, uint32_t num_ntfy,
-					uint64_t bar2_size)
+static inline int gve_doorbell_in_range(uint32_t db_idx, uint64_t bar2_size)
 {
 	uint64_t last_byte;
 
-	if (num_ntfy == 0U)
-		return 0;
-	if (db_idx >= num_ntfy)
+	if (bar2_size < 4ULL)
 		return 0;
 	last_byte = (uint64_t)db_idx * 4ULL + 3ULL;
 	return last_byte < bar2_size;
+}
+
+/*
+ * Cap a requested notification-block count at the number of event
+ * counters the device reports. The device may write one irq db index
+ * and one counter per notification block, so an advertised count
+ * above the counter budget would let device writes run past the two
+ * arrays the driver allocates. The driver needs at least two blocks,
+ * one TX plus one RX. Return the capped count, or 0 when the device
+ * budget cannot support one queue pair. Ticket 0b923396ef.
+ */
+static inline uint32_t gve_ntfy_cap(uint32_t want, uint32_t counters)
+{
+	if (counters < 2U || want < 2U)
+		return 0;
+	return want < counters ? want : counters;
 }
 
 #endif /* __UK_DRV_GVE_H__ */

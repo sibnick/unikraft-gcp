@@ -520,6 +520,19 @@ static int gve_register_qpl(struct gve_device *gdev, struct uk_alloc *a,
 	uk_pr_info("gve: REGISTER_PAGE_LIST id=%u pages=%u rc=%d status=0x%x\n",
 		   qpl_id, num_pages, rc, cmd_status);
 	if (rc != 0) {
+		/*
+		 * A timeout does not cancel the command. The device
+		 * can still read the bus list and DMA into those
+		 * pages, so leak both buffers on -ETIMEDOUT. A
+		 * returned status (-EIO) means the device finished
+		 * the command, so the buffers are safe to free.
+		 * Ticket 6e2054b369.
+		 */
+		if (rc == -ETIMEDOUT) {
+			uk_pr_err("gve: REGISTER_PAGE_LIST id=%u timed out, leaking page list buffers\n",
+				  qpl_id);
+			return rc;
+		}
 		uk_free(a, page_bus);
 		uk_free(a, pages);
 		return rc;
@@ -541,6 +554,7 @@ static int gve_configure_resources(struct gve_device *gdev)
 	int got_counters = 0;	/* allocated by this call: free on failure */
 	int got_dbs = 0;
 	int got_ptype = 0;
+	int cfg_timed_out = 0;	/* a CONFIGURE command may still run */
 
 	if (gdev->resources_configured)
 		return 0;
@@ -559,8 +573,11 @@ static int gve_configure_resources(struct gve_device *gdev)
 	}
 
 	if (!gdev->irq_db_indices) {
-		size_t db_sz = align_up_page(64UL * sizeof(struct gve_irq_db));
+		size_t db_sz = align_up_page((size_t)gdev->num_event_counters *
+					     sizeof(struct gve_irq_db));
 
+		if (db_sz == 0)
+			db_sz = GVE_PAGE_SIZE;
 		gdev->irq_db_indices = uk_memalign(drv_alloc, GVE_PAGE_SIZE, db_sz);
 		if (!gdev->irq_db_indices) {
 			rc = -ENOMEM;
@@ -570,10 +587,24 @@ static int gve_configure_resources(struct gve_device *gdev)
 		got_dbs = 1;
 	}
 
-	ntfy_candidates[0] = 2U;
-	ntfy_candidates[1] = gdev->max_tx_queues + gdev->max_rx_queues;
-	if (ntfy_candidates[1] < 2U)
-		ntfy_candidates[1] = 2U;
+	/*
+	 * The device may write one irq db index and one counter per
+	 * notification block, so the advertised block count must fit
+	 * the arrays sized from num_event_counters above. Cap both
+	 * candidates. Refuse a device whose budget cannot support one
+	 * TX plus one RX block. Ticket 0b923396ef.
+	 */
+	if (gdev->num_event_counters < 2U) {
+		printf("GATE_FAIL: gve device reports %u event counters, need at least 2\n",
+		       (unsigned int)gdev->num_event_counters);
+		return -ENODEV;
+	}
+	ntfy_candidates[0] = gve_ntfy_cap(2U, gdev->num_event_counters);
+	ntfy_candidates[1] = gve_ntfy_cap(gdev->max_tx_queues +
+					  gdev->max_rx_queues,
+					  gdev->num_event_counters);
+	if (ntfy_candidates[1] < ntfy_candidates[0])
+		ntfy_candidates[1] = ntfy_candidates[0];
 
 	for (cand_idx = 0; cand_idx < 2; cand_idx++) {
 		uint32_t num_ntfy = ntfy_candidates[cand_idx];
@@ -592,6 +623,8 @@ static int gve_configure_resources(struct gve_device *gdev)
 			   gve_queue_format_name(gdev->queue_format),
 			   (unsigned int)gdev->queue_format,
 			   gdev->num_event_counters, num_ntfy, rc, cmd_status);
+		if (rc == -ETIMEDOUT)
+			cfg_timed_out = 1;
 		if (rc == 0) {
 			gdev->num_ntfy_blks = num_ntfy;
 			break;
@@ -614,26 +647,14 @@ static int gve_configure_resources(struct gve_device *gdev)
 				     &gdev->adminq_prod_cnt, &cmd, &cmd_status);
 		uk_pr_info("gve: CONFIGURE_DEVICE_RESOURCES (fallback GQI_QPL) rc=%d status=0x%x\n",
 			   rc, cmd_status);
+		if (rc == -ETIMEDOUT)
+			cfg_timed_out = 1;
 		if (rc == 0)
 			gdev->num_ntfy_blks = ntfy_candidates[0];
 	}
 
 	if (rc != 0)
 		goto fail;
-
-	/*
-	 * The driver writes doorbell blocks as 32-bit words at
-	 * db_bar2[db_index], so the area covering every block must
-	 * fit inside the BAR2 window it maps. Refuse the device when
-	 * the negotiated block count does not fit. Ticket 7af135385d.
-	 */
-	if ((uint64_t)gdev->num_ntfy_blks * 4ULL > gdev->bar2_size) {
-		printf("GATE_FAIL: gve num_ntfy_blks=%u exceeds BAR2 size=%llu\n",
-		       gdev->num_ntfy_blks,
-		       (unsigned long long)gdev->bar2_size);
-		rc = -ENODEV;
-		goto fail;
-	}
 
 	if (gdev->queue_format == GVE_DQO_RDA_FORMAT) {
 		if (!gdev->ptype_lut_dqo) {
@@ -673,7 +694,18 @@ fail:
 	/*
 	 * Release everything this call allocated. State the device
 	 * already had stays in place for a later retry.
+	 *
+	 * A CONFIGURE timeout does not cancel the command. The device
+	 * can still write the counter array and the irq db indices
+	 * later, and both addresses live in that command. Leak the
+	 * arrays and the ptype map on timeout instead of handing the
+	 * allocator memory the device may write. The pointers stay
+	 * set, so a retry reuses the same arrays. Ticket 6e2054b369.
 	 */
+	if (cfg_timed_out) {
+		uk_pr_err("gve: CONFIGURE_DEVICE_RESOURCES timed out, leaking counter, irq, and ptype buffers\n");
+		return rc;
+	}
 	if (got_ptype) {
 		uk_free(drv_alloc, gdev->ptype_lut_dqo);
 		gdev->ptype_lut_dqo = NULL;
@@ -954,28 +986,39 @@ static struct uk_netdev_tx_queue *gve_netdev_txq_configure(
 	uk_pr_info("gve: CREATE_TX_QUEUE qid=%u fmt=%s rc=%d status=0x%x\n",
 		   queue_id, gve_queue_format_name(gdev->queue_format),
 		   rc, cmd_status);
+	if (rc == -ETIMEDOUT) {
+		/*
+		 * The CREATE command can still run: the device may
+		 * write q_resources and the rings at any time. Leak
+		 * the whole queue instead of freeing memory the
+		 * device can touch. The QPL pages are already leaked
+		 * by gve_register_qpl if that command timed out.
+		 * Ticket 6e2054b369.
+		 */
+		uk_pr_err("gve: CREATE_TX_QUEUE timed out, leaking queue buffers\n");
+		return ERR2PTR(rc);
+	}
 	if (rc != 0)
 		goto err_free;
 
 	/*
 	 * The device filled q_resources during CREATE. Validate its
 	 * doorbell index once here and keep the host-endian value in
-	 * txq->db_idx for every later BAR2 write. An index at or
-	 * above num_ntfy_blks, or one whose 32-bit word falls beyond
-	 * BAR2, must fail the queue setup instead of writing to other
-	 * MMIO or RAM. Ticket 7af135385d.
+	 * txq->db_idx for every later BAR2 write. An index whose
+	 * 32-bit word falls beyond BAR2 must fail the queue setup
+	 * instead of writing to other MMIO or RAM. The device
+	 * allocates sparse indexes, so the window bound is the check;
+	 * see gve_doorbell_in_range. Ticket 7af135385d.
 	 */
 	txq->db_idx = bswap32(txq->q_resources->db_index);
-	if (!gve_doorbell_in_range(txq->db_idx, gdev->num_ntfy_blks,
-				   gdev->bar2_size)) {
-		printf("GATE_FAIL: gve TX doorbell index %u out of range (num_ntfy=%u bar2_size=%llu)\n",
-		       txq->db_idx, gdev->num_ntfy_blks,
-		       (unsigned long long)gdev->bar2_size);
+	if (!gve_doorbell_in_range(txq->db_idx, gdev->bar2_size)) {
+		printf("GATE_FAIL: gve TX doorbell index %u out of range (bar2_size=%llu)\n",
+		       txq->db_idx, (unsigned long long)gdev->bar2_size);
 		rc = -EIO;
 		goto err_destroy;
 	}
-	uk_pr_info("gve: TX0 doorbell index %u accepted (num_ntfy=%u)\n",
-		   txq->db_idx, gdev->num_ntfy_blks);
+	uk_pr_info("gve: TX0 doorbell index %u accepted (bar2_size=%llu)\n",
+		   txq->db_idx, (unsigned long long)gdev->bar2_size);
 
 	gdev->txq = txq;
 	return txq;
@@ -1204,6 +1247,11 @@ static struct uk_netdev_rx_queue *gve_netdev_rxq_configure(
 	uk_pr_info("gve: CREATE_RX_QUEUE qid=%u fmt=%s rc=%d status=0x%x\n",
 		   queue_id, gve_queue_format_name(gdev->queue_format),
 		   rc, cmd_status);
+	if (rc == -ETIMEDOUT) {
+		/* Same rule as the TX path. Ticket 6e2054b369. */
+		uk_pr_err("gve: CREATE_RX_QUEUE timed out, leaking queue buffers\n");
+		return ERR2PTR(rc);
+	}
 	if (rc != 0)
 		goto err_free;
 
@@ -1213,16 +1261,14 @@ static struct uk_netdev_rx_queue *gve_netdev_rxq_configure(
 	 * 7af135385d.
 	 */
 	rxq->db_idx = bswap32(rxq->q_resources->db_index);
-	if (!gve_doorbell_in_range(rxq->db_idx, gdev->num_ntfy_blks,
-				   gdev->bar2_size)) {
-		printf("GATE_FAIL: gve RX doorbell index %u out of range (num_ntfy=%u bar2_size=%llu)\n",
-		       rxq->db_idx, gdev->num_ntfy_blks,
-		       (unsigned long long)gdev->bar2_size);
+	if (!gve_doorbell_in_range(rxq->db_idx, gdev->bar2_size)) {
+		printf("GATE_FAIL: gve RX doorbell index %u out of range (bar2_size=%llu)\n",
+		       rxq->db_idx, (unsigned long long)gdev->bar2_size);
 		rc = -EIO;
 		goto err_destroy;
 	}
-	uk_pr_info("gve: RX0 doorbell index %u accepted (num_ntfy=%u)\n",
-		   rxq->db_idx, gdev->num_ntfy_blks);
+	uk_pr_info("gve: RX0 doorbell index %u accepted (bar2_size=%llu)\n",
+		   rxq->db_idx, (unsigned long long)gdev->bar2_size);
 
 	gdev->rxq = rxq;
 	return rxq;
@@ -1261,14 +1307,12 @@ static int gve_netdev_start(struct uk_netdev *dev)
 	 * Defense in depth: the queue configure path already checked
 	 * both indices, so this only catches a queue that reached
 	 * start without that check. The first RX doorbell write below
-	 * must never leave the notification area. Ticket 7af135385d.
+	 * must never leave the BAR2 window. Ticket 7af135385d.
 	 */
-	if (!gve_doorbell_in_range(tx_db_idx, gdev->num_ntfy_blks,
-				   gdev->bar2_size) ||
-	    !gve_doorbell_in_range(rx_db_idx, gdev->num_ntfy_blks,
-				   gdev->bar2_size)) {
-		printf("GATE_FAIL: gve doorbell index out of range at start: tx=%u rx=%u num_ntfy=%u bar2_size=%llu\n",
-		       tx_db_idx, rx_db_idx, gdev->num_ntfy_blks,
+	if (!gve_doorbell_in_range(tx_db_idx, gdev->bar2_size) ||
+	    !gve_doorbell_in_range(rx_db_idx, gdev->bar2_size)) {
+		printf("GATE_FAIL: gve doorbell index out of range at start: tx=%u rx=%u bar2_size=%llu\n",
+		       tx_db_idx, rx_db_idx,
 		       (unsigned long long)gdev->bar2_size);
 		return -EIO;
 	}
@@ -1720,6 +1764,7 @@ static int gve_add_dev(struct pci_device *pdev)
 	int mapped_bar0 = 0;
 	int mapped_bar2 = 0;
 	int has_gqi_raw = 0;
+	int cmd_may_run = 0;	/* a timeout may have left a command pending */
 	int rc;
 
 	if (!pdev)
@@ -1878,6 +1923,8 @@ static int gve_add_dev(struct pci_device *pdev)
 			     &cmd_status);
 	uk_pr_info("gve: VERIFY_DRIVER_COMPATIBILITY rc=%d status=0x%x\n",
 		   rc, cmd_status);
+	if (rc == -ETIMEDOUT)
+		cmd_may_run = 1;
 	if (rc != 0 && cmd_status != GVE_ADMINQ_COMMAND_ERROR_UNIMPLEMENTED) {
 		uk_pr_info("gve: Warning: VERIFY_DRIVER_COMPATIBILITY returned 0x%x\n",
 			   cmd_status);
@@ -1902,6 +1949,8 @@ static int gve_add_dev(struct pci_device *pdev)
 	rc = gve_adminq_exec(reg_bar0, adminq, &gdev->adminq_prod_cnt, &cmd,
 			     &cmd_status);
 	uk_pr_info("gve: DESCRIBE_DEVICE rc=%d status=0x%x\n", rc, cmd_status);
+	if (rc == -ETIMEDOUT)
+		cmd_may_run = 1;
 	if (rc != 0) {
 		printf("GATE_FAIL: DESCRIBE_DEVICE failed with status=0x%x\n",
 		       cmd_status);
@@ -2166,13 +2215,24 @@ static int gve_add_dev(struct pci_device *pdev)
 	return 0;
 
 err:
-	/* Unwind every allocation and mapping this call made. */
-	if (desc_buf)
-		uk_free(drv_alloc, desc_buf);
-	if (drv_info)
-		uk_free(drv_alloc, drv_info);
-	if (adminq)
-		uk_free(drv_alloc, adminq);
+	/*
+	 * Unwind every allocation and mapping this call made. A
+	 * timeout does not cancel the AdminQ command: the device can
+	 * still write the adminq entry and the descriptor buffer, and
+	 * still read the driver info buffer. Leak those three on
+	 * timeout instead of returning device-touched or
+	 * device-readable memory to the allocator. Ticket 6e2054b369.
+	 */
+	if (!cmd_may_run) {
+		if (desc_buf)
+			uk_free(drv_alloc, desc_buf);
+		if (drv_info)
+			uk_free(drv_alloc, drv_info);
+		if (adminq)
+			uk_free(drv_alloc, adminq);
+	} else {
+		uk_pr_err("gve: probe aborted with a command possibly pending, leaking adminq, driver info, and descriptor buffers\n");
+	}
 	if (mapped_bar2)
 		gve_unmap_bar(1);
 	if (mapped_bar0)
