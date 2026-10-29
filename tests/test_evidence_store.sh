@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: BSD-3-Clause
 # Host test for the evidence-store step in scripts/lib/gcp_lib.sh.
-# Tickets c16353731a cf185ab6fd.
+# Tickets c16353731a cf185ab6fd eec304d8cf.
 #
 # The test needs Fossil on the host. It builds a throwaway checkout
 # in a temporary directory, so fossil uv commands never touch this
@@ -268,6 +268,56 @@ else
 fi
 check_contains "KEEP_RES run stores PARTIAL" "${out}" \
     "run ukg-test-0008: PARTIAL"
+
+# Case 10: a failed fossil uv add must not cite the artifact and must
+# not print a ready-to-paste ticket command. Ticket eec304d8cf.
+UKG_RUN="ukg-test-0009"
+UKG_EVIDENCE_LOG="${WORK}/nostore.log"
+printf 'GATE_GVE_PASS\n' >"${UKG_EVIDENCE_LOG}"
+mkdir -p "${WORK}/not-a-checkout"
+UKG_REPO_ROOT="${WORK}/not-a-checkout"
+out="$(ukg_store_evidence 0 0 0 2>&1)"
+UKG_REPO_ROOT="${CO}"
+check_contains "failed store marks evidence NOT STORED" "${out}" \
+    "Evidence: NOT STORED"
+if printf '%s' "${out}" | grep -q "fossil ticket change"; then
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo "FAIL - failed store prints no ticket command"
+else
+    PASS_COUNT=$((PASS_COUNT + 1))
+    echo "ok   - failed store prints no ticket command"
+fi
+if printf '%s' "${out}" | grep -q "(fossil uv)"; then
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo "FAIL - failed store cites no artifact"
+else
+    PASS_COUNT=$((PASS_COUNT + 1))
+    echo "ok   - failed store cites no artifact"
+fi
+# The gate result itself stays visible.
+check_contains "failed store keeps the gate result" "${out}" \
+    "run ukg-test-0009: PASS"
+
+# Case 11: a reused run id stores nothing new, so the stored artifact
+# from the earlier run must not be cited either. Ticket eec304d8cf.
+UKG_RUN="ukg-test-0010"
+UKG_EVIDENCE_LOG="${WORK}/dup1.log"
+printf 'first\n' >"${UKG_EVIDENCE_LOG}"
+ukg_store_evidence 0 0 0 >/dev/null 2>&1
+UKG_EVIDENCE_LOG="${WORK}/dup2.log"
+printf 'second\n' >"${UKG_EVIDENCE_LOG}"
+out="$(ukg_store_evidence 0 0 0 2>&1)"
+check_contains "reused run id reports the existing artifact" "${out}" \
+    "already exists in the artifact store"
+check_contains "reused run id marks evidence NOT STORED" "${out}" \
+    "Evidence: NOT STORED"
+if printf '%s' "${out}" | grep -q "fossil ticket change"; then
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo "FAIL - reused run id prints no ticket command"
+else
+    PASS_COUNT=$((PASS_COUNT + 1))
+    echo "ok   - reused run id prints no ticket command"
+fi
 
 echo ""
 echo "test_evidence_store: ${PASS_COUNT} passed, ${FAIL_COUNT} failed"

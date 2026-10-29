@@ -9,6 +9,7 @@
 # gcp_run_b2.sh gcp_run_b3.sh gcp_build_image.sh gcp_teardown.sh
 # Tickets: 1c76a66b26 4a7a2ca6f5 e3effabf78 4347c2a8e6 c16353731a
 # 06ea1706a7 5e6a2acd8a 74936642ce cf185ab6fd afc0a00b06 3a59523e76
+# 0bc13135d7 eec304d8cf
 
 # Directory of this file, the path of the teardown script, and the
 # root of this Fossil checkout. The evidence store step needs the
@@ -100,12 +101,35 @@ ukg_gcs_rm_ok() {
     if [ "${rc}" -eq 0 ]; then
         return 0
     fi
-    # gcloud reports an absent object as "No URLs matched" for a
-    # wildcard or as an HTTP 404 "not found" for an exact name.
-    # Both mean the object is already gone.
-    if printf '%s' "${out}" | grep -qiE "No URLs matched|404|not found"; then
+    # gcloud reports an absent object as "The following URLs matched
+    # no objects or files" (current text, seen in run
+    # ukg-1029-010754), as "No URLs matched" (older text), or as an
+    # HTTP 404 "not found" for an exact name. All mean the object is
+    # already gone.
+    if printf '%s' "${out}" | grep -qiE "matched no objects|No URLs matched|404|not found"; then
         return 0
     fi
+    return 1
+}
+
+# Capture one instance's full serial console output into one log file
+# without ever destroying a good log. gcloud get-serial-port-output
+# returns the whole log on every call, so the fetch replaces the file.
+# A failed fetch must not truncate the previous content: the redirect
+# goes to a temporary file that replaces the log only on success.
+# Ticket 0bc13135d7. Needs GCP_ZONE and GCP_PROJECT from the caller.
+# Arg $1: instance name. Arg $2: log path. Returns the gcloud status.
+ukg_serial_capture() {
+    local inst="$1" log="$2"
+    local tmp="${log}.new"
+    if gcloud compute instances get-serial-port-output "${inst}" \
+        --zone="${GCP_ZONE}" --project="${GCP_PROJECT}" \
+        >"${tmp}" 2>&1; then
+        mv -f "${tmp}" "${log}"
+        return 0
+    fi
+    rm -f "${tmp}"
+    echo "[WARN] Serial capture failed for ${inst}. Keeping the previous log." >&2
     return 1
 }
 
@@ -219,19 +243,23 @@ ukg_store_evidence() {
         return 0
     fi
     local store_name="reports/${UKG_RUN}-serial.log"
+    local stored=0
     echo ""
     echo "=================================================="
     echo "[EVIDENCE] Storing ${result} evidence for run ${UKG_RUN}..."
     echo "=================================================="
     if (cd "${UKG_REPO_ROOT}" && fossil uv ls 2>/dev/null) | grep -Fxq "${store_name}"; then
         # Never overwrite stored evidence in silence. A rerun with a
-        # reused run id replaces only on purpose.
+        # reused run id replaces only on purpose. The stored artifact
+        # belongs to the earlier run, so it must not be cited for this
+        # one.
         echo "[WARN] ${store_name} already exists in the artifact store." >&2
         echo "[WARN] Keep the first copy, or replace it on purpose:" >&2
         echo "[WARN]     fossil uv replace ${log} --as ${store_name}" >&2
     elif (cd "${UKG_REPO_ROOT}" && fossil uv add "${log}" --as "${store_name}") >/dev/null 2>&1; then
         echo "[OK] Stored ${store_name}. Confirmation from fossil uv ls -l:"
         (cd "${UKG_REPO_ROOT}" && fossil uv ls -l) | grep -F "${store_name}" || true
+        stored=1
     else
         echo "[WARN] fossil uv add failed. Store the evidence by hand" >&2
         echo "[WARN] from the checkout root:" >&2
@@ -246,17 +274,30 @@ ukg_store_evidence() {
             result_line="${result_line} The gate passed, but teardown or the leak audit failed."
         fi
     fi
-    result_line="${result_line} Evidence: ${store_name} (fossil uv)."
-    echo "[EVIDENCE] Result line: ${result_line}"
-    if [ -n "${UKG_TICKET:-}" ]; then
-        echo "[EVIDENCE] Update the mapped ticket from the checkout root:"
-        # The \n\n stays literal. fossil ticket change turns it into
-        # the blank line before the result. printf keeps it exact.
-        printf '    fossil ticket change %s +comment "\\n\\n%s"\n' \
-            "${UKG_TICKET}" "${result_line}"
+    if [ "${stored}" -eq 1 ]; then
+        result_line="${result_line} Evidence: ${store_name} (fossil uv)."
+        echo "[EVIDENCE] Result line: ${result_line}"
+        if [ -n "${UKG_TICKET:-}" ]; then
+            echo "[EVIDENCE] Update the mapped ticket from the checkout root:"
+            # The \n\n stays literal. fossil ticket change turns it
+            # into the blank line before the result. printf keeps it
+            # exact.
+            printf '    fossil ticket change %s +comment "\\n\\n%s"\n' \
+                "${UKG_TICKET}" "${result_line}"
+        else
+            echo "[EVIDENCE] UKG_TICKET is not set, so no mapped ticket" \
+                "command can be printed." >&2
+        fi
     else
-        echo "[EVIDENCE] UKG_TICKET is not set, so no mapped ticket" \
-            "command can be printed." >&2
+        # Ticket 4 of the 2026-10-29 follow-up audit (ticket
+        # eec304d8cf): never cite an artifact this run did not store.
+        # No ready-to-paste ticket command either, because pasting it
+        # would put unsupported evidence on the ticket.
+        result_line="${result_line} Evidence: NOT STORED, the local log is ${log}."
+        echo "[EVIDENCE] Result line: ${result_line}"
+        echo "[EVIDENCE] No ticket command is printed: store the log" \
+            "with fossil uv first, then add the result to the ticket" \
+            "by hand." >&2
     fi
     return 0
 }
