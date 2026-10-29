@@ -1,0 +1,11 @@
+spec: v0.6
+name: httpreply
+targets:
+  - name: gcp-x86_64
+    architecture: x86_64
+    platform: kvm
+unikraft:
+  version: RELEASE-0.21.0
+libraries:
+  lwip:
+    version: RELEASE-0.21.0

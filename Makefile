@@ -13,6 +13,8 @@ build: prepare test-host
 	@$(MAKE) -C samples/helloworld -j$$(nproc)
 	@$(MAKE) -C samples/networkload defconfig
 	@$(MAKE) -C samples/networkload -j$$(nproc)
+	@$(MAKE) -C samples/httpreply defconfig
+	@$(MAKE) -C samples/httpreply -j$$(nproc)
 
 test-host:
 	@cc -Wall -Wextra -Werror -std=c11 -Idrivers/gve/include tests/test_gve.c -o /tmp/test_gve
@@ -37,6 +39,8 @@ clean:
 	@rm -rf samples/helloworld/build
 	@$(MAKE) -C samples/networkload clean
 	@rm -rf samples/networkload/build
+	@$(MAKE) -C samples/httpreply clean
+	@rm -rf samples/httpreply/build
 
 teardown:
 	@# The run id is mandatory. A teardown with no run id deletes
