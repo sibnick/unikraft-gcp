@@ -33,6 +33,14 @@
 /* Bound for the link-up poll in netdev_start. */
 #define GVE_LINK_TIMEOUT_MSEC	2000UL
 
+/*
+ * Upper bound on queue pairs the driver can hold. The device budget
+ * (min of max queues and half the event counters) is always smaller,
+ * but the static queue arrays need a compile-time bound. Eight pairs
+ * covers every GCP machine size. Ticket a9b1936640.
+ */
+#define GVE_MAX_QUEUES		8U
+
 static struct uk_alloc *drv_alloc;
 
 /* 2 MiB page directories for mapping BAR0 (slot 0) and BAR2 (slot 1) */
@@ -145,8 +153,17 @@ struct gve_device {
 	struct gve_ptype_lut *ptype_lut_dqo;
 	int resources_configured;
 
-	struct uk_netdev_tx_queue *txq;
-	struct uk_netdev_rx_queue *rxq;
+	/* RSS state. Sizes come from the RSS_CONFIG device option when
+	 * present, else from the GVE_RSS_* defaults. */
+	int rss_opt_present;
+	uint16_t rss_key_size;
+	uint16_t rss_lut_size;
+
+	/* Queue pairs accepted by gve_netdev_configure. The datapath
+	 * and start path iterate this many entries. Ticket a9b1936640. */
+	uint16_t queue_pairs;
+	struct uk_netdev_tx_queue *txq[GVE_MAX_QUEUES];
+	struct uk_netdev_rx_queue *rxq[GVE_MAX_QUEUES];
 };
 
 #define to_gvedev(ndev) \
@@ -316,6 +333,10 @@ static const char *gve_option_name(uint16_t opt_id)
 		return "JUMBO_FRAMES";
 	case GVE_DEV_OPT_ID_BUFFER_SIZES:
 		return "BUFFER_SIZES";
+	case GVE_DEV_OPT_ID_FLOW_STEERING:
+		return "FLOW_STEERING";
+	case GVE_DEV_OPT_ID_RSS_CONFIG:
+		return "RSS_CONFIG";
 	default:
 		return "UNKNOWN";
 	}
@@ -544,13 +565,83 @@ static int gve_register_qpl(struct gve_device *gdev, struct uk_alloc *a,
 	return 0;
 }
 
+/*
+ * Program RSS so the device spreads flows across every configured RX
+ * queue: Toeplitz algorithm, the Linux default hash-type set (TCP and
+ * UDP over IPv4 and IPv6), a fixed key, and the default indirection
+ * table (entry i selects queue i % queue_pairs). Sizes come from the
+ * RSS_CONFIG device option when the device advertised one.
+ *
+ * The key and LUT buffers only need to stay valid until the command
+ * completes, the same contract the Linux driver relies on. A timeout
+ * does not cancel the command, so that path leaks the buffers instead
+ * of freeing memory the device may still read (ticket 6e2054b369). A
+ * rejected command is not fatal: steering then follows whatever the
+ * device had configured before. Ticket a9b1936640.
+ */
+static int gve_configure_rss(struct gve_device *gdev)
+{
+	uint16_t key_size = gdev->rss_opt_present ? gdev->rss_key_size
+						   : GVE_RSS_KEY_SIZE;
+	uint16_t lut_size = gdev->rss_opt_present ? gdev->rss_lut_size
+						   : GVE_RSS_INDIR_SIZE;
+	uint32_t pairs = gdev->queue_pairs ? gdev->queue_pairs : 1U;
+	uint16_t hash_types = (uint16_t)((1U << GVE_RSS_HASH_TCPV4) |
+					 (1U << GVE_RSS_HASH_UDPV4) |
+					 (1U << GVE_RSS_HASH_TCPV6) |
+					 (1U << GVE_RSS_HASH_UDPV6));
+	union gve_adminq_command cmd;
+	uint32_t cmd_status = 0;
+	uint8_t *key;
+	uint32_t *lut;
+	int rc;
+
+	if (key_size == 0U || key_size > GVE_RSS_KEY_SIZE_MAX ||
+	    lut_size == 0U || lut_size > GVE_RSS_INDIR_SIZE_MAX) {
+		uk_pr_err("gve: RSS sizes out of driver bounds (key=%u lut=%u), not configuring RSS\n",
+			  key_size, lut_size);
+		return -EINVAL;
+	}
+
+	key = uk_memalign(drv_alloc, GVE_PAGE_SIZE, align_up_page(key_size));
+	lut = uk_memalign(drv_alloc, GVE_PAGE_SIZE,
+			  align_up_page((size_t)lut_size * sizeof(uint32_t)));
+	if (!key || !lut) {
+		if (key)
+			uk_free(drv_alloc, key);
+		if (lut)
+			uk_free(drv_alloc, lut);
+		return -ENOMEM;
+	}
+	gve_rss_fill_key(key, key_size);
+	gve_rss_fill_lut(lut, lut_size, pairs);
+
+	gve_adminq_fill_configure_rss(&cmd, hash_types,
+				      GVE_RSS_HASH_ALG_TOEPLITZ,
+				      (uint64_t)(uintptr_t)key, key_size,
+				      (uint64_t)(uintptr_t)lut, lut_size);
+	rc = gve_adminq_exec(gdev->reg_bar0, gdev->adminq,
+			     &gdev->adminq_prod_cnt, &cmd, &cmd_status);
+	uk_pr_info("gve: CONFIGURE_RSS types=0x%x alg=top key=%u lut=%u queues=%u rc=%d status=0x%x\n",
+		   hash_types, key_size, lut_size, pairs, rc, cmd_status);
+	if (rc == -ETIMEDOUT) {
+		uk_pr_err("gve: CONFIGURE_RSS timed out, leaking rss buffers\n");
+		return rc;
+	}
+	uk_free(drv_alloc, key);
+	uk_free(drv_alloc, lut);
+	return rc;
+}
+
 static int gve_configure_resources(struct gve_device *gdev)
 {
 	union gve_adminq_command cmd;
 	uint32_t cmd_status = 0;
 	uint32_t ntfy_candidates[2];
+	uint32_t ntfy_want;
 	int cand_idx;
 	int rc = -EIO;
+	int rss_rc;
 	int got_counters = 0;	/* allocated by this call: free on failure */
 	int got_dbs = 0;
 	int got_ptype = 0;
@@ -591,15 +682,19 @@ static int gve_configure_resources(struct gve_device *gdev)
 	 * The device may write one irq db index and one counter per
 	 * notification block, so the advertised block count must fit
 	 * the arrays sized from num_event_counters above. Cap both
-	 * candidates. Refuse a device whose budget cannot support one
-	 * TX plus one RX block. Ticket 0b923396ef.
+	 * candidates. The target is one block pair per queue pair;
+	 * refuse a device whose budget cannot support even one pair.
+	 * Ticket 0b923396ef, multi-queue rebase ticket a9b1936640.
 	 */
-	if (gdev->num_event_counters < 2U) {
-		printf("GATE_FAIL: gve device reports %u event counters, need at least 2\n",
-		       (unsigned int)gdev->num_event_counters);
+	ntfy_want = 2U * (gdev->queue_pairs ? gdev->queue_pairs : 1U);
+	if (gdev->num_event_counters < ntfy_want) {
+		printf("GATE_FAIL: gve device reports %u event counters, need at least %u for %u queue pairs\n",
+		       (unsigned int)gdev->num_event_counters,
+		       (unsigned int)ntfy_want,
+		       (unsigned int)(ntfy_want / 2U));
 		return -ENODEV;
 	}
-	ntfy_candidates[0] = gve_ntfy_cap(2U, gdev->num_event_counters);
+	ntfy_candidates[0] = gve_ntfy_cap(ntfy_want, gdev->num_event_counters);
 	ntfy_candidates[1] = gve_ntfy_cap(gdev->max_tx_queues +
 					  gdev->max_rx_queues,
 					  gdev->num_event_counters);
@@ -687,6 +782,17 @@ static int gve_configure_resources(struct gve_device *gdev)
 		}
 	}
 
+	/*
+	 * Program RSS so the device spreads flows across the RX queues.
+	 * Non-fatal: the hardware default already spreads flows, so a
+	 * rejected or unimplemented command still leaves a working
+	 * multi-queue device. Ticket a9b1936640.
+	 */
+	rss_rc = gve_configure_rss(gdev);
+	if (rss_rc != 0 && rss_rc != -ETIMEDOUT)
+		uk_pr_info("gve: Continuing with device default RSS (rc=%d)\n",
+			   rss_rc);
+
 	gdev->resources_configured = 1;
 	return 0;
 
@@ -734,13 +840,20 @@ static void gve_netdev_info_get(struct uk_netdev *dev,
 				struct uk_netdev_info *dev_info)
 {
 	struct gve_device *gdev = to_gvedev(dev);
+	uint32_t budget;
 
 	if (!dev_info || !gdev)
 		return;
 
+	budget = gve_queue_pairs_budget(gdev->max_tx_queues,
+					gdev->max_rx_queues,
+					gdev->num_event_counters);
+	if (budget > GVE_MAX_QUEUES)
+		budget = GVE_MAX_QUEUES;
+
 	memset(dev_info, 0, sizeof(*dev_info));
-	dev_info->max_rx_queues = 1;
-	dev_info->max_tx_queues = 1;
+	dev_info->max_rx_queues = (uint8_t)budget;
+	dev_info->max_tx_queues = (uint8_t)budget;
 	dev_info->max_mtu = gdev->max_mtu ? gdev->max_mtu : gdev->mtu;
 	dev_info->nb_encap_tx = 0;
 	dev_info->nb_encap_rx = 0;
@@ -752,18 +865,36 @@ static int gve_netdev_configure(struct uk_netdev *dev,
 				const struct uk_netdev_conf *conf)
 {
 	struct gve_device *gdev = to_gvedev(dev);
+	uint32_t budget;
+	uint16_t pairs;
 
 	if (!gdev || !conf)
 		return -EINVAL;
 
 	/*
-	 * This driver runs a single queue per direction, and
-	 * info_get advertises exactly that. A larger request is a
-	 * caller bug, so refuse it here instead of ignoring it.
+	 * The driver always pairs TX queue q with RX queue q and gives
+	 * the pair one notification block each, so the two directions
+	 * must be configured with the same count. The count is bounded
+	 * by the device queue maxima and half the event counters, the
+	 * one-pair-per-worker budget. Ticket a9b1936640.
 	 */
-	if (conf->nb_rx_queues != 1 || conf->nb_tx_queues != 1)
+	if (conf->nb_rx_queues != conf->nb_tx_queues)
 		return -EINVAL;
+	pairs = conf->nb_rx_queues;
 
+	budget = gve_queue_pairs_budget(gdev->max_tx_queues,
+					gdev->max_rx_queues,
+					gdev->num_event_counters);
+	if (budget > GVE_MAX_QUEUES)
+		budget = GVE_MAX_QUEUES;
+	if (pairs == 0U || (uint32_t)pairs > budget) {
+		uk_pr_err("gve: request for %u queue pairs out of budget %u (max_tx=%u max_rx=%u counters=%u)\n",
+			  pairs, budget, gdev->max_tx_queues,
+			  gdev->max_rx_queues, gdev->num_event_counters);
+		return -EINVAL;
+	}
+
+	gdev->queue_pairs = pairs;
 	return gve_configure_resources(gdev);
 }
 
@@ -772,7 +903,8 @@ static int gve_netdev_txq_info_get(struct uk_netdev *dev, uint16_t queue_id,
 {
 	struct gve_device *gdev = to_gvedev(dev);
 
-	if (!gdev || !qinfo || queue_id >= 1)
+	if (!gdev || !qinfo ||
+	    queue_id >= (gdev->queue_pairs ? gdev->queue_pairs : 1U))
 		return -EINVAL;
 
 	memset(qinfo, 0, sizeof(*qinfo));
@@ -788,7 +920,8 @@ static int gve_netdev_rxq_info_get(struct uk_netdev *dev, uint16_t queue_id,
 {
 	struct gve_device *gdev = to_gvedev(dev);
 
-	if (!gdev || !qinfo || queue_id >= 1)
+	if (!gdev || !qinfo ||
+	    queue_id >= (gdev->queue_pairs ? gdev->queue_pairs : 1U))
 		return -EINVAL;
 
 	memset(qinfo, 0, sizeof(*qinfo));
@@ -861,7 +994,7 @@ static struct uk_netdev_tx_queue *gve_netdev_txq_configure(
 	size_t bounce_sz;
 	int rc;
 
-	if (!gdev || queue_id >= 1)
+	if (!gdev || queue_id >= (gdev->queue_pairs ? gdev->queue_pairs : 1U))
 		return ERR2PTR(-EINVAL);
 	/*
 	 * The driver creates the ring at the device-reported size and
@@ -878,9 +1011,9 @@ static struct uk_netdev_tx_queue *gve_netdev_txq_configure(
 		return ERR2PTR(rc);
 
 	/* Reconfiguration: tear the live queue down before recreating. */
-	if (gdev->txq) {
-		gve_txq_free(gdev, gdev->txq, 1);
-		gdev->txq = NULL;
+	if (gdev->txq[queue_id]) {
+		gve_txq_free(gdev, gdev->txq[queue_id], 1);
+		gdev->txq[queue_id] = NULL;
 	}
 
 	txq = uk_zalloc(a, sizeof(*txq));
@@ -1017,10 +1150,11 @@ static struct uk_netdev_tx_queue *gve_netdev_txq_configure(
 		rc = -EIO;
 		goto err_destroy;
 	}
-	uk_pr_info("gve: TX0 doorbell index %u accepted (bar2_size=%llu)\n",
-		   txq->db_idx, (unsigned long long)gdev->bar2_size);
+	uk_pr_info("gve: TX%u doorbell index %u accepted (bar2_size=%llu)\n",
+		   queue_id, txq->db_idx,
+		   (unsigned long long)gdev->bar2_size);
 
-	gdev->txq = txq;
+	gdev->txq[queue_id] = txq;
 	return txq;
 
 err_destroy:
@@ -1095,7 +1229,8 @@ static struct uk_netdev_rx_queue *gve_netdev_rxq_configure(
 	uint32_t i;
 	int rc;
 
-	if (!gdev || !conf || !conf->alloc_rxpkts || queue_id >= 1)
+	if (!gdev || !conf || !conf->alloc_rxpkts ||
+	    queue_id >= (gdev->queue_pairs ? gdev->queue_pairs : 1U))
 		return ERR2PTR(-EINVAL);
 	/* Same policy as the TX queue: device size or driver default. */
 	if (!gve_ring_request_ok(nb_desc, gdev->rx_desc_cnt))
@@ -1107,9 +1242,9 @@ static struct uk_netdev_rx_queue *gve_netdev_rxq_configure(
 		return ERR2PTR(rc);
 
 	/* Reconfiguration: tear the live queue down before recreating. */
-	if (gdev->rxq) {
-		gve_rxq_free(gdev, gdev->rxq, 1);
-		gdev->rxq = NULL;
+	if (gdev->rxq[queue_id]) {
+		gve_rxq_free(gdev, gdev->rxq[queue_id], 1);
+		gdev->rxq[queue_id] = NULL;
 	}
 
 	rxq = uk_zalloc(a, sizeof(*rxq));
@@ -1267,10 +1402,10 @@ static struct uk_netdev_rx_queue *gve_netdev_rxq_configure(
 		rc = -EIO;
 		goto err_destroy;
 	}
-	uk_pr_info("gve: RX0 doorbell index %u accepted (bar2_size=%llu)\n",
-		   rxq->db_idx, (unsigned long long)gdev->bar2_size);
+	uk_pr_info("gve: RX%u doorbell index %u accepted (bar2_size=%llu)\n",
+		   queue_id, rxq->db_idx, (unsigned long long)gdev->bar2_size);
 
-	gdev->rxq = rxq;
+	gdev->rxq[queue_id] = rxq;
 	return rxq;
 
 err_destroy:
@@ -1290,52 +1425,69 @@ static int gve_netdev_start(struct uk_netdev *dev)
 	uint32_t tx_db_idx, tx_cnt_idx;
 	uint32_t rx_db_idx, rx_cnt_idx;
 	uint32_t dev_status;
+	uint16_t q;
 	__nsec deadline;
 	int link_up = 0;
 
-	if (!gdev || !gdev->txq || !gdev->rxq)
+	if (!gdev || gdev->queue_pairs == 0U)
 		return -EINVAL;
+
+	/*
+	 * Every configured pair must have both halves. Catch a partial
+	 * setup here, before any doorbell write.
+	 */
+	for (q = 0U; q < gdev->queue_pairs; q++) {
+		if (!gdev->txq[q] || !gdev->rxq[q])
+			return -EINVAL;
+	}
 
 	__asm__ __volatile__("mfence" ::: "memory");
 
-	tx_db_idx = gdev->txq->db_idx;
-	tx_cnt_idx = bswap32(gdev->txq->q_resources->counter_index);
-	rx_db_idx = gdev->rxq->db_idx;
-	rx_cnt_idx = bswap32(gdev->rxq->q_resources->counter_index);
+	for (q = 0U; q < gdev->queue_pairs; q++) {
+		tx_db_idx = gdev->txq[q]->db_idx;
+		tx_cnt_idx = bswap32(gdev->txq[q]->q_resources->counter_index);
+		rx_db_idx = gdev->rxq[q]->db_idx;
+		rx_cnt_idx = bswap32(gdev->rxq[q]->q_resources->counter_index);
 
-	/*
-	 * Defense in depth: the queue configure path already checked
-	 * both indices, so this only catches a queue that reached
-	 * start without that check. The first RX doorbell write below
-	 * must never leave the BAR2 window. Ticket 7af135385d.
-	 */
-	if (!gve_doorbell_in_range(tx_db_idx, gdev->bar2_size) ||
-	    !gve_doorbell_in_range(rx_db_idx, gdev->bar2_size)) {
-		printf("GATE_FAIL: gve doorbell index out of range at start: tx=%u rx=%u bar2_size=%llu\n",
-		       tx_db_idx, rx_db_idx,
-		       (unsigned long long)gdev->bar2_size);
-		return -EIO;
-	}
-
-	/* Post initial RX buffers via BAR2 doorbell */
-	if (gdev->queue_format == GVE_DQO_RDA_FORMAT) {
-		mmio_write32(&gdev->db_bar2[rx_db_idx],
-			     gdev->rxq->dqo_bufq_tail);
 		/*
-		 * The driver never arms the interrupt translation
-		 * rings. It enables no MSI-X vector and receives every
-		 * packet by polling, so an ITR write would only let the
-		 * device raise interrupts nobody handles. The irq door
-		 * block array stays allocated because
-		 * CONFIGURE_DEVICE_RESOURCES requires it.
+		 * Defense in depth: the queue configure path already
+		 * checked both indices, so this only catches a queue
+		 * that reached start without that check. The first RX
+		 * doorbell write below must never leave the BAR2
+		 * window. Ticket 7af135385d.
 		 */
-	} else {
-		mmio_write32(&gdev->db_bar2[rx_db_idx],
-			     bswap32(gdev->rxq->gqi_fill_cnt));
+		if (!gve_doorbell_in_range(tx_db_idx, gdev->bar2_size) ||
+		    !gve_doorbell_in_range(rx_db_idx, gdev->bar2_size)) {
+			printf("GATE_FAIL: gve doorbell index out of range at start: q=%u tx=%u rx=%u bar2_size=%llu\n",
+			       q, tx_db_idx, rx_db_idx,
+			       (unsigned long long)gdev->bar2_size);
+			return -EIO;
+		}
+
+		/* Post this RX queue's initial buffers via BAR2 doorbell. */
+		if (gdev->queue_format == GVE_DQO_RDA_FORMAT) {
+			mmio_write32(&gdev->db_bar2[rx_db_idx],
+				     gdev->rxq[q]->dqo_bufq_tail);
+			/*
+			 * The driver never arms the interrupt translation
+			 * rings. It enables no MSI-X vector and receives
+			 * every packet by polling, so an ITR write would
+			 * only let the device raise interrupts nobody
+			 * handles. The irq door block array stays
+			 * allocated because CONFIGURE_DEVICE_RESOURCES
+			 * requires it.
+			 */
+		} else {
+			mmio_write32(&gdev->db_bar2[rx_db_idx],
+				     bswap32(gdev->rxq[q]->gqi_fill_cnt));
+		}
+
+		uk_pr_info("gve: Queue resources ready: TX%u(db=%u, cnt=%u) RX%u(db=%u, cnt=%u)\n",
+			   q, tx_db_idx, tx_cnt_idx, q, rx_db_idx, rx_cnt_idx);
 	}
 
-	uk_pr_info("gve: Queue resources ready: TX0(db=%u, cnt=%u) RX0(db=%u, cnt=%u)\n",
-		   tx_db_idx, tx_cnt_idx, rx_db_idx, rx_cnt_idx);
+	uk_pr_info("gve: %u queue pair(s) ready, format=%s\n",
+		   gdev->queue_pairs, gve_queue_format_name(gdev->queue_format));
 
 	/*
 	 * Do not print the gate marker for a link-down device. Poll
@@ -1779,6 +1931,14 @@ static int gve_add_dev(struct pci_device *pdev)
 	dev = pdev->addr.devid;
 	func = pdev->addr.function;
 
+	/*
+	 * Default to a single queue pair. gve_netdev_configure normally
+	 * overrides this. The default keeps start and queue configure
+	 * correct for any caller that does not go through configure.
+	 * Ticket a9b1936640.
+	 */
+	gdev->queue_pairs = 1U;
+
 	uk_pr_info("gve: Probing gVNIC PCI device %04x:%02x:%02x.%x (1ae0:0042)\n",
 		   pdev->addr.domain, bus, dev, func);
 
@@ -2079,6 +2239,28 @@ static int gve_add_dev(struct pci_device *pdev)
 				pair1 = gdev->max_mtu;
 				pair_kind = 3;
 			}
+		} else if (opt_id == GVE_DEV_OPT_ID_RSS_CONFIG) {
+			if (gve_tlv_body_fits(opt_off + sizeof(*opt), opt_len,
+					      sizeof(struct gve_device_option_rss_config),
+					      desc_region)) {
+				struct gve_device_option_rss_config *rs =
+					(struct gve_device_option_rss_config *)opt_body;
+				uint32_t rss_sup =
+					bswap32(rs->supported_features_mask);
+
+				sup_feat = rss_sup;
+				has_sup = 1;
+				if (rss_sup & GVE_SUP_RSS_CONFIG_MASK) {
+					gdev->rss_opt_present = 1;
+					gdev->rss_key_size =
+						bswap16(rs->hash_key_size);
+					gdev->rss_lut_size =
+						bswap16(rs->hash_lut_size);
+				}
+				pair1 = gdev->rss_key_size;
+				pair2 = gdev->rss_lut_size;
+				pair_kind = 4;
+			}
 		}
 
 		switch (pair_kind) {
@@ -2098,6 +2280,11 @@ static int gve_add_dev(struct pci_device *pdev)
 			uk_pr_info("gve:   [Option %u] id=0x%x (%s) len=%u req_feat=0x%x max_mtu=%u\n",
 				   i, opt_id, gve_option_name(opt_id),
 				   opt_len, req_feat, pair1);
+			break;
+		case 4:
+			uk_pr_info("gve:   [Option %u] id=0x%x (%s) len=%u req_feat=0x%x sup_feat=0x%x hash_key_size=%u hash_lut_size=%u\n",
+				   i, opt_id, gve_option_name(opt_id),
+				   opt_len, req_feat, sup_feat, pair1, pair2);
 			break;
 		default:
 			if (has_sup)
