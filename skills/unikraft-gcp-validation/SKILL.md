@@ -23,6 +23,8 @@ the captured serial log for these exact tokens.
 | `GATE_NET_PASS` | networkload bidirectional check passes. Phase A3 or B3 done | `84e256b934`, `9374183aab` |
 | `GATE_GVE_ADMINQ_PASS` | gve PCI device probed and Admin Queue describes device. Phase B1 done | `e64aa83ff1` |
 | `GATE_GVE_PASS` | gve queues created and uk_netdev interface configured. Phase B2 done | `a1c1337265` |
+| `GATE_RSS_PASS` | gve carried traffic on every RX queue of N pairs: `GATE_RSS_PASS queues=N perq=...` in the server log. RSS multi-queue gate | `a9b1936640` |
+| `GATE_RSS_TRAFFIC` | gate-rss client saw 99 percent of its flow packets echoed back. RSS multi-queue gate, pair half | `a9b1936640` |
 | `GATE_FAIL` | Any gate failed. Follow with the failing step name | current ticket |
 
 A run is valid only when the log shows the expected marker and the
@@ -87,6 +89,12 @@ command instead. Ticket c16353731a.
    interface, and verify `GATE_GVE_PASS`.
 6. B3 (ticket `9374183aab`): two-instance ping and networkload over
    gVNIC pass on third generation VMs, then the teardown audit passes.
+7. RSS (ticket `a9b1936640`): `scripts/gcp_run_rss.sh <run-id>
+   <queue-pairs>` boots the `samples/gate-rss` pair on a third
+   generation VM. The server must show `GATE_RSS_PASS queues=N` with
+   every queue non-zero, and the client must show
+   `GATE_RSS_TRAFFIC`. Run the gate once with two pairs and once with
+   four pairs.
 
 One agent drives one gate at a time. The full lifecycle is in
 `AGENTS.md`.

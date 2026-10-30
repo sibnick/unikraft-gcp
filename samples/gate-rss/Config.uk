@@ -1,0 +1,11 @@
+menuconfig APPGATERSS
+	bool "gate-rss: multi-queue RSS steering cloud gate"
+	default y
+	select LIBNOLIBC if !HAVE_LIBC
+	select LIBUKALLOC
+	select LIBUKBUS
+	select LIBUKBUS_PCI
+	select LIBUKNETDEV
+	help
+	  Raw uk_netdev gate app that proves the gve device steers client
+	  flows across multiple RX queues. Ticket a9b1936640.

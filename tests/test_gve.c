@@ -731,6 +731,102 @@ static void test_ntfy_cap(void)
 	assert(gve_ntfy_cap(1U, 64U) == 0U);
 }
 
+static void test_queue_pairs_budget(void)
+{
+	/* Device maxima bind first. */
+	assert(gve_queue_pairs_budget(2U, 8U, 8U) == 2U);
+	assert(gve_queue_pairs_budget(8U, 3U, 8U) == 3U);
+	/* Half the event counters binds second: one block per queue. */
+	assert(gve_queue_pairs_budget(8U, 8U, 8U) == 4U);
+	assert(gve_queue_pairs_budget(4U, 4U, 6U) == 3U);
+	assert(gve_queue_pairs_budget(4U, 4U, 1U) == 0U);
+	assert(gve_queue_pairs_budget(0U, 4U, 8U) == 0U);
+	/* The real GCP c3 device: max 4/4 with 8 counters. */
+	assert(gve_queue_pairs_budget(4U, 4U, 8U) == 4U);
+}
+
+static void test_adminq_configure_rss(void)
+{
+	union gve_adminq_command cmd;
+	uint16_t types = (uint16_t)((1U << GVE_RSS_HASH_TCPV4) |
+				    (1U << GVE_RSS_HASH_UDPV4) |
+				    (1U << GVE_RSS_HASH_TCPV6) |
+				    (1U << GVE_RSS_HASH_UDPV6));
+
+	gve_adminq_fill_configure_rss(&cmd, types, GVE_RSS_HASH_ALG_TOEPLITZ,
+				      0x1000ULL, 40U, 0x2000ULL, 128U);
+	assert(__builtin_bswap32(cmd.opcode) == GVE_ADMINQ_CONFIGURE_RSS);
+	assert(__builtin_bswap16(cmd.configure_rss.hash_types) == types);
+	assert(types == 0xD2U); /* Linux default: TCP/UDP over v4 and v6 */
+	assert(cmd.configure_rss.hash_alg == 1U); /* ETH_RSS_HASH_TOP */
+	assert(__builtin_bswap16(cmd.configure_rss.hash_key_size) == 40U);
+	assert(__builtin_bswap16(cmd.configure_rss.hash_lut_size) == 128U);
+	assert(__builtin_bswap64(cmd.configure_rss.hash_key_addr) == 0x1000ULL);
+	assert(__builtin_bswap64(cmd.configure_rss.hash_lut_addr) == 0x2000ULL);
+	assert(cmd.configure_rss.reserved == 0U);
+
+	/* Zero buffers mean "keep the device value": size and address
+	 * both stay zero, the field semantics Linux documents. */
+	gve_adminq_fill_configure_rss(&cmd, types, GVE_RSS_HASH_ALG_TOEPLITZ,
+				      0ULL, 40U, 0x2000ULL, 128U);
+	assert(__builtin_bswap16(cmd.configure_rss.hash_key_size) == 0U);
+	assert(__builtin_bswap64(cmd.configure_rss.hash_key_addr) == 0ULL);
+	assert(__builtin_bswap16(cmd.configure_rss.hash_lut_size) == 128U);
+	gve_adminq_fill_configure_rss(&cmd, types, GVE_RSS_HASH_ALG_TOEPLITZ,
+				      0x1000ULL, 40U, 0ULL, 128U);
+	assert(__builtin_bswap16(cmd.configure_rss.hash_lut_size) == 0U);
+	assert(__builtin_bswap64(cmd.configure_rss.hash_lut_addr) == 0ULL);
+
+	/* A zero size also drops a non-zero address. */
+	gve_adminq_fill_configure_rss(&cmd, types, GVE_RSS_HASH_ALG_TOEPLITZ,
+				      0x1000ULL, 0U, 0x2000ULL, 0U);
+	assert(__builtin_bswap64(cmd.configure_rss.hash_key_addr) == 0ULL);
+	assert(__builtin_bswap64(cmd.configure_rss.hash_lut_addr) == 0ULL);
+}
+
+static void test_rss_lut_fill(void)
+{
+	uint32_t lut[8];
+	uint32_t i;
+
+	gve_rss_fill_lut(lut, 8U, 3U);
+	for (i = 0; i < 8U; i++)
+		assert(__builtin_bswap32(lut[i]) == i % 3U);
+
+	/* One queue: every entry selects queue 0. */
+	gve_rss_fill_lut(lut, 8U, 1U);
+	for (i = 0; i < 8U; i++)
+		assert(__builtin_bswap32(lut[i]) == 0U);
+
+	/* Zero queues: no division by zero, everything lands on 0. */
+	gve_rss_fill_lut(lut, 4U, 0U);
+	for (i = 0; i < 4U; i++)
+		assert(__builtin_bswap32(lut[i]) == 0U);
+
+	/* More queues than entries: entries stay below the queue count. */
+	gve_rss_fill_lut(lut, 8U, 16U);
+	for (i = 0; i < 8U; i++)
+		assert(__builtin_bswap32(lut[i]) == i);
+}
+
+static void test_rss_key_fill(void)
+{
+	uint8_t key[128];
+	uint32_t i;
+
+	gve_rss_fill_key(key, 40U);
+	for (i = 0; i < 40U; i++)
+		assert(key[i] == (uint8_t)(0xffU - i));
+
+	/* The pattern wraps at 64 bytes, so a longer key repeats. */
+	gve_rss_fill_key(key, 64U);
+	for (i = 0; i < 64U; i++)
+		assert(key[i] == (uint8_t)(0xffU - i));
+	gve_rss_fill_key(key, 128U);
+	for (i = 0; i < 128U; i++)
+		assert(key[i] == (uint8_t)(0xffU - (i % 64U)));
+}
+
 int main(void)
 {
 	test_adminq_configure_resources();
@@ -756,6 +852,10 @@ int main(void)
 	test_bar_size_decode();
 	test_doorbell_range();
 	test_ntfy_cap();
+	test_queue_pairs_budget();
+	test_adminq_configure_rss();
+	test_rss_lut_fill();
+	test_rss_key_fill();
 	printf("test_gve: all unit tests passed\n");
 	return 0;
 }

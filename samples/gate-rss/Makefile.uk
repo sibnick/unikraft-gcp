@@ -1,0 +1,3 @@
+$(eval $(call addlib,appgaterss))
+
+APPGATERSS_SRCS-y += $(APPGATERSS_BASE)/main.c

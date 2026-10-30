@@ -17,6 +17,8 @@ build: prepare test-host
 	@$(MAKE) -C samples/httpreply -j$$(nproc)
 	@$(MAKE) -C samples/low-latency-hft defconfig
 	@$(MAKE) -C samples/low-latency-hft -j$$(nproc)
+	@$(MAKE) -C samples/gate-rss defconfig
+	@$(MAKE) -C samples/gate-rss -j$$(nproc)
 
 test-host:
 	@cc -Wall -Wextra -Werror -std=c11 -Idrivers/gve/include tests/test_gve.c -o /tmp/test_gve
@@ -47,6 +49,8 @@ clean:
 	@$(MAKE) -C samples/low-latency-hft clean
 	@rm -rf samples/low-latency-hft/build
 	@rm -rf samples/low-latency-hft/bin
+	@$(MAKE) -C samples/gate-rss clean
+	@rm -rf samples/gate-rss/build
 
 teardown:
 	@# The run id is mandatory. A teardown with no run id deletes

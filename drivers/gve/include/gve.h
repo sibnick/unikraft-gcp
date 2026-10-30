@@ -55,6 +55,7 @@ enum gve_adminq_opcodes {
 	GVE_ADMINQ_DESTROY_TX_QUEUE		= 0x7,
 	GVE_ADMINQ_DESTROY_RX_QUEUE		= 0x8,
 	GVE_ADMINQ_DECONFIGURE_DEVICE_RESOURCES	= 0x9,
+	GVE_ADMINQ_CONFIGURE_RSS		= 0xA,
 	GVE_ADMINQ_SET_DRIVER_PARAMETER		= 0xB,
 	GVE_ADMINQ_REPORT_STATS			= 0xC,
 	GVE_ADMINQ_REPORT_LINK_SPEED		= 0xD,
@@ -103,7 +104,12 @@ enum gve_dev_opt_id {
 	GVE_DEV_OPT_ID_DQO_QPL			= 0x7,
 	GVE_DEV_OPT_ID_JUMBO_FRAMES		= 0x8,
 	GVE_DEV_OPT_ID_BUFFER_SIZES		= 0xa,
+	GVE_DEV_OPT_ID_FLOW_STEERING		= 0xb,
+	GVE_DEV_OPT_ID_RSS_CONFIG		= 0xe,
 };
+
+/* Device option supported-features bit positions (option payload field 0) */
+#define GVE_SUP_RSS_CONFIG_MASK			(1U << 7)
 
 /* Driver capability bit positions in driver_capability_flags[0] */
 enum gve_driver_capability {
@@ -173,6 +179,19 @@ struct gve_device_option_jumbo_frames {
 	uint32_t supported_features_mask;
 	uint16_t max_mtu;
 	uint8_t padding[2];
+} __attribute__((packed));
+
+/*
+ * RSS_CONFIG device option. The device advertises the RSS key length
+ * and indirection-table length it accepts. The Linux gve driver reads
+ * the same two fields. When this option is present the device owns the
+ * RSS state; the driver sends the CONFIGURE_RSS admin command with a
+ * key and LUT of exactly these sizes.
+ */
+struct gve_device_option_rss_config {
+	uint32_t supported_features_mask;
+	uint16_t hash_key_size;
+	uint16_t hash_lut_size;
 } __attribute__((packed));
 
 struct gve_adminq_describe_device {
@@ -284,6 +303,45 @@ struct gve_adminq_verify_driver_compatibility {
 	uint64_t driver_info_addr;
 } __attribute__((packed));
 
+/*
+ * RSS hash-type bit positions, matching the Linux gve driver. The
+ * CONFIGURE_RSS hash_types field is a mask of these bits.
+ */
+enum gve_rss_hash_type {
+	GVE_RSS_HASH_IPV4	= 0,
+	GVE_RSS_HASH_TCPV4	= 1,
+	GVE_RSS_HASH_IPV6	= 2,
+	GVE_RSS_HASH_IPV6_EX	= 3,
+	GVE_RSS_HASH_TCPV6	= 4,
+	GVE_RSS_HASH_TCPV6_EX	= 5,
+	GVE_RSS_HASH_UDPV4	= 6,
+	GVE_RSS_HASH_UDPV6	= 7,
+	GVE_RSS_HASH_UDPV6_EX	= 8,
+};
+
+/* Toeplitz hash algorithm value in CONFIGURE_RSS (ETH_RSS_HASH_TOP). */
+#define GVE_RSS_HASH_ALG_TOEPLITZ	1U
+
+/* RSS sizes used when the device advertises no RSS_CONFIG option. */
+#define GVE_RSS_KEY_SIZE		40U
+#define GVE_RSS_INDIR_SIZE		128U
+
+/* Sizes a CONFIGURE_RSS command can carry. The device option may ask
+ * for smaller values, never larger ones, so the driver pins buffers to
+ * these bounds. */
+#define GVE_RSS_KEY_SIZE_MAX		128U
+#define GVE_RSS_INDIR_SIZE_MAX		1024U
+
+struct gve_adminq_configure_rss {
+	uint16_t hash_types;
+	uint8_t hash_alg;
+	uint8_t reserved;
+	uint16_t hash_key_size;
+	uint16_t hash_lut_size;
+	uint64_t hash_key_addr;
+	uint64_t hash_lut_addr;
+} __attribute__((packed));
+
 union gve_adminq_command {
 	struct {
 		uint32_t opcode;
@@ -300,6 +358,7 @@ union gve_adminq_command {
 			struct gve_adminq_set_driver_parameter set_driver_param;
 			struct gve_adminq_get_ptype_map get_ptype_map;
 			struct gve_adminq_verify_driver_compatibility verify_driver_compatibility;
+			struct gve_adminq_configure_rss configure_rss;
 		};
 	} __attribute__((packed));
 	uint8_t reserved[64];
@@ -529,6 +588,7 @@ _Static_assert(offsetof(struct gve_registers, adminq_length) == 40,
 _Static_assert(sizeof(struct gve_driver_info) == 304, "gve_driver_info size");
 _Static_assert(sizeof(struct gve_device_descriptor) == 40, "gve_device_descriptor size");
 _Static_assert(sizeof(struct gve_device_option) == 8, "gve_device_option size");
+_Static_assert(sizeof(struct gve_device_option_rss_config) == 8, "gve_device_option_rss_config size");
 _Static_assert(sizeof(struct gve_irq_db) == 64, "gve_irq_db size");
 _Static_assert(sizeof(struct gve_queue_resources) == 64, "gve_queue_resources size");
 _Static_assert(sizeof(struct gve_ptype_lut) == 2048, "gve_ptype_lut size");
@@ -536,6 +596,7 @@ _Static_assert(sizeof(struct gve_adminq_configure_device_resources) == 40, "conf
 _Static_assert(sizeof(struct gve_adminq_register_page_list) == 24, "register_page_list size");
 _Static_assert(sizeof(struct gve_adminq_create_tx_queue) == 48, "create_tx_queue size");
 _Static_assert(sizeof(struct gve_adminq_create_rx_queue) == 56, "create_rx_queue size");
+_Static_assert(sizeof(struct gve_adminq_configure_rss) == 24, "configure_rss size");
 _Static_assert(sizeof(struct gve_adminq_get_ptype_map) == 16, "get_ptype_map size");
 _Static_assert(sizeof(union gve_adminq_command) == 64, "gve_adminq_command size");
 _Static_assert(sizeof(union gve_tx_desc) == 16, "gve_tx_desc size");
@@ -635,6 +696,84 @@ static inline void gve_adminq_fill_create_rx_queue(
 	cmd->create_rx_queue.rx_buff_ring_size =
 		__builtin_bswap16(rx_buff_ring_size);
 	cmd->create_rx_queue.enable_rsc = 0;
+}
+
+/*
+ * Fill a CONFIGURE_RSS command. Zero-valued key or LUT arguments
+ * store zero sizes and zero addresses, which instructs the device to
+ * keep the current value for that field, exactly as the Linux gve
+ * driver documents. paddr arguments are physical addresses: this
+ * unikernel runs identity-mapped, so the virtual address is the
+ * physical one.
+ */
+static inline void gve_adminq_fill_configure_rss(
+	union gve_adminq_command *cmd,
+	uint16_t hash_types,
+	uint8_t hash_alg,
+	uint64_t key_paddr, uint16_t key_size,
+	uint64_t lut_paddr, uint16_t lut_size)
+{
+	__builtin_memset(cmd, 0, sizeof(*cmd));
+	cmd->opcode = __builtin_bswap32(GVE_ADMINQ_CONFIGURE_RSS);
+	cmd->configure_rss.hash_types = __builtin_bswap16(hash_types);
+	cmd->configure_rss.hash_alg = hash_alg;
+	if (key_paddr != 0 && key_size != 0) {
+		cmd->configure_rss.hash_key_size = __builtin_bswap16(key_size);
+		cmd->configure_rss.hash_key_addr =
+			__builtin_bswap64(key_paddr);
+	}
+	if (lut_paddr != 0 && lut_size != 0) {
+		cmd->configure_rss.hash_lut_size = __builtin_bswap16(lut_size);
+		cmd->configure_rss.hash_lut_addr =
+			__builtin_bswap64(lut_paddr);
+	}
+}
+
+/*
+ * Write the default RSS indirection table: entry i selects RX queue
+ * i % num_queues, big-endian, like the table Linux sends. With zero
+ * queues every entry selects queue 0.
+ */
+static inline void gve_rss_fill_lut(uint32_t *lut, uint32_t lut_size,
+				    uint32_t num_queues)
+{
+	uint32_t i;
+
+	for (i = 0; i < lut_size; i++) {
+		uint32_t qid = (num_queues != 0) ? (i % num_queues) : 0U;
+
+		lut[i] = __builtin_bswap32(qid);
+	}
+}
+
+/*
+ * Write a deterministic Toeplitz key: repeating descending bytes.
+ * The device accepts any key of the advertised size. A fixed key makes
+ * a flow land on the same RX queue in every run, so gate results stay
+ * reproducible.
+ */
+static inline void gve_rss_fill_key(uint8_t *key, uint32_t key_size)
+{
+	uint32_t i;
+
+	for (i = 0; i < key_size; i++)
+		key[i] = (uint8_t)(0xffU - (i % 64U));
+}
+
+/*
+ * Queue-pair budget. Each pair needs one TX and one RX notification
+ * block, and one event counter backs each block, so the pair count is
+ * bounded by the smaller queue-max and half the event counters.
+ * Ticket a9b1936640.
+ */
+static inline uint32_t gve_queue_pairs_budget(uint32_t max_tx,
+					      uint32_t max_rx,
+					      uint32_t counters)
+{
+	uint32_t pairs = (max_tx < max_rx) ? max_tx : max_rx;
+	uint32_t by_counters = counters / 2U;
+
+	return (pairs < by_counters) ? pairs : by_counters;
 }
 
 static inline void gve_dqo_fill_tx_general_ctx_desc(

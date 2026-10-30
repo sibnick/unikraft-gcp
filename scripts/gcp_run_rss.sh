@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: BSD-3-Clause
+# Launch a two-instance c3-standard-4 VM pair on Google Cloud with gVNIC
+# and verify gve multi-queue creation plus RSS steering (ticket
+# a9b1936640). The server unikernel configures N queue pairs, echoes
+# every flow packet, and counts RX packets per queue. The client sends
+# one UDP flow per source port, then asks the server for its per-queue
+# report. The gate passes when every RX queue carried traffic.
+#
+# Usage: gcp_run_rss.sh <run-id> [queue-pairs]
+# Queue pairs default to 2. The IP plan, firewall scope, and zone
+# fallback list follow the Phase B3 runner conventions.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# shellcheck source=./lib/gcp_lib.sh
+source "${SCRIPT_DIR}/lib/gcp_lib.sh"
+
+if [ -f "${ROOT_DIR}/.env" ]; then
+    # shellcheck source=/dev/null
+    source "${ROOT_DIR}/.env"
+fi
+
+GCP_PROJECT="${GCP_PROJECT:-$(gcloud config get-value project 2>/dev/null || true)}"
+GCP_ZONE="${GCP_ZONE:-$(gcloud config get-value compute/zone 2>/dev/null || true)}"
+UKG_RUN="${1:-${UKG_RUN:-$(ukg_default_run_id)}}"
+ukg_validate_run_id "${UKG_RUN}"
+
+RSS_PAIRS="${2:-${RSS_PAIRS:-2}}"
+if ! [[ "${RSS_PAIRS}" =~ ^[1-8]$ ]]; then
+    echo "[ERROR] queue-pairs must be a single digit 1..8, got: ${RSS_PAIRS}" >&2
+    exit 1
+fi
+RSS_FLOWS="${RSS_FLOWS:-48}"
+RSS_PKTS="${RSS_PKTS:-12}"
+
+# Every run uploads a disk image to Cloud Storage. Require the
+# bucket before any billable call. Ticket afc0a00b06.
+if [ -z "${GCP_BUCKET:-}" ]; then
+    echo "[ERROR] GCP_BUCKET is not set." >&2
+    echo "[ERROR] Every run uploads a disk image to Cloud Storage." >&2
+    echo "[ERROR] Set GCP_BUCKET in .env." >&2
+    exit 1
+fi
+export UKG_RUN
+
+MACHINE_TYPE="${MACHINE_TYPE:-c3-standard-4}"
+SRV_NAME="${UKG_RUN}-srv"
+CLI_NAME="${UKG_RUN}-cli"
+SRV_IMG="${UKG_RUN}-srv-img"
+CLI_IMG="${UKG_RUN}-cli-img"
+FIREWALL_NAME="${UKG_RUN}-allow-internal"
+
+# IP plan for the run subnet. Custom subnets are regional, so a
+# fallback region needs a different plan. Override all five values
+# together in .env when you change region. Defaults keep the
+# historical us-east4 plan.
+SRV_IP="${UKG_SRV_IP:-10.150.0.10}"
+CLI_IP="${UKG_CLI_IP:-10.150.0.11}"
+NETMASK="${UKG_NETMASK:-20}"
+GATEWAY="${UKG_GATEWAY:-10.150.0.1}"
+SUBNET="${UKG_SUBNET:-10.150.0.0/20}"
+
+SRV_LOG="$(ukg_mk_serial_log "${UKG_RUN}-srv")"
+CLI_LOG="$(ukg_mk_serial_log "${UKG_RUN}-cli")"
+COMBINED_LOG="$(ukg_mk_serial_log "${UKG_RUN}")"
+
+# Evidence contract wiring. The teardown trap stores the combined log
+# as reports/<run-id>-serial.log with fossil uv after the leak audit,
+# and prints the exact fossil ticket change command for the mapped
+# ticket. Ticket a9b1936640 is the default.
+UKG_GATE="RSS${RSS_PAIRS}"
+UKG_EVIDENCE_LOG="${COMBINED_LOG}"
+UKG_TICKET="${UKG_TICKET:-a9b1936640}"
+
+if [ -z "${GCP_PROJECT}" ] || [ -z "${GCP_ZONE}" ]; then
+    echo "[ERROR] GCP_PROJECT and GCP_ZONE must be set." >&2
+    exit 1
+fi
+
+echo "=================================================="
+echo "gve Multi-Queue RSS Gate Run"
+echo "Project:      ${GCP_PROJECT}"
+echo "Zone:         ${GCP_ZONE}"
+echo "Machine Type: ${MACHINE_TYPE}"
+echo "Run ID:       ${UKG_RUN}"
+echo "Queue pairs:  ${RSS_PAIRS} flows=${RSS_FLOWS} pkts=${RSS_PKTS}"
+echo "Server:       ${SRV_NAME} (${SRV_IP}) image: ${SRV_IMG}"
+echo "Client:       ${CLI_NAME} (${CLI_IP}) image: ${CLI_IMG}"
+echo "Subnet:       ${SUBNET}"
+echo "Logs:         ${SRV_LOG} ${CLI_LOG} ${COMBINED_LOG}"
+echo "=================================================="
+
+# Install the teardown trap before the first resource create. The
+# image builds below already create billable objects. Any later
+# error, Ctrl-C, or killed terminal still tears this run down.
+# Export KEEP_RES=1 to keep resources and print the teardown command.
+ukg_install_teardown_trap
+
+# 1. Build and upload server image
+echo "[INFO] Building server image ${SRV_IMG}..."
+"${SCRIPT_DIR}/gcp_build_image.sh" "${ROOT_DIR}/samples/gate-rss" "${SRV_IMG}" \
+    "netdev.ip=${SRV_IP}/${NETMASK}:${GATEWAY} -- role=server ip=${SRV_IP}/${NETMASK} gw=${GATEWAY} queues=${RSS_PAIRS} flows=${RSS_FLOWS} pkts=${RSS_PKTS}"
+
+# 2. Build and upload client image
+echo "[INFO] Building client image ${CLI_IMG}..."
+"${SCRIPT_DIR}/gcp_build_image.sh" "${ROOT_DIR}/samples/gate-rss" "${CLI_IMG}" \
+    "netdev.ip=${CLI_IP}/${NETMASK}:${GATEWAY} -- role=client peer=${SRV_IP} ip=${CLI_IP}/${NETMASK} gw=${GATEWAY} queues=${RSS_PAIRS} flows=${RSS_FLOWS} pkts=${RSS_PKTS}"
+
+# 3. Create internal firewall rule if missing.
+# The gate only moves UDP flow traffic to the echo port. The source
+# range is the run subnet only.
+if ! gcloud compute firewall-rules describe "${FIREWALL_NAME}" --project="${GCP_PROJECT}" &>/dev/null; then
+    echo "[INFO] Creating internal firewall rule ${FIREWALL_NAME}..."
+    gcloud compute firewall-rules create "${FIREWALL_NAME}" \
+        --project="${GCP_PROJECT}" \
+        --network=default \
+        --direction=INGRESS \
+        --allow=udp:9000 \
+        --source-ranges="${SUBNET}" \
+        --target-tags=ukg-vm
+    # Firewall rules support no labels on GA, beta, or alpha gcloud
+    # (verified on SDK 591.0.0), so this rule stays unlabeled. The
+    # teardown delete filter covers it through the anchored name
+    # branch. Ticket 3a59523e76.
+fi
+
+# The zone fallback list comes from ukg_zone_list. Override it with
+# UKG_ZONES in .env. Ticket 4347c2a8e6 N7.
+ZONE_LIST="$(ukg_zone_list)"
+
+# 4. Delete existing instances if present in any candidate zone
+# (rerunnable requirement)
+for z in ${ZONE_LIST}; do
+    if gcloud compute instances describe "${SRV_NAME}" --zone="${z}" --project="${GCP_PROJECT}" &>/dev/null; then
+        echo "[INFO] Instance ${SRV_NAME} already exists in ${z}. Deleting..."
+        gcloud compute instances delete "${SRV_NAME}" --zone="${z}" --project="${GCP_PROJECT}" --quiet
+    fi
+    if gcloud compute instances describe "${CLI_NAME}" --zone="${z}" --project="${GCP_PROJECT}" &>/dev/null; then
+        echo "[INFO] Instance ${CLI_NAME} already exists in ${z}. Deleting..."
+        gcloud compute instances delete "${CLI_NAME}" --zone="${z}" --project="${GCP_PROJECT}" --quiet
+    fi
+done
+
+# 5. Launch both instances in the candidate zone
+SELECTED_ZONE=""
+for z in ${ZONE_LIST}; do
+    echo "[INFO] Attempting to launch VM pair in zone ${z}..."
+    # The gate reads evidence from the serial console and the pair
+    # talks inside the VPC. Both VMs need no billable external IPv4
+    # address, so each GVNIC gets no address.
+    if gcloud compute instances create "${SRV_NAME}" \
+        --zone="${z}" \
+        --project="${GCP_PROJECT}" \
+        --machine-type="${MACHINE_TYPE}" \
+        --boot-disk-type=pd-balanced \
+        --network-interface="nic-type=GVNIC,no-address,private-network-ip=${SRV_IP}" \
+        --image="${SRV_IMG}" \
+        --tags=ukg-vm \
+        --labels="run=${UKG_RUN}"; then
+
+        sleep 8
+
+        if gcloud compute instances create "${CLI_NAME}" \
+            --zone="${z}" \
+            --project="${GCP_PROJECT}" \
+            --machine-type="${MACHINE_TYPE}" \
+            --boot-disk-type=pd-balanced \
+            --network-interface="nic-type=GVNIC,no-address,private-network-ip=${CLI_IP}" \
+            --image="${CLI_IMG}" \
+            --tags=ukg-vm \
+            --labels="run=${UKG_RUN}"; then
+            SELECTED_ZONE="${z}"
+            GCP_ZONE="${z}"
+            break
+        else
+            # A create can report failure after the instance actually
+            # exists. Re-describe the client for an orphan before the
+            # cleanup and the next zone. Ticket 021cb7256c.
+            echo "[WARN] Client creation failed in ${z}. Checking for an orphan client..."
+            if gcloud compute instances describe "${CLI_NAME}" --zone="${z}" --project="${GCP_PROJECT}" &>/dev/null; then
+                echo "[WARN] Orphan client ${CLI_NAME} found in ${z}. Deleting..."
+                gcloud compute instances delete "${CLI_NAME}" --zone="${z}" --project="${GCP_PROJECT}" --quiet \
+                    || echo "[WARN] Orphan client delete failed. Teardown later with: ${SCRIPT_DIR}/gcp_teardown.sh ${UKG_RUN}" >&2
+            fi
+            echo "[WARN] Cleaning up server ${SRV_NAME} in ${z}..."
+            # A transient delete failure must not abort the script and
+            # strand the server VM with no hint. Ticket 021cb7256c.
+            gcloud compute instances delete "${SRV_NAME}" --zone="${z}" --project="${GCP_PROJECT}" --quiet \
+                || echo "[WARN] Server cleanup delete failed. Teardown later with: ${SCRIPT_DIR}/gcp_teardown.sh ${UKG_RUN}" >&2
+        fi
+    else
+        # The create may have failed after the server actually
+        # exists. Check for an orphan before the next zone.
+        echo "[WARN] Server creation failed in ${z}. Checking for an orphan server..."
+        if gcloud compute instances describe "${SRV_NAME}" --zone="${z}" --project="${GCP_PROJECT}" &>/dev/null; then
+            echo "[WARN] Orphan server ${SRV_NAME} found in ${z}. Deleting..."
+            gcloud compute instances delete "${SRV_NAME}" --zone="${z}" --project="${GCP_PROJECT}" --quiet \
+                || echo "[WARN] Orphan server delete failed. Teardown later with: ${SCRIPT_DIR}/gcp_teardown.sh ${UKG_RUN}" >&2
+        fi
+    fi
+    echo "[WARN] Failed to launch VM pair in ${z}, trying next zone..."
+done
+
+if [ -z "${SELECTED_ZONE}" ]; then
+    echo "[ERROR] Could not launch VM pair in any candidate zone." >&2
+    exit 1
+fi
+
+echo "[INFO] Both instances launched in ${GCP_ZONE}."
+echo "[INFO] Polling serial console output for the RSS gate markers..."
+RSS_PASS=0
+FAIL_SEEN=0
+
+for i in $(seq 1 90); do
+    sleep 3
+
+    ukg_serial_capture "${SRV_NAME}" "${SRV_LOG}" || true
+
+    ukg_serial_capture "${CLI_NAME}" "${CLI_LOG}" || true
+
+    if ukg_gate_rss_pass "${SRV_LOG}" "${CLI_LOG}" "${RSS_PAIRS}"; then
+        RSS_PASS=1
+    fi
+    if grep -aq "GATE_FAIL" "${SRV_LOG}" 2>/dev/null \
+        || grep -aq "GATE_FAIL" "${CLI_LOG}" 2>/dev/null; then
+        FAIL_SEEN=1
+    fi
+
+    if [ "${RSS_PASS}" -eq 1 ]; then
+        echo ""
+        echo "[SUCCESS] RSS gate markers detected after attempt ${i}!"
+        break
+    fi
+    if [ "${FAIL_SEEN}" -eq 1 ]; then
+        echo ""
+        echo "[WARN] A GATE_FAIL marker appeared after attempt ${i}. Stopping the poll."
+        break
+    fi
+
+    echo -n "."
+done
+echo ""
+
+# Final capture before the verdict. A failure marker can appear after
+# the pass markers, so re-read the logs and re-evaluate. The combined
+# evidence log then also carries the final state. Ticket 06ea1706a7.
+if [ "${RSS_PASS}" -eq 1 ]; then
+    sleep 3
+    ukg_serial_capture "${SRV_NAME}" "${SRV_LOG}" || true
+    ukg_serial_capture "${CLI_NAME}" "${CLI_LOG}" || true
+    RSS_PASS=0
+    if ukg_gate_rss_pass "${SRV_LOG}" "${CLI_LOG}" "${RSS_PAIRS}"; then
+        RSS_PASS=1
+    fi
+fi
+
+# Combine logs for the evidence contract. The teardown trap stores
+# the file as reports/<run-id>-serial.log in fossil uv after the
+# leak audit. Ticket c16353731a.
+{
+    echo "=== SERVER SERIAL CONSOLE OUTPUT (${SRV_NAME}) ==="
+    cat "${SRV_LOG}" 2>/dev/null || true
+    echo ""
+    echo "=== CLIENT SERIAL CONSOLE OUTPUT (${CLI_NAME}) ==="
+    cat "${CLI_LOG}" 2>/dev/null || true
+} > "${COMBINED_LOG}"
+echo "[INFO] Combined evidence log: ${COMBINED_LOG}"
+
+echo "--- Server Serial Console Output ---"
+cat "${SRV_LOG}" 2>/dev/null || true
+echo "------------------------------------"
+
+echo "--- Client Serial Console Output ---"
+cat "${CLI_LOG}" 2>/dev/null || true
+echo "------------------------------------"
+
+if [ "${RSS_PASS}" -eq 1 ]; then
+    echo "[PASS] RSS gate completed with ${RSS_PAIRS} queue pairs: GATE_RSS_PASS and GATE_RSS_TRAFFIC verified."
+    exit 0
+else
+    echo "[FAIL] Missing Phase RSS gate markers in serial console output!" >&2
+    echo "RSS_PASS=${RSS_PASS} pairs=${RSS_PAIRS}" >&2
+    echo "The teardown trap now deletes this run's resources. Export KEEP_RES=1 before the next run to keep them." >&2
+    exit 1
+fi
