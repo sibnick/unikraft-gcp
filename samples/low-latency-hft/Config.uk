@@ -1,0 +1,27 @@
+config APPLOWLATENCYHFT_DEPENDENCIES
+	bool
+	default y
+	select LIBNOLIBC if !HAVE_LIBC
+	select LIBUKALLOC
+	select LIBUKBUS
+	select LIBUKBUS_PCI
+	select LIBUKNETDEV
+	select LIBUKNETDEV_EINFO_LIBPARAM
+	select LIBUKLIBPARAM
+	select LIBLWIP
+	select LIBLWIP_IPV4
+	select LIBLWIP_NOTHREADS
+	select LIBLWIP_SOCKET
+	select LIBLWIP_TCP
+	select LIBLWIP_UDP
+	select LIBLWIP_ICMP
+	select LIBLWIP_AUTOIFACE
+	select LIBPOSIX_POLL
+	select LIBPOSIX_SOCKET_POLLED
+	select LIBPOSIX_TIME
+	select LIBGVE
+
+menuconfig APPLOWLATENCYHFT
+	bool "Low-latency UDP echo server (GCP)"
+	default y
+	select APPLOWLATENCYHFT_DEPENDENCIES

@@ -6,10 +6,11 @@
 # for the evidence store step.
 #
 # Sourced by: gcp_run_a1.sh gcp_run_a2.sh gcp_run_a3.sh gcp_run_b1.sh
-# gcp_run_b2.sh gcp_run_b3.sh gcp_build_image.sh gcp_teardown.sh
+# gcp_run_b2.sh gcp_run_b3.sh gcp_run_c1.sh gcp_run_c2.sh
+# gcp_build_image.sh gcp_teardown.sh
 # Tickets: 1c76a66b26 4a7a2ca6f5 e3effabf78 4347c2a8e6 c16353731a
 # 06ea1706a7 5e6a2acd8a 74936642ce cf185ab6fd afc0a00b06 3a59523e76
-# 0bc13135d7 eec304d8cf
+# 0bc13135d7 eec304d8cf 4c76b4d84d a5874d85fe
 
 # Directory of this file, the path of the teardown script, and the
 # root of this Fossil checkout. The evidence store step needs the
@@ -341,4 +342,160 @@ ukg_gate_ping_pass() {
         return 0
     fi
     return 1
+}
+
+# Authoritative pair gate check: HTTP benchmark (gate C1). Passes only
+# when the server log shows the unikernel served a page
+# (GATE_HTTP_FIRST_200), the client log shows a clean wrk run
+# (GATE_HTTP_BENCH_PASS), and neither log shows a GATE_FAIL or a
+# client-side GATE_HTTP_BENCH_FAIL. The server half proves the unikernel
+# datapath; the client half proves the measured load. Ticket 4c76b4d84d.
+# Arg $1: server log path. Arg $2: client log path. Returns 0 on pass.
+ukg_gate_http_pass() {
+    local srv_log="$1"
+    local cli_log="$2"
+    grep -q "GATE_HTTP_FIRST_200" "${srv_log}" 2>/dev/null || return 1
+    grep -q "GATE_HTTP_BENCH_PASS" "${cli_log}" 2>/dev/null || return 1
+    if grep -q "GATE_FAIL" "${cli_log}" 2>/dev/null; then
+        return 1
+    fi
+    if grep -q "GATE_FAIL" "${srv_log}" 2>/dev/null; then
+        return 1
+    fi
+    if grep -q "GATE_HTTP_BENCH_FAIL" "${cli_log}" 2>/dev/null; then
+        return 1
+    fi
+    return 0
+}
+
+# Authoritative pair gate check: UDP latency (gate C2). Passes only
+# when the server log shows the unikernel echo server came up
+# (GATE_HFT_READY), the client log shows a lossless RTT run
+# (GATE_HFT_RTT_PASS), and neither log shows a failure marker.
+# Ticket 238f7cbd91 a5874d85fe.
+# Arg $1: server log path. Arg $2: client log path. Returns 0 on pass.
+ukg_gate_hft_pass() {
+    local srv_log="$1"
+    local cli_log="$2"
+    grep -q "GATE_HFT_READY" "${srv_log}" 2>/dev/null || return 1
+    grep -q "GATE_HFT_RTT_PASS" "${cli_log}" 2>/dev/null || return 1
+    if grep -q "GATE_FAIL" "${cli_log}" 2>/dev/null; then
+        return 1
+    fi
+    if grep -q "GATE_FAIL" "${srv_log}" 2>/dev/null; then
+        return 1
+    fi
+    if grep -q "GATE_HFT_RTT_FAIL" "${cli_log}" 2>/dev/null; then
+        return 1
+    fi
+    return 0
+}
+
+# Decide the wrk verdict from one wrk report file. Returns 0 (pass) only
+# when Requests/sec is a number above zero and the report shows no
+# socket errors and no non-2xx responses. A wrk run that finished but
+# hit socket errors, timeouts, or non-2xx responses is a fail, the same
+# rule the ENA httpreply tables apply (they report a Socket Errors
+# column and expect 0). Arg $1: report file. The file may be a raw
+# GCP serial log, so strip carriage returns before parsing.
+# Ticket 4c76b4d84d.
+ukg_wrk_ok() {
+    local rep="$1"
+    local rps
+    [ -s "${rep}" ] || return 1
+    rps="$(tr -d '\r' <"${rep}" | awk '/Requests\/sec:/ { v=$2 } END { print v }')"
+    case "${rps}" in
+        ''|*[!0-9.]*) return 1 ;;
+    esac
+    awk -v r="${rps}" 'BEGIN { exit !(r > 0) }' || return 1
+    if tr -d '\r' <"${rep}" | grep -qE "Socket errors:.*[1-9]"; then
+        return 1
+    fi
+    if tr -d '\r' <"${rep}" | grep -qE "Non-2xx responses:"; then
+        return 1
+    fi
+    return 0
+}
+
+# Parse one combined C1/C2 serial log into a single CSV data row
+# without header. Columns:
+#   run,gate,stack,machine,concurrency,throughput,p50_ms,p99_ms,p999_ms,errors,loss_pct
+# Gate detection: a wrk Requests/sec report is C1, a PROBE_RESULT line
+# is C2. Throughput is requests per second for C1 and packets per
+# second for C2. The parser reads the stack from the combined log
+# header (target:/server: unikraft|linux) and the run id from the
+# client banner. The machine type never reaches the serial console,
+# so the caller passes it as the second argument. Percentiles are
+# normalized to milliseconds; wrk prints us, ms, or s by magnitude.
+# Returns 1 when the log carries neither report. Ticket a1134318f5.
+ukg_ab_parse() {
+    local log="$1"
+    local machine="${2:-unknown}"
+    local gate=""
+    [ -s "${log}" ] || return 1
+    if grep -q "Requests/sec:" "${log}" 2>/dev/null; then
+        gate="C1"
+    elif grep -q "PROBE_RESULT" "${log}" 2>/dev/null; then
+        gate="C2"
+    else
+        return 1
+    fi
+    awk -v gate="${gate}" -v machine="${machine}" \
+        -v defrun="$(basename "${log}" .log)" '
+    function toms(v,   n) {
+        n = v + 0
+        if (v ~ /ms$/) return n
+        if (v ~ /us$/) return n / 1000
+        if (v ~ /s$/)  return n * 1000
+        return n
+    }
+    { gsub(/\r/, "") }
+    run == "" && match($0, /run=ukg-[A-Za-z0-9-]+/) {
+        run = substr($0, RSTART + 4, RLENGTH - 4)
+    }
+    stack == "" && ($0 ~ /target: (unikraft|linux)/ || $0 ~ /server: (unikraft|linux)/) {
+        stack = ($0 ~ /unikraft/) ? "unikraft" : "linux"
+    }
+    gate == "C1" && $0 ~ /threads and [0-9]+ connections/ {
+        line = $0
+        gsub(/[^0-9]+/, " ", line)
+        split(line, na, " ")
+        conc = na[2]
+    }
+    gate == "C1" && $0 ~ /^Requests\/sec:/ { rps = $2 }
+    gate == "C1" && $0 ~ /^[ \t]*50%[ \t]/    { p50 = toms($2) }
+    gate == "C1" && $0 ~ /^[ \t]*90%[ \t]/    { p90 = toms($2) }
+    gate == "C1" && $0 ~ /^[ \t]*99%[ \t]/    { p99 = toms($2) }
+    gate == "C1" && $0 ~ /^[ \t]*99\.9%[ \t]/ { p999 = toms($2); has999 = 1 }
+    gate == "C1" && $0 ~ /Socket errors:/ {
+        line = $0
+        sub(/.*Socket errors:/, "", line)
+        gsub(/[^0-9]+/, " ", line)
+        n = split(line, ea, " ")
+        for (i = 1; i <= n; i++) if (ea[i] != "") sockerr += ea[i]
+    }
+    gate == "C1" && $0 ~ /^Non-2xx responses:/ { non2xx = $NF }
+    gate == "C2" && $0 ~ /^PROBE_RESULT / {
+        n = split($0, kv, /[ =]+/)
+        for (i = 2; i + 1 <= n; i += 2) val[kv[i]] = kv[i + 1]
+    }
+    END {
+        if (run == "") run = defrun
+        if (stack == "") stack = "unknown"
+        if (gate == "C1") {
+            if (rps == "") exit 1
+            v999 = has999 ? sprintf("%.3f", p999) : ""
+            printf "%s,%s,%s,%s,%s,%s,%.3f,%.3f,%s,%d,\n", \
+                run, gate, stack, machine, conc, rps, \
+                p50, p99, v999, sockerr + non2xx
+        } else {
+            if (!("p50_us" in val)) exit 1
+            printf "%s,%s,%s,%s,1,%s,%.3f,%.3f,%.3f,%d,%s\n", \
+                run, gate, stack, machine, val["rate"], \
+                val["p50_us"] / 1000, val["p99_us"] / 1000, \
+                val["p999_us"] / 1000, val["sent"] - val["recv"], \
+                val["loss_pct"]
+        }
+    }
+    ' "${log}"
 }

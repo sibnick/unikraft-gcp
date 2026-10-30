@@ -303,6 +303,115 @@ else
     bad "failed serial capture removes the temp file"
 fi
 
+# 8. C1 and C2 gate helpers and the wrk report verdict. The fixtures
+# mirror the marker contract of gcp_run_c1.sh and gcp_run_c2.sh. The
+# wrk fixtures carry CRLF endings, because the host parses raw GCP
+# serial logs. Ticket 4c76b4d84d a5874d85fe.
+mk http_srv_pass.log "GATE_HTTP_READY
+GATE_HTTP_FIRST_200"
+mk http_srv_nofirst.log "GATE_HTTP_READY"
+mk http_srv_fail.log "GATE_HTTP_READY
+GATE_FAIL: epoll_wait errno 5"
+mk http_cli_pass.log "WRK_BEGIN
+GATE_HTTP_BENCH_PASS requests_sec=12284.17
+WRK_END"
+mk http_cli_benchfail.log "GATE_HTTP_BENCH_PASS requests_sec=1
+GATE_HTTP_BENCH_FAIL: wrk reported socket errors"
+mk http_cli_quiet.log "boot noise only"
+
+if ukg_gate_http_pass "${WORK}/http_srv_pass.log" "${WORK}/http_cli_pass.log"; then
+    ok "http gate accepts both markers with no fail marker"
+else
+    bad "http gate accepts both markers with no fail marker"
+fi
+if ukg_gate_http_pass "${WORK}/http_srv_nofirst.log" "${WORK}/http_cli_pass.log"; then
+    bad "http gate vetoes a server without GATE_HTTP_FIRST_200"
+else
+    ok "http gate vetoes a server without GATE_HTTP_FIRST_200"
+fi
+if ukg_gate_http_pass "${WORK}/http_srv_pass.log" "${WORK}/http_cli_quiet.log"; then
+    bad "http gate vetoes a client without GATE_HTTP_BENCH_PASS"
+else
+    ok "http gate vetoes a client without GATE_HTTP_BENCH_PASS"
+fi
+if ukg_gate_http_pass "${WORK}/http_srv_fail.log" "${WORK}/http_cli_pass.log"; then
+    bad "http gate vetoes a GATE_FAIL in the server log"
+else
+    ok "http gate vetoes a GATE_FAIL in the server log"
+fi
+if ukg_gate_http_pass "${WORK}/http_srv_pass.log" "${WORK}/http_cli_benchfail.log"; then
+    bad "http gate vetoes a late GATE_HTTP_BENCH_FAIL"
+else
+    ok "http gate vetoes a late GATE_HTTP_BENCH_FAIL"
+fi
+
+mk hft_srv_pass.log "Listening on: 0.0.0.0:9000
+GATE_HFT_READY"
+mk hft_srv_quiet.log "boot noise only"
+mk hft_cli_pass.log "PROBE_BEGIN
+GATE_HFT_RTT_PASS probes=20000
+PROBE_END"
+mk hft_cli_fail.log "GATE_HFT_RTT_FAIL: measured run finished with packet loss"
+
+if ukg_gate_hft_pass "${WORK}/hft_srv_pass.log" "${WORK}/hft_cli_pass.log"; then
+    ok "hft gate accepts both markers with no fail marker"
+else
+    bad "hft gate accepts both markers with no fail marker"
+fi
+if ukg_gate_hft_pass "${WORK}/hft_srv_quiet.log" "${WORK}/hft_cli_pass.log"; then
+    bad "hft gate vetoes a server without GATE_HFT_READY"
+else
+    ok "hft gate vetoes a server without GATE_HFT_READY"
+fi
+if ukg_gate_hft_pass "${WORK}/hft_srv_pass.log" "${WORK}/hft_cli_fail.log"; then
+    bad "hft gate vetoes GATE_HFT_RTT_FAIL on the client"
+else
+    ok "hft gate vetoes GATE_HFT_RTT_FAIL on the client"
+fi
+if ukg_gate_hft_pass "${WORK}/http_srv_fail.log" "${WORK}/hft_cli_pass.log"; then
+    bad "hft gate vetoes a GATE_FAIL in the server log"
+else
+    ok "hft gate vetoes a GATE_FAIL in the server log"
+fi
+
+printf 'Running 10s test @ http://10.150.0.10/\r\n  2 threads and 50 connections\r\n  123456 requests in 10.05s, 18.63MB read\r\nRequests/sec:  12284.17\r\nTransfer/sec:      1.85MB\r\n' > "${WORK}/wrk_clean.log"
+printf 'Running 10s test @ http://10.150.0.10/\r\nRequests/sec:  12284.17\r\nSocket errors: connect 0, read 0, write 0, timeout 3\r\n' > "${WORK}/wrk_sockerr.log"
+printf 'Running 10s test @ http://10.150.0.10/\r\nNon-2xx responses: 12\r\nRequests/sec:  12284.17\r\n' > "${WORK}/wrk_non2xx.log"
+printf 'Running 10s test @ http://10.150.0.10/\r\nsocket: Connection refused\r\n' > "${WORK}/wrk_norps.log"
+printf 'Running 10s test @ http://10.150.0.10/\r\nRequests/sec:  0.00\r\n' > "${WORK}/wrk_zerorps.log"
+: > "${WORK}/wrk_empty.log"
+
+if ukg_wrk_ok "${WORK}/wrk_clean.log"; then
+    ok "wrk verdict accepts a clean CRLF serial report"
+else
+    bad "wrk verdict accepts a clean CRLF serial report"
+fi
+if ukg_wrk_ok "${WORK}/wrk_sockerr.log"; then
+    bad "wrk verdict vetoes socket errors"
+else
+    ok "wrk verdict vetoes socket errors"
+fi
+if ukg_wrk_ok "${WORK}/wrk_non2xx.log"; then
+    bad "wrk verdict vetoes non-2xx responses"
+else
+    ok "wrk verdict vetoes non-2xx responses"
+fi
+if ukg_wrk_ok "${WORK}/wrk_norps.log"; then
+    bad "wrk verdict vetoes a report without Requests/sec"
+else
+    ok "wrk verdict vetoes a report without Requests/sec"
+fi
+if ukg_wrk_ok "${WORK}/wrk_zerorps.log"; then
+    bad "wrk verdict vetoes zero requests per second"
+else
+    ok "wrk verdict vetoes zero requests per second"
+fi
+if ukg_wrk_ok "${WORK}/wrk_empty.log"; then
+    bad "wrk verdict vetoes an empty report"
+else
+    ok "wrk verdict vetoes an empty report"
+fi
+
 echo ""
 echo "test_gate_logic: ${PASS_COUNT} passed, ${FAIL_COUNT} failed"
 [ "${FAIL_COUNT}" -eq 0 ]

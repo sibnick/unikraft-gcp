@@ -13,6 +13,10 @@ build: prepare test-host
 	@$(MAKE) -C samples/helloworld -j$$(nproc)
 	@$(MAKE) -C samples/networkload defconfig
 	@$(MAKE) -C samples/networkload -j$$(nproc)
+	@$(MAKE) -C samples/httpreply defconfig
+	@$(MAKE) -C samples/httpreply -j$$(nproc)
+	@$(MAKE) -C samples/low-latency-hft defconfig
+	@$(MAKE) -C samples/low-latency-hft -j$$(nproc)
 
 test-host:
 	@cc -Wall -Wextra -Werror -std=c11 -Idrivers/gve/include tests/test_gve.c -o /tmp/test_gve
@@ -20,6 +24,7 @@ test-host:
 	@rm -f /tmp/test_gve
 	@bash tests/test_evidence_store.sh
 	@bash tests/test_gate_logic.sh
+	@bash tests/test_ab_report.sh
 
 lint:
 	@# Run from scripts/ so ShellCheck resolves the source= directives.
@@ -37,6 +42,11 @@ clean:
 	@rm -rf samples/helloworld/build
 	@$(MAKE) -C samples/networkload clean
 	@rm -rf samples/networkload/build
+	@$(MAKE) -C samples/httpreply clean
+	@rm -rf samples/httpreply/build
+	@$(MAKE) -C samples/low-latency-hft clean
+	@rm -rf samples/low-latency-hft/build
+	@rm -rf samples/low-latency-hft/bin
 
 teardown:
 	@# The run id is mandatory. A teardown with no run id deletes
