@@ -117,6 +117,45 @@ else
     ok "net gate vetoes a fail marker"
 fi
 
+# 3b. RSS gate helper. The server pass marker must carry the exact
+# pair count the run requested, the client must show lossless flow
+# traffic, and a fail marker in either log vetoes. Ticket a9b1936640.
+mk srv_rss_pass.log "GATE_RSS_PASS queues=2 perq=300,276 total=576"
+mk cli_rss_pass.log "GATE_RSS_TRAFFIC sent=576 echoed=576"
+mk srv_rss_imb.log "GATE_FAIL: rss steering incomplete total=576 expected=576 perq=576,0"
+mk srv_rss_fail.log "GATE_RSS_PASS queues=2 perq=300,276 total=576
+GATE_FAIL: doorbell index out of range"
+if ukg_gate_rss_pass "${WORK}/srv_rss_pass.log" "${WORK}/cli_rss_pass.log" 2; then
+    ok "rss gate accepts matched pair count and traffic"
+else
+    bad "rss gate accepts matched pair count and traffic"
+fi
+if ukg_gate_rss_pass "${WORK}/srv_rss_pass.log" "${WORK}/cli_rss_pass.log" 4; then
+    bad "rss gate vetoes a pair-count mismatch"
+else
+    ok "rss gate vetoes a pair-count mismatch"
+fi
+if ukg_gate_rss_pass "${WORK}/srv_rss_imb.log" "${WORK}/cli_rss_pass.log" 2; then
+    bad "rss gate vetoes the server imbalance fail marker"
+else
+    ok "rss gate vetoes the server imbalance fail marker"
+fi
+if ukg_gate_rss_pass "${WORK}/srv_rss_fail.log" "${WORK}/cli_rss_pass.log" 2; then
+    bad "rss gate vetoes a fail marker after a pass marker"
+else
+    ok "rss gate vetoes a fail marker after a pass marker"
+fi
+if ukg_gate_rss_pass "${WORK}/srv_quiet.log" "${WORK}/cli_rss_pass.log" 2; then
+    bad "rss gate vetoes a missing server pass marker"
+else
+    ok "rss gate vetoes a missing server pass marker"
+fi
+if ukg_gate_rss_pass "${WORK}/srv_rss_pass.log" "${WORK}/cli_fail.log" 2; then
+    bad "rss gate vetoes a client fail without traffic marker"
+else
+    ok "rss gate vetoes a client fail without traffic marker"
+fi
+
 # 4. Run-scoped delete filter. The filter must carry the run label
 # branch and keep the anchored name branch. Ticket 3a59523e76.
 FILTER="$(ukg_run_delete_filter "ukg-x")"

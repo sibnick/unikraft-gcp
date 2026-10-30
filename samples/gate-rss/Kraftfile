@@ -1,0 +1,6 @@
+spec: v0.6
+name: gate-rss
+targets:
+  - name: gcp-x86_64
+    architecture: x86_64
+    platform: kvm

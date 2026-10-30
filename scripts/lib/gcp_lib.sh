@@ -391,6 +391,28 @@ ukg_gate_hft_pass() {
     return 0
 }
 
+# Authoritative pair gate check: gve multi-queue RSS steering. Passes
+# only when the server log shows every RX queue carried traffic for
+# the requested pair count (GATE_RSS_PASS queues=<N>), the client log
+# shows a lossless flow run (GATE_RSS_TRAFFIC), and neither log shows
+# a failure marker. Ticket a9b1936640.
+# Arg $1: server log path. Arg $2: client log path. Arg $3: queue
+# pairs the run requested. Returns 0 on pass.
+ukg_gate_rss_pass() {
+    local srv_log="$1"
+    local cli_log="$2"
+    local queues="$3"
+    grep -q "GATE_RSS_PASS queues=${queues} " "${srv_log}" 2>/dev/null || return 1
+    grep -q "GATE_RSS_TRAFFIC" "${cli_log}" 2>/dev/null || return 1
+    if grep -q "GATE_FAIL" "${cli_log}" 2>/dev/null; then
+        return 1
+    fi
+    if grep -q "GATE_FAIL" "${srv_log}" 2>/dev/null; then
+        return 1
+    fi
+    return 0
+}
+
 # Decide the wrk verdict from one wrk report file. Returns 0 (pass) only
 # when Requests/sec is a number above zero and the report shows no
 # socket errors and no non-2xx responses. A wrk run that finished but
