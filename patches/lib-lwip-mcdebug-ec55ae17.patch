@@ -1,0 +1,68 @@
+From: nikolay <nikolay@localhost>
+Subject: [PATCH] lib-lwip: add 0017 pbuf underflow forensics (temporary)
+
+Add numbered patch 0017 to the lib-lwip patch set. It instruments
+pbuf_free: on a ref==0 pbuf it prints core id, pbuf words, and the
+caller via uk_pr_crit, then the existing assert fires. Used to catch
+the double free that fails the MC cloud gate. Remove after the root
+cause fix. [Ticket 3dc1f3f6b6]
+
+--- /dev/null
++++ b/patches/0017-mc-debug-pbuf-underflow.patch
+@@ -0,0 +1,56 @@
++From: nikolay <nikolay@localhost>
++Subject: [PATCH 0017] pbuf_free: report the double-free candidate before the assert
++
++The multi-core gate on GCP crashes three idle worker cores at
++pbuf.c:753 (pbuf_free: p->ref > 0). The crash dump shows only
++registers, so the owner cannot tell which pbuf or which caller under-
++flowed the reference. On a ref==0 pbuf, print the core id, the pbuf
++address and raw words, and the caller return address first. Then the
++assert still fires and the crash guard keeps one dump. Decode the
++return address with addr2line. Temporary debug; remove after the root
++cause is fixed. [Ticket 3dc1f3f6b6]
++
++--- a/src/core/pbuf.c
+++++ b/src/core/pbuf.c
++@@ -86,6 +86,29 @@
++ 
++ #include <string.h>
++ 
+++#if defined(__Unikraft__)
+++#define MC_PBUF_DEBUG 1
+++#endif
+++
+++#ifdef MC_PBUF_DEBUG
+++#include "lwip_percore.h"
+++
+++/* Underflow forensics [Ticket 3dc1f3f6b6]. A ref==0 pbuf at entry
+++ * means double free. Print the owner core, the pbuf words, and the
+++ * caller before the assert stops the core.
+++ */
+++static void
+++mc_pbuf_underflow_report(const struct pbuf *p)
+++{
+++  const unsigned long *w = (const unsigned long *)p;
+++  uk_pr_crit("MCDBG ref0 core=%u p=%p w0=%lx w1=%lx w2=%lx w3=%lx w4=%lx w5=%lx w6=%lx w7=%lx ra0=%p ra1=%p\n",
+++             lwip_current_core_id(), (const void *)p,
+++             w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7],
+++             __builtin_return_address(0),
+++             __builtin_return_address(1));
+++}
+++#endif /* MC_PBUF_DEBUG */
+++
++ #define SIZEOF_STRUCT_PBUF        LWIP_MEM_ALIGN_SIZE(sizeof(struct pbuf))
++ /* Since the pool is created in memp, PBUF_POOL_BUFSIZE will be automatically
++    aligned there. Therefore, PBUF_POOL_BUFSIZE_ALIGNED can be used here. */
++@@ -745,6 +768,11 @@
++   while (p != NULL) {
++     LWIP_PBUF_REF_T ref;
++     SYS_ARCH_DECL_PROTECT(old_level);
+++#ifdef MC_PBUF_DEBUG
+++    /* all pbufs in a chain are referenced at least once */
+++    if (p->ref == 0)
+++      mc_pbuf_underflow_report(p);
+++#endif
++     /* Since decrementing ref cannot be guaranteed to be a single machine operation
++      * we must protect it. We put the new ref into a local variable to prevent
++      * further protection. */
