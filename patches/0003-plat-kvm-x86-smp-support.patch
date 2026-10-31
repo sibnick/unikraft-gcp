@@ -1,5 +1,34 @@
+diff --git a/drivers/firmware/ukacpi/acpi.c b/drivers/firmware/ukacpi/acpi.c
+index 1623228..5ae6dcf 100644
+--- a/drivers/firmware/ukacpi/acpi.c
++++ b/drivers/firmware/ukacpi/acpi.c
+@@ -249,7 +249,23 @@ int uk_acpi_init(void)
+ #if CONFIG_LIBUKBOOT
+ static int boot_acpi_init(struct ukplat_bootinfo *bi __unused)
+ {
+-	return uk_acpi_init();
++	int rc;
++
++	rc = uk_acpi_init();
++	if (unlikely(rc == -ENOENT)) {
++		/*
++		 * UEFI boot loaders (for example GRUB in EFI mode) do not
++		 * publish the legacy ACPI RSDP. Boot without ACPI tables
++		 * instead of failing the early init call. The x86_64 CPU
++		 * id map has an identity fallback for this case.
++		 * [Ticket 3dc1f3f6b6]
++		 */
++		uk_pr_warn("No ACPI RSDP present: booting without ACPI tables\n");
++
++		return 0;
++	}
++
++	return rc;
+ }
+ 
+ UK_BOOT_EARLYTAB_ENTRY(boot_acpi_init, UK_ACPI_INIT_PRIO);
 diff --git a/drivers/firmware/ukacpi/arch/x86_64/madt.c b/drivers/firmware/ukacpi/arch/x86_64/madt.c
-index 4883a75..e392e1c 100644
+index 4883a75..2ca8ac2 100644
 --- a/drivers/firmware/ukacpi/arch/x86_64/madt.c
 +++ b/drivers/firmware/ukacpi/arch/x86_64/madt.c
 @@ -10,6 +10,7 @@
@@ -23,7 +52,32 @@ index 4883a75..e392e1c 100644
  	union {
  		struct uk_acpi_madt_x2apic *x2apic;
  		struct uk_acpi_madt_lapic *lapic;
-@@ -80,7 +85,7 @@ int uk_acpi_madt_fill_cpu_idmap(void)
+@@ -38,7 +43,23 @@ int uk_acpi_madt_fill_cpu_idmap(void)
+ 
+ 	/* Enumerate all other CPUs */
+ 	madt = uk_acpi_get_madt();
+-	UK_ASSERT(madt);
++	if (unlikely(!madt)) {
++		/*
++		 * UEFI boot loaders (for example GRUB in EFI mode) do not
++		 * publish the legacy ACPI RSDP. Without a RSDP there is no
++		 * MADT. On KVM-style hypervisors the local APIC IDs are
++		 * 0..N-1, so fall back to an identity CPU id map.
++		 * [Ticket 3dc1f3f6b6]
++		 */
++		uk_pr_warn("No MADT present: using identity CPU id map\n");
++
++		for (idx = 1; idx < CONFIG_UKPLAT_CPU_MAXCOUNT; idx++) {
++			uk_pcpuvar_lval(idx, uk_pcpuvar_cpu_id) = idx;
++			uk_pcpuvar_lval(idx, uk_pcpuvar_cpu_idx) = idx;
++		}
++
++		return 0;
++	}
+ 
+ 	len = madt->hdr.tab_len - sizeof(*madt);
+ 	idx = 1;
+@@ -80,7 +101,7 @@ int uk_acpi_madt_fill_cpu_idmap(void)
  
  		/* Ignore cores that exceed max configured value */
  		if (unlikely(idx == CONFIG_UKPLAT_CPU_MAXCOUNT)) {
