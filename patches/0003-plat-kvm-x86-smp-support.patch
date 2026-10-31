@@ -1097,6 +1097,113 @@ index 8e78944..591ae7b 100644
  #ifdef __cplusplus
  }
  #endif
+diff --git a/lib/ukconsole/console.c b/lib/ukconsole/console.c
+index 9c06197..743e6c0 100644
+--- a/lib/ukconsole/console.c
++++ b/lib/ukconsole/console.c
+@@ -6,6 +6,7 @@
+ 
+ #include <uk/essentials.h>
+ #include <uk/arch/types.h>
++#include <uk/arch/spinlock.h>
+ #include <uk/list.h>
+ #include <uk/console.h>
+ #include <uk/console/driver.h>
+@@ -39,6 +40,18 @@ __u16 uk_console_count(void)
+ 	return uk_console_device_count;
+ }
+ 
++/*
++ * Serializes the two console write paths: app printf reaches here through
++ * devfs, and kernel uk_printk reaches it through libukprint. On an SMP
++ * guest the cores write COM1 at the same time. Without this lock the
++ * messages interleave byte for byte, and the run scripts cannot read
++ * their gate markers or a crash dump. [Ticket 3dc1f3f6b6]
++ *
++ * Caveat: uk_printk from an interrupt handler on a core that already
++ * holds this lock deadlocks. Handlers must not print.
++ */
++static __spinlock uk_console_out_lock = UKARCH_SPINLOCK_INITIALIZER();
++
+ __ssz uk_console_out(const char *buf, __sz len)
+ {
+ 	struct uk_console *dev = __NULL;
+@@ -49,12 +62,16 @@ __ssz uk_console_out(const char *buf, __sz len)
+ 	if (unlikely(!buf))
+ 		return -EINVAL;
+ 
++	ukarch_spin_lock(&uk_console_out_lock);
++
+ 	/* Output to all STDOUT devices */
+ 	uk_list_for_each_entry(dev, &uk_console_device_list, _list) {
+ 		if ((dev->flags & UK_CONSOLE_FLAG_STDOUT) && dev->ops->out)
+ 			uk_console_out_direct(dev, buf, len);
+ 	}
+ 
++	ukarch_spin_unlock(&uk_console_out_lock);
++
+ 	return len;
+ }
+ 
+diff --git a/lib/ukdebug/crash.c b/lib/ukdebug/crash.c
+index 39757f3..2ea8c0d 100644
+--- a/lib/ukdebug/crash.c
++++ b/lib/ukdebug/crash.c
+@@ -9,6 +9,7 @@
+ #include <stddef.h>
+ 
+ #include <uk/config.h>
++#include <uk/atomic.h>
+ #include <uk/crash.h>
+ #include <uk/essentials.h>
+ #include <uk/event.h>
+@@ -86,10 +87,10 @@ __noreturn void _uk_crash(struct uk_lcpu_regs *regs,
+ 			  struct uk_crash_descr *descr)
+ {
+ 	struct uk_crash_event_param param;
+-#if HAVE_SMP
++#if CONFIG_HAVE_SMP
+ 	static __s32 crash_cpu = -1;
+ 	int cpu_id = uk_pcpuvar_current_get(uk_pcpuvar_cpu_id);
+-#endif /* HAVE_SMP */
++#endif /* CONFIG_HAVE_SMP */
+ 
+ 	UK_ASSERT(regs);
+ 	UK_ASSERT(descr);
+@@ -98,18 +99,27 @@ __noreturn void _uk_crash(struct uk_lcpu_regs *regs,
+ 	uk_preempt_disable();
+ 	uk_lcpu_except_push_nested();
+ 
+-#if HAVE_SMP
+-	#warning The crash code does not support multicore systems
+-
+-	/* Only let one CPU perform the crash */
+-	if (ukarch_compare_exchange_sync(&crash_cpu, -1, cpu_id) != cpu_id) {
++#if CONFIG_HAVE_SMP
++	/* Upstream guards this block with `#if HAVE_SMP`. Nothing defines
++	 * HAVE_SMP, so on an SMP build the guard was dead code: every
++	 * crashing core printed a full dump and the dumps interleaved
++	 * byte-for-byte on COM1, destroying the crash evidence. Use the
++	 * real Kconfig symbol so one core dumps and the others halt.
++	 * [Ticket 3dc1f3f6b6]
++	 */
++
++	/* Only let one CPU perform the crash. The upstream call name
++	 * (ukarch_compare_exchange_sync) predates 0.21; the symbol in
++	 * this release is uk_compare_exchange_sync. [Ticket 3dc1f3f6b6]
++	 */
++	if (uk_compare_exchange_sync(&crash_cpu, -1, cpu_id) != cpu_id) {
+ 		/* TODO: Finish SMP Support
+ 		 * Freeze CPU or wait until the crash_cpu initiates a freeze
+ 		 * (e.g., through IPI). For now, just busy wait.
+ 		 */
+ 		uk_lcpu_halt();
+ 	}
+-#endif /* HAVE_SMP */
++#endif /* CONFIG_HAVE_SMP */
+ 
+ #if CONFIG_LIBUKDEBUG_CRASH_SCREEN
+ 	crash_printk("Unikraft Crash - " STRINGIFY(UK_CODENAME)
 diff --git a/lib/ukintctlr/exportsyms.uk b/lib/ukintctlr/exportsyms.uk
 index 4aea478..741ef72 100644
 --- a/lib/ukintctlr/exportsyms.uk
