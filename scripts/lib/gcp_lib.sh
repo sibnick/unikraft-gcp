@@ -122,15 +122,31 @@ ukg_gcs_rm_ok() {
 # Arg $1: instance name. Arg $2: log path. Returns the gcloud status.
 ukg_serial_capture() {
     local inst="$1" log="$2"
-    local tmp="${log}.new"
+    local tmp="${log}.new" err="${log}.err"
     if gcloud compute instances get-serial-port-output "${inst}" \
         --zone="${GCP_ZONE}" --project="${GCP_PROJECT}" \
-        >"${tmp}" 2>&1; then
-        mv -f "${tmp}" "${log}"
+        >"${tmp}" 2>"${err}"; then
+        # Drop NUL bytes. A multi-core guest interleaves core writes
+        # on COM1 and can emit NUL bytes. With NULs present, grep treats
+        # the log as binary and drops its -o output. Run MC evidence,
+        # ticket 3dc1f3f6b6.
+        if tr -d '\0' <"${tmp}" >"${tmp}.san"; then
+            mv -f "${tmp}.san" "${log}"
+        else
+            mv -f "${tmp}" "${log}"
+        fi
+        rm -f "${err}"
         return 0
     fi
-    rm -f "${tmp}"
-    echo "[WARN] Serial capture failed for ${inst}. Keeping the previous log." >&2
+    # Keep the gcloud reason visible. The MC run lost every client
+    # capture with no clue because stderr was deleted with the
+    # temporary file.
+    local reason=""
+    if [ -s "${err}" ]; then
+        reason="$(grep -m1 . "${err}" 2>/dev/null || true)"
+    fi
+    rm -f "${tmp}" "${err}"
+    echo "[WARN] Serial capture failed for ${inst}: ${reason:-gcloud error}. Keeping the previous log." >&2
     return 1
 }
 

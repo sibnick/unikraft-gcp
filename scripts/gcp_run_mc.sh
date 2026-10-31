@@ -161,14 +161,25 @@ wrk -t@@THREADS@@ -c@@CONNS@@ -d@@DURATION@@s --latency "http://${TARGET}:${PORT
 echo "WRK_END"
 RPS=$(awk '/Requests\/sec:/ { v=$2 } END { print v }' /tmp/wrk-report.txt)
 if ! printf '%s' "${RPS}" | grep -Eq '^[0-9]+(\.[0-9]+)?$'; then
-    echo "GATE_HTTP_BENCH_FAIL: no Requests/sec value in the wrk report"
+    MARK="GATE_HTTP_BENCH_FAIL: no Requests/sec value in the wrk report"
 elif grep -E 'Socket errors:' /tmp/wrk-report.txt | grep -q '[1-9]'; then
-    echo "GATE_HTTP_BENCH_FAIL: wrk reported socket errors"
+    MARK="GATE_HTTP_BENCH_FAIL: wrk reported socket errors"
 elif grep -q 'Non-2xx responses:' /tmp/wrk-report.txt; then
-    echo "GATE_HTTP_BENCH_FAIL: wrk reported non-2xx responses"
+    MARK="GATE_HTTP_BENCH_FAIL: wrk reported non-2xx responses"
 else
-    echo "GATE_HTTP_BENCH_PASS requests_sec=${RPS}"
+    MARK="GATE_HTTP_BENCH_PASS requests_sec=${RPS}"
 fi
+echo "${MARK}"
+# Stay alive and reprint the verdict. The runner polls this serial
+# console, and get-serial-port-output starts failing once the instance
+# is stopped: run ukg-1031-012052-508809 lost every capture after the
+# client powered off. Reprinting also covers a serial buffer that only
+# propagates late. The run teardown deletes this VM, same session.
+# Ticket 3dc1f3f6b6.
+for i in $(seq 1 36); do
+    sleep 5
+    echo "MCCLIENT alive=${i} ${MARK}"
+done
 poweroff
 CLI_EOF
 sed -i \
@@ -303,39 +314,49 @@ echo "[INFO] Polling serial console output for the multi-core gate markers..."
 ukg_mc_verdict() {
     local c seen hb
 
+    # All greps carry -a. Cross-core COM1 writes can leave NUL bytes
+    # in the server log. Without -a, grep drops the -o output for a
+    # binary file, and the run reports a false FAIL. Run
+    # ukg-1031-012052-508809, ticket 3dc1f3f6b6.
+
     # All workers online: the app counts schedulers, not config slots.
-    grep -q "detected ${VCPUS} worker cores" "${SRV_LOG}" 2>/dev/null || return 1
+    grep -aq "detected ${VCPUS} worker cores" "${SRV_LOG}" 2>/dev/null || return 1
 
     # No allocator self-test failure on any core.
-    if grep -q "alloc self-test failed" "${SRV_LOG}" 2>/dev/null; then
+    if grep -aq "alloc self-test failed" "${SRV_LOG}" 2>/dev/null; then
         return 1
     fi
-    if grep -q "GATE_FAIL" "${SRV_LOG}" 2>/dev/null; then
+    if grep -aq "GATE_FAIL" "${SRV_LOG}" 2>/dev/null; then
+        return 1
+    fi
+    # A crash dump on any core fails the gate: the run must complete
+    # the sweep without a Unikraft crash.
+    if grep -aq "Unikraft Crash" "${SRV_LOG}" 2>/dev/null; then
         return 1
     fi
 
     # Every core 0..VCPUS-1 printed at least one heartbeat line.
     for c in $(seq 0 $((VCPUS - 1))); do
-        grep -Eq "core ${c} heartbeat" "${SRV_LOG}" 2>/dev/null || return 1
+        grep -Eaq "core ${c} heartbeat" "${SRV_LOG}" 2>/dev/null || return 1
     done
 
     # SMP proof: count distinct cores with a heartbeat.
-    seen="$(grep -Eo 'core [0-9]+ heartbeat' "${SRV_LOG}" 2>/dev/null \
+    seen="$(grep -aEo 'core [0-9]+ heartbeat' "${SRV_LOG}" 2>/dev/null \
         | sort -u | wc -l)"
     [ "${seen}" -ge "${VCPUS}" ] || return 1
 
     # The load must actually have been served by the multi-core
     # stack: a heartbeat with a nonzero request count.
-    hb="$(grep -Eo 'req=[0-9]+' "${SRV_LOG}" 2>/dev/null \
+    hb="$(grep -aEo 'req=[0-9]+' "${SRV_LOG}" 2>/dev/null \
         | grep -Ev 'req=0\b' | head -1)"
     [ -n "${hb}" ] || return 1
 
     # Client verdict.
-    grep -q "GATE_HTTP_BENCH_PASS" "${CLI_LOG}" 2>/dev/null || return 1
-    if grep -q "GATE_FAIL" "${CLI_LOG}" 2>/dev/null; then
+    grep -aq "GATE_HTTP_BENCH_PASS" "${CLI_LOG}" 2>/dev/null || return 1
+    if grep -aq "GATE_FAIL" "${CLI_LOG}" 2>/dev/null; then
         return 1
     fi
-    if grep -q "GATE_HTTP_BENCH_FAIL" "${CLI_LOG}" 2>/dev/null; then
+    if grep -aq "GATE_HTTP_BENCH_FAIL" "${CLI_LOG}" 2>/dev/null; then
         return 1
     fi
     ukg_wrk_ok "${CLI_LOG}" || return 1
@@ -360,9 +381,9 @@ for i in $(seq 1 100); do
         break
     fi
 
-    # A client FAIL marker is final: the client prints it and powers
-    # off. Stop the poll early so the run reports fast on failure.
-    if grep -q "GATE_HTTP_BENCH_FAIL" "${CLI_LOG}" 2>/dev/null; then
+    # A client FAIL marker is final: the client prints it and idles.
+    # Stop the poll early so the run reports fast on failure.
+    if grep -aq "GATE_HTTP_BENCH_FAIL" "${CLI_LOG}" 2>/dev/null; then
         echo ""
         echo "[WARN] Client reported GATE_HTTP_BENCH_FAIL. Stopping the poll."
         break
