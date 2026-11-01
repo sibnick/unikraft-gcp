@@ -160,14 +160,53 @@ echo "WRK_BEGIN"
 wrk -t@@THREADS@@ -c@@CONNS@@ -d@@DURATION@@s --latency "http://${TARGET}:${PORT}/" 2>&1 | tee /tmp/wrk-report.txt
 echo "WRK_END"
 RPS=$(awk '/Requests\/sec:/ { v=$2 } END { print v }' /tmp/wrk-report.txt)
-if ! printf '%s' "${RPS}" | grep -Eq '^[0-9]+(\.[0-9]+)?$'; then
-    MARK="GATE_HTTP_BENCH_FAIL: no Requests/sec value in the wrk report"
-elif grep -E 'Socket errors:' /tmp/wrk-report.txt | grep -q '[1-9]'; then
-    MARK="GATE_HTTP_BENCH_FAIL: wrk reported socket errors"
-elif grep -q 'Non-2xx responses:' /tmp/wrk-report.txt; then
-    MARK="GATE_HTTP_BENCH_FAIL: wrk reported non-2xx responses"
-else
+# Socket-error policy [Ticket 3dc1f3f6b6]. wrk counts a COMPLETED request
+# as a "timeout" when its latency exceeds wrk's 2000 ms histogram window
+# (SOCKET_TIMEOUT_MS default in wrk.c): an isolated packet loss that TCP
+# recovered by retransmission lands there. run ukg-1101-011940-615720: 9
+# of 1050064 requests, valid responses, connect/read/write all zero.
+# Policy: connect, read, or write errors always fail. A timeout-only
+# count up to 0.01 percent of completed requests warns but passes.
+VERDICT=$(tr -d '\r' < /tmp/wrk-report.txt | awk '
+    /requests in/      { total = $1 }
+    /Requests\/sec:/   { rps = $2 }
+    /Socket errors:/   { c = $4; r = $6; w = $8; t = $10
+                         gsub(/,/, "", c); gsub(/,/, "", r)
+                         gsub(/,/, "", w); gsub(/,/, "", t) }
+    /Non-2xx/          { n = $1 }
+    END {
+        if (rps == "" || rps + 0 <= 0)
+            { print "FAIL no Requests/sec value in the wrk report"; exit }
+        if (c + 0 > 0 || r + 0 > 0 || w + 0 > 0)
+            { print "FAIL wrk connect/read/write errors " c "/" r "/" w; exit }
+        if (n + 0 > 0)
+            { print "FAIL wrk reported non-2xx responses " n; exit }
+        if (t + 0 > 0) {
+            pct = (total + 0 > 0) ? t * 100.0 / total : 100
+            if (pct > 0.01)
+                { print "FAIL wrk slow-completed rate " sprintf("%.4f", pct) "% (" t " of " total ")"; exit }
+            printf "WARN completed-slow %s of %s over 2s (%s%%, RTO recovery)\n", t, total, sprintf("%.4f", pct)
+            print "PASS rps=" rps " slow=" t
+            exit
+        }
+        print "PASS rps=" rps
+    }')
+case "${VERDICT}" in
+    WARN*)
+        echo "${VERDICT%%$'\n'*}" | sed 's/^WARN/GATE_HTTP_BENCH_WARN/'
+        PASS_LINE="${VERDICT##*$'\n'}"
+        ;;
+    PASS*)
+        PASS_LINE="${VERDICT}"
+        ;;
+    *)
+        PASS_LINE=""
+        ;;
+esac
+if [ -n "${PASS_LINE}" ]; then
     MARK="GATE_HTTP_BENCH_PASS requests_sec=${RPS}"
+else
+    MARK="GATE_HTTP_BENCH_${VERDICT/FAIL/FAIL:}"
 fi
 echo "${MARK}"
 # Stay alive and reprint the verdict. The runner polls this serial

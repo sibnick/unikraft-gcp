@@ -439,20 +439,30 @@ ukg_gate_rss_pass() {
 # Ticket 4c76b4d84d.
 ukg_wrk_ok() {
     local rep="$1"
-    local rps
     [ -s "${rep}" ] || return 1
-    rps="$(tr -d '\r' <"${rep}" | awk '/Requests\/sec:/ { v=$2 } END { print v }')"
-    case "${rps}" in
-        ''|*[!0-9.]*) return 1 ;;
-    esac
-    awk -v r="${rps}" 'BEGIN { exit !(r > 0) }' || return 1
-    if tr -d '\r' <"${rep}" | grep -qE "Socket errors:.*[1-9]"; then
-        return 1
-    fi
-    if tr -d '\r' <"${rep}" | grep -qE "Non-2xx responses:"; then
-        return 1
-    fi
-    return 0
+    # Same socket-error policy as the MC client verdict, run
+    # ukg-1101-011940-615720 [Ticket 3dc1f3f6b6]: connect, read, or
+    # write errors fail; non-2xx fails; a timeout-only count is wrk
+    # reporting COMPLETED requests over its 2000 ms histogram window
+    # (RTO recoveries). Those pass up to 0.01 percent of completed
+    # requests.
+    tr -d '\r' <"${rep}" | awk '
+        /requests in/      { total = $1 }
+        /Requests\/sec:/   { rps = $2 }
+        /Socket errors:/   { c = $4; r = $6; w = $8; t = $10
+                             gsub(/,/, "", c); gsub(/,/, "", r)
+                             gsub(/,/, "", w); gsub(/,/, "", t) }
+        /Non-2xx/          { n = $1 }
+        END {
+            if (rps == "" || rps + 0 <= 0) exit 1
+            if (c + 0 > 0 || r + 0 > 0 || w + 0 > 0) exit 1
+            if (n + 0 > 0) exit 1
+            if (t + 0 > 0) {
+                pct = (total + 0 > 0) ? t * 100.0 / total : 100
+                if (pct > 0.01) exit 1
+            }
+            exit 0
+        }'
 }
 
 # Parse one combined C1/C2 serial log into a single CSV data row
