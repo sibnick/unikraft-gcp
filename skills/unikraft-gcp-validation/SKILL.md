@@ -42,6 +42,9 @@ teardown audit is empty.
    `gcp_teardown.sh <run-id>`.
 5. Never embed project ids, buckets, or images in git history. Read
    them from environment or a local untracked `.env`.
+6. Run one cloud gate at a time across all ticket checkouts. Billable
+   resources live in one project. Wait for the previous run to tear
+   down before launching the next one.
 
 ## 3. Evidence Contract
 
@@ -74,6 +77,10 @@ command instead. Ticket c16353731a.
    `samples/networkload` app plus the pinned `lib-lwip`.
 4. Keep driver or platform patches as separate commits. Each patch
    links one gate.
+5. Pin fetched libraries by commit hash or by a stored archive, never
+   by a floating branch. A branch tip can move and break the patch
+   set without warning. The lib-lwip fork is fetched by branch url;
+   keep the build-time zip and its hash.
 
 ## 5. Phase Order
 

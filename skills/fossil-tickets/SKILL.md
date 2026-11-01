@@ -127,3 +127,24 @@ fossil ticket change <10-char-UUID> \
 
 Completed in check-in [<commit-hash>] on feature/phase4-dma. All unit tests pass."
 ```
+
+### D. Claiming And Releasing (Parallel Work)
+
+The ticket schema has no owner field. Use comment markers so parallel
+agents can see who works on what. Claim before work starts:
+
+```bash
+fossil ticket change <10-char-UUID> \
+  +comment "\n\n[claim] <agent> started <UTC date> on feature/<name>"
+```
+
+Release when work pauses. Record the branch head so another agent can
+resume:
+
+```bash
+fossil ticket change <10-char-UUID> \
+  +comment "\n\n[unclaim] <agent> paused at check-in [<hash>]"
+```
+
+Closing the ticket replaces the claim as the final state. See
+AGENTS.md section 4E.

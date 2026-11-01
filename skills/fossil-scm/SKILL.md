@@ -95,6 +95,23 @@ Avoid these common mistakes made by AI agents:
 - In Fossil, `fossil add` is ONLY for new untracked files.
 - `fossil commit` automatically includes all modified tracked files.
 
+### Trap 5: Branch switches destroy build state
+
+The sample `build/` trees are untracked but huge. A `fossil update` to
+another branch changes sources under them and forces a full rebuild.
+For parallel ticket work, open one checkout per ticket instead:
+
+```bash
+mkdir -p ~/projects/work/<ticket-id>
+cd ~/projects/work/<ticket-id>
+fossil open ~/projects/unikraft-gcp/Unikraft-GCP.fossil
+fossil update feature/<name>
+```
+
+Each checkout has its own `.fslckout`. Never delete one from another
+checkout. Autosync runs everywhere, so every checkout sees every
+branch as soon as it is pushed. See AGENTS.md section 4E.
+
 ---
 
 ## 4. Standard End-to-End Task Lifecycle Recipe

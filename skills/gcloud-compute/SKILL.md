@@ -84,6 +84,16 @@ gcloud compute images list --project "${GCP_PROJECT}" --no-standard-images
 Every list must be empty. A non-empty list means the run is not
 finished.
 
+When more than one run can be live, first narrow the audit to your
+own label, then judge the rest by hand:
+
+```bash
+gcloud compute instances list --filter 'labels.run=<run-id>'
+```
+
+Never delete `ukg-` resources that carry a foreign `run` label.
+Another session owns them. Stop and ask the owner.
+
 ## 6. Troubleshooting Table
 
 | Symptom | Likely cause | Action |

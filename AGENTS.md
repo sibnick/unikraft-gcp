@@ -124,6 +124,42 @@ fossil commit -m "feat(image): add GRUB serial boot recipe [Ticket 4395182d17]"
 > the mirror, and fixes the mirror index. Follow
 > `skills/fossil-git-sync/SKILL.md` for the full procedure.
 
+### E. Parallel Ticket Work
+
+One ticket, one branch, one checkout directory. Do not switch one
+checkout between tickets. The sample build trees are large. A branch
+switch forces a full rebuild.
+
+1. **Claim first.** The ticket schema has no owner field. Append a
+   claim marker to the ticket before work starts:
+
+   ```bash
+   fossil ticket change <UUID> +comment "\n\n[claim] <agent> started <UTC date> on feature/<name>"
+   ```
+
+2. **Open a per-ticket checkout.** Keep the main checkout on its own
+   ticket. Work other tickets in `../work/<ticket-id>` beside it:
+
+   ```bash
+   mkdir -p ~/projects/work/<ticket-id>
+   cd ~/projects/work/<ticket-id>
+   fossil open ~/projects/unikraft-gcp/Unikraft-GCP.fossil
+   fossil update feature/<name>
+   ```
+
+   Each checkout builds in its own directory. Parallel tickets never
+   rebuild each other's objects. Autosync keeps every checkout
+   current through the shared database.
+3. **One cloud run at a time.** Cloud runs are serial across all
+   checkouts and sessions. Owner approval covers one run, not a
+   batch.
+4. **Merge one branch at a time.** Merge only branches whose gate
+   passed with stored evidence. From the main checkout: update trunk,
+   merge, and commit. Then run `scripts/git_export.sh`.
+5. **Release or close.** Close the ticket when the gate passed. If
+   work pauses, append an `[unclaim]` comment with the branch head
+   hash so another agent can resume.
+
 ---
 
 ## 5. Google Cloud Rules
@@ -137,6 +173,9 @@ fossil commit -m "feat(image): add GRUB serial boot recipe [Ticket 4395182d17]"
 4. Open firewall rules only for internal ranges during a run.
 5. Never store project ids, buckets, or image names in tracked files.
    Use environment variables or an untracked `.env`.
+6. Work on one cloud run at a time. During the leak audit, do not
+   delete `ukg-` resources that carry another `run` label. Another
+   session may own them. Stop and check before deleting.
 
 ---
 
@@ -177,7 +216,8 @@ Store every validation log, benchmark CSV, and build report in
 
 ## 8. End-to-End Task Lifecycle for Subagents
 
-One subagent drives one gate at a time. Complete the full cycle:
+One subagent drives one ticket and one gate at a time, in its own
+checkout (section 4E). Complete the full cycle:
 
 1. **Triage**: `fossil status && fossil branch current && fossil
    timeline -n 5`. Read the ticket and the wiki `Home` page.
