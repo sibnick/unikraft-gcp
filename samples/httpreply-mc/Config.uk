@@ -1,0 +1,46 @@
+config APPHTTPREPLYMC_DEPENDENCIES
+	bool
+	default y
+	select LIBNOLIBC if !HAVE_LIBC
+	select LIBUKALLOC
+	select LIBUKALLOCBBUDDY
+	select LIBUKBOOT
+	select LIBUKBUS
+	select LIBUKBUS_PCI
+	select LIBUKLCPU
+	select LIBUKLIBPARAM
+	select LIBUKLOCK
+	select LIBUKNETDEV
+	select LIBUKNETDEV_EINFO_LIBPARAM
+	select LIBUKPCPUVAR
+	select LIBUKSCHED
+	select LIBUKSCHEDCOOP
+	select LIBLWIP
+	select LIBLWIP_IPV4
+	select LIBLWIP_NOTHREADS
+	select LIBLWIP_PERCORE
+	select LIBLWIP_SOCKET
+	select LIBLWIP_TCP
+	select LIBLWIP_ICMP
+	select LIBLWIP_AUTOIFACE
+	select LIBPOSIX_POLL
+	select LIBPOSIX_SOCKET_POLLED
+	select LIBPOSIX_TIME
+	select LIBGVE
+
+menuconfig APPHTTPREPLYMC
+	bool "Unikraft HTTP Reply Multi-Core Benchmark Server (GCP)"
+	default n
+	select APPHTTPREPLYMC_DEPENDENCIES
+
+config APPHTTPREPLYMC_CONSOLE_STATS
+	bool "Print per-core heartbeat and stats to the console"
+	depends on APPHTTPREPLYMC
+	default n
+	help
+	  Print a per-core heartbeat every 2 seconds with RX packets,
+	  served requests, open connections, and heap headroom. Each
+	  write blocks the run-to-completion worker loop, so the core
+	  stops and every open connection waits. This inflates tail
+	  latency. Keep this off for latency benchmarks. Turn it on for
+	  bring-up and for the gate evidence in the serial log.

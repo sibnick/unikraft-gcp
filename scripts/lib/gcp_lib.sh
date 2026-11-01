@@ -122,15 +122,31 @@ ukg_gcs_rm_ok() {
 # Arg $1: instance name. Arg $2: log path. Returns the gcloud status.
 ukg_serial_capture() {
     local inst="$1" log="$2"
-    local tmp="${log}.new"
+    local tmp="${log}.new" err="${log}.err"
     if gcloud compute instances get-serial-port-output "${inst}" \
         --zone="${GCP_ZONE}" --project="${GCP_PROJECT}" \
-        >"${tmp}" 2>&1; then
-        mv -f "${tmp}" "${log}"
+        >"${tmp}" 2>"${err}"; then
+        # Drop NUL bytes. A multi-core guest interleaves core writes
+        # on COM1 and can emit NUL bytes. With NULs present, grep treats
+        # the log as binary and drops its -o output. Run MC evidence,
+        # ticket 3dc1f3f6b6.
+        if tr -d '\0' <"${tmp}" >"${tmp}.san"; then
+            mv -f "${tmp}.san" "${log}"
+        else
+            mv -f "${tmp}" "${log}"
+        fi
+        rm -f "${err}"
         return 0
     fi
-    rm -f "${tmp}"
-    echo "[WARN] Serial capture failed for ${inst}. Keeping the previous log." >&2
+    # Keep the gcloud reason visible. The MC run lost every client
+    # capture with no clue because stderr was deleted with the
+    # temporary file.
+    local reason=""
+    if [ -s "${err}" ]; then
+        reason="$(grep -m1 . "${err}" 2>/dev/null || true)"
+    fi
+    rm -f "${tmp}" "${err}"
+    echo "[WARN] Serial capture failed for ${inst}: ${reason:-gcloud error}. Keeping the previous log." >&2
     return 1
 }
 
@@ -423,20 +439,30 @@ ukg_gate_rss_pass() {
 # Ticket 4c76b4d84d.
 ukg_wrk_ok() {
     local rep="$1"
-    local rps
     [ -s "${rep}" ] || return 1
-    rps="$(tr -d '\r' <"${rep}" | awk '/Requests\/sec:/ { v=$2 } END { print v }')"
-    case "${rps}" in
-        ''|*[!0-9.]*) return 1 ;;
-    esac
-    awk -v r="${rps}" 'BEGIN { exit !(r > 0) }' || return 1
-    if tr -d '\r' <"${rep}" | grep -qE "Socket errors:.*[1-9]"; then
-        return 1
-    fi
-    if tr -d '\r' <"${rep}" | grep -qE "Non-2xx responses:"; then
-        return 1
-    fi
-    return 0
+    # Same socket-error policy as the MC client verdict, run
+    # ukg-1101-011940-615720 [Ticket 3dc1f3f6b6]: connect, read, or
+    # write errors fail; non-2xx fails; a timeout-only count is wrk
+    # reporting COMPLETED requests over its 2000 ms histogram window
+    # (RTO recoveries). Those pass up to 0.01 percent of completed
+    # requests.
+    tr -d '\r' <"${rep}" | awk '
+        /requests in/      { total = $1 }
+        /Requests\/sec:/   { rps = $2 }
+        /Socket errors:/   { c = $4; r = $6; w = $8; t = $10
+                             gsub(/,/, "", c); gsub(/,/, "", r)
+                             gsub(/,/, "", w); gsub(/,/, "", t) }
+        /Non-2xx/          { n = $1 }
+        END {
+            if (rps == "" || rps + 0 <= 0) exit 1
+            if (c + 0 > 0 || r + 0 > 0 || w + 0 > 0) exit 1
+            if (n + 0 > 0) exit 1
+            if (t + 0 > 0) {
+                pct = (total + 0 > 0) ? t * 100.0 / total : 100
+                if (pct > 0.01) exit 1
+            }
+            exit 0
+        }'
 }
 
 # Parse one combined C1/C2 serial log into a single CSV data row

@@ -1,0 +1,17 @@
+spec: v0.6
+
+name: httpreply-mc
+version: 0.1.0
+description: Unikraft multi-core HTTP reply benchmark server (per-core lwIP, SO_REUSEPORT, idle backoff) for Google Cloud
+
+targets:
+  - name: gcp-x86_64
+    architecture: x86_64
+    platform: kvm
+
+unikraft:
+  version: RELEASE-0.21.0
+
+libraries:
+  lwip:
+    version: RELEASE-0.21.0
