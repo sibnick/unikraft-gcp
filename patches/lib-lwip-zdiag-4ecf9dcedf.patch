@@ -1,0 +1,401 @@
+--- a/Config.uk
++++ b/Config.uk
+@@ -361,6 +361,21 @@
+ 			Default 2, maximum 5.
+ endif
+ 
++config LWIP_UKG_DIAG
++	bool "TEMP DIAG forensics (unikraft-gcp ticket 4ecf9dcedf)"
++	default n
++	select LIBUKLIBPARAM
++	help
++		Temporary diagnostic build switch for the unikraft-gcp
++		nginx cloud investigation. It compiles diag.c: a kernel
++		thread that prints RX/TX packet counters, lwIP memory
++		pool occupancy, and the netif state to the serial
++		console every 10 seconds. It also enables the boot
++		parameter lwip.diagpeers=<ipv4> to add static ARP
++		entries with the GCP gateway MAC, and lwIP internal
++		stats counters. Remove this option when the
++		investigation ends. Ticket 4ecf9dcedf.
++
+ menuconfig LWIP_DEBUG
+ 	bool "Debug messages"
+ 	default n
+--- a/Makefile.uk
++++ b/Makefile.uk
+@@ -75,6 +75,10 @@
+ CXXINCLUDES-$(CONFIG_LIBLWIP) += $(LIBLWIP_COMMON_INCLUDES-y)
+ $(eval $(call uknetdev_scratch_mem,$(CONFIG_LWIP_UKNETDEV_SCRATCH)))
+ 
++# TEMP DIAG (unikraft-gcp ticket 4ecf9dcedf): register libparam with
++# the 'lwip.' prefix so lwip.diagpeers=<ipv4> reaches diag.c.
++$(eval $(call addlib_paramprefix,liblwip,lwip))
++
+ ################################################################################
+ # Library flags
+ ################################################################################
+@@ -135,6 +139,8 @@
+ LIBLWIP_SRCS-y += $(LIBLWIP_EXTRACTED)/netif/ethernet.c
+ LIBLWIP_SRCS-$(CONFIG_LWIP_UKNETDEV) += $(LIBLWIP_BASE)/netbuf.c|unikraft
+ LIBLWIP_SRCS-$(CONFIG_LWIP_UKNETDEV) += $(LIBLWIP_BASE)/uknetdev.c|unikraft
++# TEMP DIAG (unikraft-gcp ticket 4ecf9dcedf): periodic serial forensics
++LIBLWIP_SRCS-$(CONFIG_LWIP_UKG_DIAG) += $(LIBLWIP_BASE)/diag.c|unikraft
+ 
+ ################################################################################
+ # IPv4
+--- a/include/lwipopts.h
++++ b/include/lwipopts.h
+@@ -494,4 +494,24 @@
+ #endif /* CONFIG_LWIP_SERVICE_DEBUG */
+ #endif /* CONFIG_LWIP_DEBUG */
+ 
++/*
++ * TEMP DIAG (unikraft-gcp ticket 4ecf9dcedf): turn on the lwIP
++ * internal stats counters for the diagnostic build only. The diag.c
++ * thread reads lwip_stats and prints pool occupancy to the serial
++ * console. Non-diagnostic builds keep the default: no counters.
++ */
++#if CONFIG_LWIP_UKG_DIAG
++#define LWIP_STATS         1
++#define LWIP_STATS_DISPLAY 1
++#define LINK_STATS         1
++#define IP_FRAG_STATS      0
++#define IP_STATS           1
++#define ICMP_STATS         1
++#define UDP_STATS          1
++#define TCP_STATS          1
++#define MEM_STATS          1
++#define MEMP_STATS         1
++#define SYS_STATS          1
++#endif /* CONFIG_LWIP_UKG_DIAG */
++
+ #endif /* __LWIP_LWIPOPTS_H__ */
+--- a/uknetdev.c
++++ b/uknetdev.c
+@@ -52,6 +52,22 @@
+ #include "netif/etharp.h"
+ #include "netif/ethernet.h"
+ #include <uk/atomic.h>
++#include "ukg_diag.h"
++
++#if CONFIG_LWIP_UKG_DIAG
++/* TEMP DIAG (unikraft-gcp ticket 4ecf9dcedf). Plain volatile counters
++ * on the data path. One writer per counter, one reader: the diag.c
++ * printer thread. The values are read torn at worst; a diagnostic
++ * never needs an atomic snapshot of all of them.
++ */
++volatile uint64_t ukg_diag_rx_pkts;
++volatile uint64_t ukg_diag_rx_bytes;
++volatile uint64_t ukg_diag_rx_drop;
++volatile uint64_t ukg_diag_rx_stall;
++volatile uint64_t ukg_diag_tx_pkts;
++volatile uint64_t ukg_diag_tx_bytes;
++volatile uint64_t ukg_diag_tx_err;
++#endif /* CONFIG_LWIP_UKG_DIAG */
+ 
+ #include <uk/essentials.h>
+ 
+@@ -158,6 +174,7 @@
+ 					  lwip_data->dev_info.nb_encap_rx);
+ 		if (!nb[i]) {
+ 			/* we run out of memory */
++			UKG_DIAG_RX_STALL();
+ 			break;
+ 		}
+ 	}
+@@ -231,6 +248,7 @@
+ 		} while (uk_netdev_status_notready(ret));
+ 	}
+ 	if (unlikely(ret < 0)) {
++		UKG_DIAG_TX_ERR();
+ 		LWIP_DEBUGF(NETIF_DEBUG,
+ 			    ("%s: %c%c%u: Failed to send %"PRIu16" bytes\n",
+ 			     __func__, nf->name[0], nf->name[1], nf->num,
+@@ -242,6 +260,7 @@
+ 		uk_netbuf_free_single(nb);
+ 		return ERR_IF;
+ 	}
++	UKG_DIAG_TX(p->tot_len);
+ 	LWIP_DEBUGF(NETIF_DEBUG, ("%s: %c%c%u: Sent %"PRIu16" bytes\n",
+ 				  __func__, nf->name[0], nf->name[1], nf->num,
+ 				  p->tot_len));
+@@ -305,6 +324,7 @@
+ 			     nb->len));
+ 
+ 		npkts++;
++		UKG_DIAG_RX(nb->len);
+ 
+ 		/* Send packet to lwip */
+ 		p = lwip_netbuf_to_pbuf(nb);
+@@ -343,6 +363,7 @@
+ 			/*
+ 			 * Drop the packet that we could not send to the stack
+ 			 */
++			UKG_DIAG_RX_DROP();
+ 			uk_pr_err("%c%c%u: Failed to forward packet to lwIP: %d\n",
+ 				  nf->name[0], nf->name[1], nf->num, err);
+ 			uk_netbuf_free_single(nb);
+--- /dev/null
++++ b/ukg_diag.h
+@@ -0,0 +1,55 @@
++/* SPDX-License-Identifier: BSD-3-Clause */
++/*
++ * TEMP DIAG (unikraft-gcp ticket 4ecf9dcedf).
++ * Data-path counters for the lib-lwip diagnostic build. Non-
++ * diagnostic builds compile every macro here to nothing, so the
++ * data path keeps its original code. Remove with the LWIP_UKG_DIAG
++ * option when the investigation ends.
++ */
++#ifndef __UKG_DIAG_H
++#define __UKG_DIAG_H
++
++#include <uk/config.h>
++
++#if CONFIG_LWIP_UKG_DIAG
++
++#include <inttypes.h>
++
++extern volatile uint64_t ukg_diag_rx_pkts;
++extern volatile uint64_t ukg_diag_rx_bytes;
++extern volatile uint64_t ukg_diag_rx_drop;
++extern volatile uint64_t ukg_diag_rx_stall;
++extern volatile uint64_t ukg_diag_tx_pkts;
++extern volatile uint64_t ukg_diag_tx_bytes;
++extern volatile uint64_t ukg_diag_tx_err;
++
++#define UKG_DIAG_RX(len)			\
++	do {					\
++		ukg_diag_rx_pkts++;		\
++		ukg_diag_rx_bytes += (len);	\
++	} while (0)
++
++#define UKG_DIAG_TX(len)			\
++	do {					\
++		ukg_diag_tx_pkts++;		\
++		ukg_diag_tx_bytes += (len);	\
++	} while (0)
++
++/* Packet left the NIC ring but lwIP refused it. */
++#define UKG_DIAG_RX_DROP()	(ukg_diag_rx_drop++)
++/* RX ring refill ran out of netbuf memory. */
++#define UKG_DIAG_RX_STALL()	(ukg_diag_rx_stall++)
++/* The NIC refused the frame. */
++#define UKG_DIAG_TX_ERR()	(ukg_diag_tx_err++)
++
++#else /* !CONFIG_LWIP_UKG_DIAG */
++
++#define UKG_DIAG_RX(len)		do { (void)(len); } while (0)
++#define UKG_DIAG_TX(len)		do { (void)(len); } while (0)
++#define UKG_DIAG_RX_DROP()		do { } while (0)
++#define UKG_DIAG_RX_STALL()		do { } while (0)
++#define UKG_DIAG_TX_ERR()		do { } while (0)
++
++#endif /* CONFIG_LWIP_UKG_DIAG */
++
++#endif /* __UKG_DIAG_H */
+--- /dev/null
++++ b/diag.c
+@@ -0,0 +1,202 @@
++/* SPDX-License-Identifier: BSD-3-Clause */
++/*
++ * TEMP DIAG (unikraft-gcp ticket 4ecf9dcedf).
++ *
++ * Periodic network forensics printer for the nginx-on-GCP
++ * investigation. One kernel thread wakes every 10 seconds and prints
++ * to the serial console:
++ *
++ *   - RX and TX counters taken from the uknetdev glue data path;
++ *   - lwIP pool occupancy, which shows whether the ARP pending queue
++ *     is stuck;
++ *   - the netif state and the result of the lwip.diagpeers=<ipv4>
++ *     boot parameter.
++ *
++ * The counters are the discriminator the run needs. When the RX
++ * counter advances while the client sends SYNs, but nginx never
++ * accepts, the break is between the ring and the stack. When the RX
++ * counter stays flat under load, the frames never reach the guest or
++ * the reply path is dead. Remove this file with the LWIP_UKG_DIAG
++ * option when the investigation ends.
++ */
++
++#include <uk/config.h>
++
++#if CONFIG_LWIP_UKG_DIAG
++
++#include <stdio.h>
++#include <string.h>
++#include <inttypes.h>
++
++#include <uk/print.h>
++#include <uk/essentials.h>
++#include <uk/arch/time.h>
++#include <uk/plat/time.h>
++#include <uk/semaphore.h>
++#include <uk/sched.h>
++#include <uk/init.h>
++#include <uk/libparam.h>
++
++#include "lwip/opt.h"
++#include "lwip/init.h"
++#include "lwip/netif.h"
++#include "lwip/ip_addr.h"
++#include "lwip/etharp.h"
++#include "lwip/stats.h"
++#include "lwip/memp.h"
++
++#include "ukg_diag.h"
++
++/* Boot argument: lwip.diagpeers=<ipv4>, repeated up to
++ * UKG_DIAG_MAXPEERS times. The GCP fabric does not answer ARP
++ * requests for guest IPs on the legacy virtio-net path, so map each
++ * peer to the gateway-derived MAC 42:01:<gateway ip bytes>. Same rule
++ * as the C1 httpreply gates (ticket 73b23402f0). */
++#define UKG_DIAG_MAXPEERS 8
++static char *diagpeers[UKG_DIAG_MAXPEERS];
++UK_LIBPARAM_PARAM_ARR_ALIAS(diagpeers, diagpeers, charp, UKG_DIAG_MAXPEERS,
++			    "Static ARP peers (TEMP DIAG 4ecf9dcedf)");
++
++#define UKG_DIAG_PERIOD_SEC 10
++
++static struct uk_semaphore nap;
++
++static void ukg_diag_print_pools(void)
++{
++#if LWIP_STATS && MEMP_STATS
++	static const struct {
++		int idx;
++		const char *name;
++	} pools[] = {
++#if PBUF_POOL_SIZE
++		{ MEMP_PBUF_POOL, "PBUF_POOL" },
++#endif
++		{ MEMP_PBUF, "PBUF" },
++#if LWIP_TCP
++		{ MEMP_TCP_PCB, "TCP_PCB" },
++		{ MEMP_TCP_PCB_LISTEN, "TCP_LSN" },
++#if TCP_QUEUE_OOSEQ
++		{ MEMP_TCP_SEG, "TCP_SEG" },
++#endif
++#endif
++#if LWIP_ARP
++		{ MEMP_ARP_QUEUE, "ARPQ" },
++#endif
++		{ MEMP_NETBUF, "NETBUF" },
++		{ -1, NULL },
++	};
++	int i;
++
++	for (i = 0; pools[i].name; i++) {
++		struct stats_mem *m = lwip_stats.memp[pools[i].idx];
++
++		if (!m)
++			continue;
++		uk_pr_info("UKGDIAG pool %s used=%lu max=%lu err=%u\n",
++			   pools[i].name, (unsigned long)m->used,
++			   (unsigned long)m->max, (unsigned)m->err);
++	}
++#endif /* LWIP_STATS && MEMP_STATS */
++}
++
++/* Install one static ARP entry per configured peer. Returns 1 when
++ * the gateway is known and the pass ran, 0 when it must run again. */
++static int ukg_diag_add_static_arps(struct netif *nf)
++{
++	const ip4_addr_t *gw;
++	struct eth_addr gw_mac;
++	int i;
++
++	if (!nf)
++		return 0;
++	gw = netif_ip4_gw(nf);
++	if (!gw || ip4_addr_isany_val(*gw))
++		return 0;
++
++	gw_mac.addr[0] = 0x42;
++	gw_mac.addr[1] = 0x01;
++	gw_mac.addr[2] = ip4_addr1(gw);
++	gw_mac.addr[3] = ip4_addr2(gw);
++	gw_mac.addr[4] = ip4_addr3(gw);
++	gw_mac.addr[5] = ip4_addr4(gw);
++
++	uk_pr_info("UKGDIAG gw %s -> MAC 42:01:%02x:%02x:%02x:%02x\n",
++		   ip4addr_ntoa(gw), gw_mac.addr[2], gw_mac.addr[3],
++		   gw_mac.addr[4], gw_mac.addr[5]);
++
++	for (i = 0; i < UKG_DIAG_MAXPEERS; i++) {
++		ip4_addr_t peer;
++
++		if (!diagpeers[i])
++			continue;
++		if (ip4addr_aton(diagpeers[i], &peer) != 1) {
++			uk_pr_warn("UKGDIAG unparsable peer %s\n",
++				   diagpeers[i]);
++			continue;
++		}
++		if (etharp_add_static_entry(&peer, &gw_mac) == ERR_OK)
++			uk_pr_info("UKGDIAG ARP-STATIC ok %s\n",
++				   diagpeers[i]);
++		else
++			uk_pr_warn("UKGDIAG ARP-STATIC fail %s\n",
++				   diagpeers[i]);
++	}
++	return 1;
++}
++
++static __noreturn void ukg_diag_thread(void *arg __unused)
++{
++	struct netif *nf;
++	unsigned int static_done = 0;
++	uint64_t seq = 0;
++
++	uk_pr_info("UKGDIAG thread started (ticket 4ecf9dcedf)\n");
++
++	while (1) {
++		uk_semaphore_down_to(&nap,
++			ukplat_monotonic_clock() +
++			ukarch_time_sec_to_nsec(UKG_DIAG_PERIOD_SEC));
++
++		nf = netif_default;
++
++		uk_pr_info("UKGDIAG #%"PRIu64" t=%"PRIu64"s netif=%c%c%u up=%u link=%u rx=%"PRIu64" rb=%"PRIu64" rxd=%"PRIu64" rxst=%"PRIu64" tx=%"PRIu64" tb=%"PRIu64" txe=%"PRIu64"\n",
++			   seq,
++			   (uint64_t)(ukplat_monotonic_clock() /
++				      1000000000ULL),
++			   nf ? nf->name[0] : '-', nf ? nf->name[1] : '-',
++			   nf ? (unsigned)nf->num : 0U,
++			   nf ? (netif_is_up(nf) ? 1U : 0U) : 0U,
++			   nf ? (netif_is_link_up(nf) ? 1U : 0U) : 0U,
++			   ukg_diag_rx_pkts, ukg_diag_rx_bytes,
++			   ukg_diag_rx_drop, ukg_diag_rx_stall,
++			   ukg_diag_tx_pkts, ukg_diag_tx_bytes,
++			   ukg_diag_tx_err);
++
++		if (!static_done && nf)
++			static_done = (unsigned int)
++				ukg_diag_add_static_arps(nf);
++
++		ukg_diag_print_pools();
++		seq++;
++	}
++}
++
++static int ukg_diag_init(struct uk_init_ctx *ictx __unused)
++{
++	struct uk_sched *sched;
++
++	uk_semaphore_init(&nap, 0);
++	/* Same scheduler handle source as threads.c sys_thread_new:
++	 * ukboot runs library init calls on a scheduler context. */
++	sched = uk_sched_current();
++	if (!sched) {
++		uk_pr_warn("UKGDIAG: no primary scheduler; forensics off\n");
++		return 0;
++	}
++	if (!uk_sched_thread_create(sched, ukg_diag_thread, NULL, NULL))
++		uk_pr_warn("UKGDIAG: cannot create thread; forensics off\n");
++	return 0;
++}
++uk_lib_initcall(ukg_diag_init, 0);
++
++#endif /* CONFIG_LWIP_UKG_DIAG */

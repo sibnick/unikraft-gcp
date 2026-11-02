@@ -82,6 +82,14 @@ CONFIG_LWIP_SOCKET=y
 CONFIG_LWIP_DHCP=y
 CONFIG_LWIP_AUTOIFACE=y
 CONFIG_LIBUKNETDEV_DISPATCHERTHREADS=y
+# ICMP answers the client ping phase of the instrumented diagnostic
+# run. The no-threads httpreply gates carried it; the threaded nginx
+# build did not need it until ticket 4ecf9dcedf diagnostic runs.
+CONFIG_LWIP_ICMP=y
+# TEMP DIAG (ticket 4ecf9dcedf): serial forensics thread, lwIP stats
+# counters, and the lwip.diagpeers static-ARP boot argument. Set back
+# to n (or drop the line) when the investigation ends.
+CONFIG_LWIP_UKG_DIAG=y
 # Idle wake through the i8254 timer, the path every GCP gate in this
 # repo has used. The LAPIC one-shot wake arms and its counter runs
 # down, but no GCP run of this repo has proven that the timer vector
