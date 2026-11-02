@@ -73,7 +73,7 @@
  #endif /* __LWIP_LWIPOPTS_H__ */
 --- a/uknetdev.c
 +++ b/uknetdev.c
-@@ -52,6 +52,22 @@
+@@ -52,6 +52,24 @@
  #include "netif/etharp.h"
  #include "netif/ethernet.h"
  #include <uk/atomic.h>
@@ -92,11 +92,13 @@
 +volatile uint64_t ukg_diag_tx_pkts;
 +volatile uint64_t ukg_diag_tx_bytes;
 +volatile uint64_t ukg_diag_tx_err;
++volatile uint64_t ukg_diag_poll_passes;
++volatile uint64_t ukg_diag_poll_empty;
 +#endif /* CONFIG_LWIP_UKG_DIAG */
  
  #include <uk/essentials.h>
  
-@@ -158,6 +174,7 @@
+@@ -158,6 +176,7 @@
  					  lwip_data->dev_info.nb_encap_rx);
  		if (!nb[i]) {
  			/* we run out of memory */
@@ -104,7 +106,7 @@
  			break;
  		}
  	}
-@@ -231,6 +248,7 @@
+@@ -231,6 +250,7 @@
  		} while (uk_netdev_status_notready(ret));
  	}
  	if (unlikely(ret < 0)) {
@@ -112,7 +114,7 @@
  		LWIP_DEBUGF(NETIF_DEBUG,
  			    ("%s: %c%c%u: Failed to send %"PRIu16" bytes\n",
  			     __func__, nf->name[0], nf->name[1], nf->num,
-@@ -242,6 +260,7 @@
+@@ -242,6 +262,7 @@
  		uk_netbuf_free_single(nb);
  		return ERR_IF;
  	}
@@ -120,7 +122,7 @@
  	LWIP_DEBUGF(NETIF_DEBUG, ("%s: %c%c%u: Sent %"PRIu16" bytes\n",
  				  __func__, nf->name[0], nf->name[1], nf->num,
  				  p->tot_len));
-@@ -305,6 +324,7 @@
+@@ -305,6 +326,7 @@
  			     nb->len));
  
  		npkts++;
@@ -128,7 +130,7 @@
  
  		/* Send packet to lwip */
  		p = lwip_netbuf_to_pbuf(nb);
-@@ -343,6 +363,7 @@
+@@ -343,6 +365,7 @@
  			/*
  			 * Drop the packet that we could not send to the stack
  			 */
@@ -136,9 +138,26 @@
  			uk_pr_err("%c%c%u: Failed to forward packet to lwIP: %d\n",
  				  nf->name[0], nf->name[1], nf->num, err);
  			uk_netbuf_free_single(nb);
+@@ -493,7 +516,16 @@
+ 	struct netif *nf = (struct netif *) arg;
+ 
+ 	while (1) {
++#if CONFIG_LWIP_UKG_DIAG
++		/* TEMP DIAG (ticket 4ecf9dcedf): count every pass so
++		 * the heartbeat can prove the poll thread runs.
++		 * uknetdev_poll_queue(nf, 0) is exactly what
++		 * uknetdev_poll(nf) calls.
++		 */
++		UKG_DIAG_POLL_PASS(uknetdev_poll_queue(nf, 0));
++#else
+ 		uknetdev_poll(nf);
++#endif
+ 		uk_sched_yield();
+ 	}
+ }
 --- /dev/null
 +++ b/ukg_diag.h
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,70 @@
 +/* SPDX-License-Identifier: BSD-3-Clause */
 +/*
 + * TEMP DIAG (unikraft-gcp ticket 4ecf9dcedf).
@@ -183,6 +202,20 @@
 +/* The NIC refused the frame. */
 +#define UKG_DIAG_TX_ERR()	(ukg_diag_tx_err++)
 +
++/* Poll-thread liveness (ticket 4ecf9dcedf decisive run): one pass
++ * per _poll_netif iteration, and the subset of passes that took zero
++ * packets from the queue.
++ */
++extern volatile uint64_t ukg_diag_poll_passes;
++extern volatile uint64_t ukg_diag_poll_empty;
++
++#define UKG_DIAG_POLL_PASS(npkts)		\
++	do {					\
++		ukg_diag_poll_passes++;		\
++		if (!(npkts))			\
++			ukg_diag_poll_empty++;\
++	} while (0)
++
 +#else /* !CONFIG_LWIP_UKG_DIAG */
 +
 +#define UKG_DIAG_RX(len)		do { (void)(len); } while (0)
@@ -190,13 +223,14 @@
 +#define UKG_DIAG_RX_DROP()		do { } while (0)
 +#define UKG_DIAG_RX_STALL()		do { } while (0)
 +#define UKG_DIAG_TX_ERR()		do { } while (0)
++#define UKG_DIAG_POLL_PASS(npkts)	do { (void)(npkts); } while (0)
 +
 +#endif /* CONFIG_LWIP_UKG_DIAG */
 +
 +#endif /* __UKG_DIAG_H */
 --- /dev/null
 +++ b/diag.c
-@@ -0,0 +1,202 @@
+@@ -0,0 +1,308 @@
 +/* SPDX-License-Identifier: BSD-3-Clause */
 +/*
 + * TEMP DIAG (unikraft-gcp ticket 4ecf9dcedf).
@@ -243,6 +277,10 @@
 +#include "lwip/etharp.h"
 +#include "lwip/stats.h"
 +#include "lwip/memp.h"
++#include "lwip/tcp.h"
++#include "lwip/tcpbase.h"
++#include "lwip/priv/tcp_priv.h"
++#include "arch/sys_arch.h"
 +
 +#include "ukg_diag.h"
 +
@@ -297,6 +335,104 @@
 +	}
 +#endif /* LWIP_STATS && MEMP_STATS */
 +}
++
++/* --- Decisive-run additions (ticket 4ecf9dcedf): poll-thread
++ * liveness, tcpip mailbox pending, tcpip thread state, listener and
++ * pcb-state census. All TEMP, removed with LWIP_UKG_DIAG.
++ */
++
++/* Mirror of the ukmpi mailbox internals (lib/ukmpi/mbox_defs.h).
++ * Read-only forensic view. pending = slots between readpos and
++ * writepos on the ring of m->len slots.
++ */
++struct ukg_mbox_mirror {
++	size_t len;
++	struct uk_semaphore readsem;
++	long readpos;
++	struct uk_semaphore writesem;
++	long writepos;
++};
++
++/* Accessor added by lib-lwip patch
++ * patches/0019-ukg-diag-tcpip-accessor.patch.
++ */
++extern sys_mbox_t *ukg_diag_tcpip_mbox(void);
++
++static void ukg_diag_print_rxpath(void)
++{
++	sys_mbox_t *mb;
++	struct ukg_mbox_mirror *m;
++	unsigned long pend = 0, cap = 0;
++	struct uk_sched *s;
++	struct uk_thread *t, *tcpip = NULL;
++	unsigned long nthr = 0;
++	const char *tstate;
++
++	s = uk_sched_current();
++	if (s) {
++		UK_TAILQ_FOREACH(t, &s->thread_list, thread_list) {
++			nthr++;
++			if (t->name && !strncmp(t->name, TCPIP_THREAD_NAME,
++						sizeof(TCPIP_THREAD_NAME)))
++				tcpip = t;
++		}
++	}
++	if (!tcpip)
++		tstate = "absent";
++	else if (uk_thread_is_exited(tcpip))
++		tstate = "exited";
++	else if (uk_thread_is_runnable(tcpip))
++		tstate = "run";
++	else
++		tstate = "blk";
++
++	mb = ukg_diag_tcpip_mbox();
++	if (mb && mb->valid && mb->mbox) {
++		m = (struct ukg_mbox_mirror *) mb->mbox;
++		if (m->len > 0) {
++			cap = (unsigned long) (m->len - 1);
++			pend = (unsigned long) ((m->writepos - m->readpos +
++						 (long) m->len) %
++						(long) m->len);
++		}
++	}
++
++	uk_pr_info("UKGDIAG rxpath pass=%llu empty=%llu tcpip=%s mbox=%lu/%lu thr=%lu\n",
++		   (unsigned long long) ukg_diag_poll_passes,
++		   (unsigned long long) ukg_diag_poll_empty,
++		   tstate, pend, cap, nthr);
++}
++
++#if LWIP_TCP && !LWIP_PERCORE
++static void ukg_diag_print_tcp(void)
++{
++	struct tcp_pcb_listen *lpcb;
++	struct tcp_pcb *pcb;
++	unsigned long lsn = 0, act = 0, synrecv = 0, estab = 0, tw = 0;
++	unsigned int lport = 0;
++
++	for (lpcb = tcp_listen_pcbs.listen_pcbs; lpcb;
++	     lpcb = (struct tcp_pcb_listen *) lpcb->next) {
++		lsn++;
++		/* This fork keeps local_port in host order (verified
++		 * on the host: raw value is 80). No byte swap.
++		 */
++		lport = lpcb->local_port;
++	}
++	for (pcb = tcp_active_pcbs; pcb; pcb = pcb->next) {
++		act++;
++		if (pcb->state == SYN_RCVD)
++			synrecv++;
++		else if (pcb->state == ESTABLISHED)
++			estab++;
++	}
++	for (pcb = tcp_tw_pcbs; pcb; pcb = pcb->next)
++		tw++;
++
++	uk_pr_info("UKGDIAG tcp lsn=%lu port=%u act=%lu synrecv=%lu estab=%lu tw=%lu\n",
++		   lsn, lport, act, synrecv, estab, tw);
++}
++#endif /* LWIP_TCP && !LWIP_PERCORE */
 +
 +/* Install one static ARP entry per configured peer. Returns 1 when
 + * the gateway is known and the pass ran, 0 when it must run again. */
@@ -375,6 +511,10 @@
 +			static_done = (unsigned int)
 +				ukg_diag_add_static_arps(nf);
 +
++		ukg_diag_print_rxpath();
++#if LWIP_TCP && !LWIP_PERCORE
++		ukg_diag_print_tcp();
++#endif
 +		ukg_diag_print_pools();
 +		seq++;
 +	}
@@ -399,3 +539,35 @@
 +uk_lib_initcall(ukg_diag_init, 0);
 +
 +#endif /* CONFIG_LWIP_UKG_DIAG */
+--- /dev/null
++++ b/patches/0019-ukg-diag-tcpip-accessor.patch
+@@ -0,0 +1,29 @@
++Read the tcpip mailbox for the unikraft-gcp TEMP diagnostic
++
++Add a build-option-guarded accessor so lib-lwip diag.c can print
++the tcpip mailbox pending count and prove whether the tcpip
++thread consumes posted messages. The accessor sits inside the
++!NO_SYS section, where the threaded stack keeps the mailbox.
++Ticket 4ecf9dcedf.
++
++--- a/src/api/tcpip.c
+++++ b/src/api/tcpip.c
++@@ -655,6 +655,18 @@
++   return tcpip_try_callback(mem_free, m);
++ }
++ 
+++#if CONFIG_LWIP_UKG_DIAG
+++/* TEMP DIAG (unikraft-gcp ticket 4ecf9dcedf): forensic accessor for
+++ * the diag.c heartbeat thread. It reports the tcpip mailbox so the
+++ * heartbeat can print the pending message count. Remove together
+++ * with the LWIP_UKG_DIAG option.
+++ */
+++sys_mbox_t *
+++ukg_diag_tcpip_mbox(void)
+++{
+++  return &tcpip_mbox;
+++}
+++#endif /* CONFIG_LWIP_UKG_DIAG */
++ #else /* !NO_SYS */
++ 
++ #include "lwip/priv/api_msg.h"

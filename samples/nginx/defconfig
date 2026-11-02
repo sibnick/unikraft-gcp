@@ -93,9 +93,10 @@ CONFIG_LWIP_ICMP=y
 # ukg-1102-225945-367273 measured rx=0 under client SYN load while
 # the polled canary served the same subnet. Ticket 4ecf9dcedf.
 CONFIG_LWIP_UKNETDEV_POLLRX=y
-# TEMP forensics (ticket 4ecf9dcedf): diag.c counters and the
-# lwip.diagpeers boot argument stay in the tree, default-off.
-CONFIG_LWIP_UKG_DIAG=n
+# TEMP (ticket 4ecf9dcedf decisive run 2026-11-03): forensics ON for
+# one owner-approved instrumented run (poll-thread liveness, tcpip
+# mbox, tcp pcb census on COM1). Flip back to n right after the run.
+CONFIG_LWIP_UKG_DIAG=y
 # Idle wake through the i8254 timer, the path every GCP gate in this
 # repo has used. The LAPIC one-shot wake arms and its counter runs
 # down, but no GCP run of this repo has proven that the timer vector
