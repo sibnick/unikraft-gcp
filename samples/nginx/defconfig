@@ -42,6 +42,8 @@ CONFIG_LIBPOSIX_PROCESS_ARCH_PRCTL=y
 CONFIG_LIBPOSIX_PROCESS_MULTITHREADING=y
 CONFIG_LIBPOSIX_FILE=y
 CONFIG_LIBPOSIX_POLL=y
+# Yield instead of sleeping inside epoll_wait with no events, like the
+# ENA original. Nginx spends its idle time in epoll_wait.
 CONFIG_LIBPOSIX_POLL_YIELD=y
 CONFIG_LIBPOSIX_SIGNAL=y
 CONFIG_LIBPOSIX_TIME=y
@@ -64,8 +66,11 @@ CONFIG_LIBPOSIX_TIMEDATE=y
 # steady wake source instead of one-shot timer programming per sleep.
 CONFIG_LIBUKTIME_PERIODIC=y
 
-# Network stack: lwIP in threaded mode with DHCP. The stack runs in its
-# own thread and drives the netdev.
+# Network stack: lwIP in threaded mode. Nginx needs the event-driven
+# socket path: it blocks in epoll_wait and must be woken by lwIP when a
+# connection arrives. The polled no-threads stack, used by the demo
+# apps, never wakes epoll_wait for a listening socket (tested on the
+# host, ticket 4ecf9dcedf).
 CONFIG_LIBUKNETDEV=y
 # Enables the netdev.ip boot parameter used by scripts/gcp_run_nginx.sh.
 CONFIG_LIBUKNETDEV_EINFO_LIBPARAM=y
@@ -77,6 +82,13 @@ CONFIG_LWIP_SOCKET=y
 CONFIG_LWIP_DHCP=y
 CONFIG_LWIP_AUTOIFACE=y
 CONFIG_LIBUKNETDEV_DISPATCHERTHREADS=y
+# Idle wake through the i8254 timer, the path every GCP gate in this
+# repo has used. The LAPIC one-shot wake arms and its counter runs
+# down, but no GCP run of this repo has proven that the timer vector
+# wakes a halted core. Nginx is single vCPU, so the i8254 fallback is
+# enough. Core patch 0007-plat-kvm-x86-lapic-oneshot-option.
+# Ticket 4ecf9dcedf.
+CONFIG_KVM_X86_LAPIC_ONESHOT=n
 
 # virtio-net is the default NIC on first and second generation machine
 # sizes, the Path A target, and the device QEMU models locally.
@@ -99,3 +111,4 @@ CONFIG_APPNGINX=y
 
 # Build
 CONFIG_OPTIMIZE_PERF=y
+

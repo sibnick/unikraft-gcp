@@ -32,6 +32,7 @@ space.
 | Empty `PT_LOAD` fix | `scripts/elf_drop_empty_segments.py` rewrites the kernel before GRUB | not needed: core patch `0001-plat-kvm-x86-drop-tls-phdrs.patch` drops the empty TLS program headers at the core level, and patch `0004-plat-kvm-x86-keep-tdata-in-data.patch` keeps the real `.tdata` bytes inside the data segment. The image build needs no ELF rewrite |
 | LAPIC idle crash | ENA core carried its own LAPIC wake fix | core patch `0005-plat-kvm-x86-map-lapic-page.patch` maps the local APIC page in the kernel page table. GRUB may omit that page from the memory map, and the LAPIC one-shot wake path faults on its first MMIO write when the system idles |
 | eventfd `FIONBIO` | ENA core carried its own eventfd fix | core patch `0006-lib-posix-eventfd-accept-fionbio.patch` accepts the non-blocking switch that nginx does on its notify eventfd at startup |
+| Idle wake | ENA gate ran on AWS with the LAPIC one-shot wake | `CONFIG_KVM_X86_LAPIC_ONESHOT=n` in the defconfig. Core patch `0007-plat-kvm-x86-lapic-oneshot-option.patch` adds the switch. The first GCP run showed the one-shot probe passing, yet the guest never woke on a halted core. The nginx defconfig now uses the i8254 wake that every GCP gate in this repo has passed with |
 | Gate markers | none (external smoke test only) | client prints `GATE_NGINX_SMOKE_PASS` / `GATE_NGINX_SMOKE_FAIL` (see `skills/unikraft-gcp-validation/SKILL.md`) |
 | Deploy | `scripts/deploy_aws.py` | `scripts/gcp_run_nginx.sh` |
 
