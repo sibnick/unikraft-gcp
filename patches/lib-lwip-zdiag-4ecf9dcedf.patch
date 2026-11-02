@@ -1,8 +1,8 @@
 --- a/Config.uk
 +++ b/Config.uk
-@@ -361,6 +361,21 @@
- 			Default 2, maximum 5.
- endif
+@@ -374,6 +374,21 @@
+ 		delivery is the pattern every proven cloud gate uses.
+ 		Ticket 4ecf9dcedf.
  
 +config LWIP_UKG_DIAG
 +	bool "TEMP DIAG forensics (unikraft-gcp ticket 4ecf9dcedf)"
@@ -136,34 +136,6 @@
  			uk_pr_err("%c%c%u: Failed to forward packet to lwIP: %d\n",
  				  nf->name[0], nf->name[1], nf->num, err);
  			uk_netbuf_free_single(nb);
-@@ -512,7 +533,16 @@
- 	/* Enable and disable interrupts according to netif's up/down status */
- 
- 	if (nf->flags & NETIF_FLAG_UP) {
--		if (uk_netdev_rxintr_supported(lwip_data->dev_info.features)) {
-+		/* TEMP DIAG (unikraft-gcp ticket 4ecf9dcedf): the
-+		 * diagnostic build takes the polled RX path even when
-+		 * the device reports RX interrupt support. GCP KVM
-+		 * legacy virtio INTx never wakes the dispatcher thread
-+		 * (diagnostic run ukg-1102-225945-367273: rx=0 under
-+		 * SYN load with the fabric proven healthy). Keep the
-+		 * two branches here and in the down path consistent.
-+		 */
-+		if (uk_netdev_rxintr_supported(lwip_data->dev_info.features)
-+		    && !CONFIG_LWIP_UKG_DIAG) {
- 			ret = uk_netdev_rxq_intr_enable(dev, 0);
- 			if (ret < 0) {
- 				LWIP_DEBUGF(NETIF_DEBUG,
-@@ -559,7 +589,8 @@
- 		 * TODO:
- 		 * Cleanup the thread on stopping the network interface.
- 		 */
--		if (uk_netdev_rxintr_supported(lwip_data->dev_info.features)) {
-+		if (uk_netdev_rxintr_supported(lwip_data->dev_info.features)
-+		    && !CONFIG_LWIP_UKG_DIAG) {
- 			uk_netdev_rxq_intr_disable(dev, 0);
- 			LWIP_DEBUGF(NETIF_DEBUG,
- 					("%s: %c%c%u: Disabled rx interrupts on netdev %u\n",
 --- /dev/null
 +++ b/ukg_diag.h
 @@ -0,0 +1,55 @@

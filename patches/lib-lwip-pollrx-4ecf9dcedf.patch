@@ -1,0 +1,60 @@
+--- a/Config.uk
++++ b/Config.uk
+@@ -361,6 +361,19 @@
+ 			Default 2, maximum 5.
+ endif
+ 
++config LWIP_UKNETDEV_POLLRX
++	bool "Force polled RX delivery on uknetdev interfaces"
++	default n
++	help
++		Deliver received packets through the per-netif poll thread
++		even when the device reports RX-interrupt support. On the
++		Google Cloud Compute Engine legacy virtio-net device
++		(1af4:1000) under KVM the device never raises RX interrupts
++		to the guest, so the interrupt-driven dispatcher path
++		starves and the receive ring is never drained. Polled
++		delivery is the pattern every proven cloud gate uses.
++		Ticket 4ecf9dcedf.
++
+ menuconfig LWIP_DEBUG
+ 	bool "Debug messages"
+ 	default n
+--- a/uknetdev.c
++++ b/uknetdev.c
+@@ -512,7 +512,20 @@
+ 	/* Enable and disable interrupts according to netif's up/down status */
+ 
+ 	if (nf->flags & NETIF_FLAG_UP) {
+-		if (uk_netdev_rxintr_supported(lwip_data->dev_info.features)) {
++		/*
++		 * CONFIG_LWIP_UKNETDEV_POLLRX: skip interrupt mode and
++		 * drive this netif from the poll thread in the else
++		 * branch below. The GCP legacy virtio-net device
++		 * (1af4:1000) under KVM never raises RX interrupts to
++		 * the guest, so the interrupt-driven dispatcher path
++		 * leaves the receive ring undrained. Measured in
++		 * diagnostic run ukg-1102-225945-367273: RX stayed
++		 * zero under client SYN load while the polled canary
++		 * served the same subnet. Ticket 4ecf9dcedf. Keep this
++		 * test in sync with the down branch.
++		 */
++		if (uk_netdev_rxintr_supported(lwip_data->dev_info.features)
++		    && !CONFIG_LWIP_UKNETDEV_POLLRX) {
+ 			ret = uk_netdev_rxq_intr_enable(dev, 0);
+ 			if (ret < 0) {
+ 				LWIP_DEBUGF(NETIF_DEBUG,
+@@ -559,7 +572,12 @@
+ 		 * TODO:
+ 		 * Cleanup the thread on stopping the network interface.
+ 		 */
+-		if (uk_netdev_rxintr_supported(lwip_data->dev_info.features)) {
++		/* In sync with the up branch: with
++		 * CONFIG_LWIP_UKNETDEV_POLLRX interrupt mode was never
++		 * enabled, so there is nothing to disable here.
++		 */
++		if (uk_netdev_rxintr_supported(lwip_data->dev_info.features)
++		    && !CONFIG_LWIP_UKNETDEV_POLLRX) {
+ 			uk_netdev_rxq_intr_disable(dev, 0);
+ 			LWIP_DEBUGF(NETIF_DEBUG,
+ 					("%s: %c%c%u: Disabled rx interrupts on netdev %u\n",
