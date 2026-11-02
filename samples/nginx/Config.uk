@@ -1,0 +1,8 @@
+# Nginx on Unikraft, GCP port. The application is app-elfloader itself:
+# it loads /usr/sbin/nginx from the CPIO initrd. This config only marks
+# the app and selects the loader. See defconfig for the full config.
+# Ticket 4ecf9dcedf.
+menuconfig APPNGINX
+	bool "Nginx web server via app-elfloader (GCP)"
+	default y
+	select APPELFLOADER

@@ -1,0 +1,101 @@
+# Nginx on Unikraft, Google Cloud port (ticket 4ecf9dcedf).
+# Target: x86_64 KVM, one vCPU, virtio-net (Path A, first or second
+# generation machine sizes). The root filesystem is a CPIO initrd that
+# GRUB passes as a multiboot module. See scripts/build_rootfs.sh.
+
+# Architecture and platform
+CONFIG_ARCH_X86_64=y
+CONFIG_PLAT_KVM=y
+CONFIG_KVM_PCI=y
+
+# ELF loader application
+CONFIG_APPELFLOADER=y
+CONFIG_APPELFLOADER_VFSEXEC=y
+CONFIG_APPELFLOADER_CUSTOMAPPNAME=n
+CONFIG_APPELFLOADER_VFSEXEC_PATH="/usr/sbin/nginx"
+CONFIG_APPELFLOADER_STACK_NBPAGES=256
+
+# Demand paging and virtual memory, needed to map shared libraries
+CONFIG_HAVE_PAGING=y
+CONFIG_PAGING=y
+CONFIG_LIBUKVMEM=y
+CONFIG_LIBELF=y
+
+# Virtual filesystem. The CPIO initrd is loaded by GRUB as a multiboot
+# module and unpacked into ramfs at boot.
+CONFIG_LIBVFSCORE=y
+CONFIG_LIBVFSCORE_AUTOMOUNT_CI=y
+CONFIG_LIBVFSCORE_AUTOMOUNT_CI_INITRD=y
+CONFIG_LIBRAMFS=y
+CONFIG_LIBUKCPIO=y
+
+# Device files used by nginx
+CONFIG_LIBDEVFS=y
+CONFIG_LIBDEVFS_DEV_NULL=y
+CONFIG_LIBDEVFS_DEV_ZERO=y
+
+# POSIX layer used by nginx
+CONFIG_LIBSYSCALL_SHIM=y
+CONFIG_LIBSYSCALL_SHIM_HANDLER=y
+CONFIG_LIBPOSIX_PROCESS=y
+CONFIG_LIBPOSIX_PROCESS_ARCH_PRCTL=y
+CONFIG_LIBPOSIX_PROCESS_MULTITHREADING=y
+CONFIG_LIBPOSIX_FILE=y
+CONFIG_LIBPOSIX_POLL=y
+CONFIG_LIBPOSIX_POLL_YIELD=y
+CONFIG_LIBPOSIX_SIGNAL=y
+CONFIG_LIBPOSIX_TIME=y
+CONFIG_LIBPOSIX_ENVIRON=y
+CONFIG_LIBPOSIX_SYSINFO=y
+CONFIG_LIBPOSIX_USER=y
+CONFIG_LIBUKSIGNAL=y
+CONFIG_LIBUKRANDOM=y
+CONFIG_LIBUKRANDOM_GETRANDOM=y
+CONFIG_LIBPOSIX_FUTEX=y
+# eventfd: nginx epoll notify. The ENA core carried this as the older
+# LIBPOSIX_EVENT symbol. Ticket 4ecf9dcedf.
+CONFIG_LIBPOSIX_EVENTFD=y
+# AF_UNIX socketpair: nginx tests socket handling with a socketpair at
+# startup. No unix socket is bound at run time.
+CONFIG_LIBPOSIX_UNIXSOCKET=y
+# strftime and calendar time for nginx log timestamps.
+CONFIG_LIBPOSIX_TIMEDATE=y
+# Periodic clock ticks, like all other samples. Gives the idle CPU a
+# steady wake source instead of one-shot timer programming per sleep.
+CONFIG_LIBUKTIME_PERIODIC=y
+
+# Network stack: lwIP in threaded mode with DHCP. The stack runs in its
+# own thread and drives the netdev.
+CONFIG_LIBUKNETDEV=y
+# Enables the netdev.ip boot parameter used by scripts/gcp_run_nginx.sh.
+CONFIG_LIBUKNETDEV_EINFO_LIBPARAM=y
+CONFIG_LIBLWIP=y
+CONFIG_LWIP_IPV4=y
+CONFIG_LWIP_TCP=y
+CONFIG_LWIP_THREADS=y
+CONFIG_LWIP_SOCKET=y
+CONFIG_LWIP_DHCP=y
+CONFIG_LWIP_AUTOIFACE=y
+CONFIG_LIBUKNETDEV_DISPATCHERTHREADS=y
+
+# virtio-net is the default NIC on first and second generation machine
+# sizes, the Path A target, and the device QEMU models locally.
+CONFIG_LIBVIRTIO_BUS=y
+CONFIG_LIBVIRTIO_PCI=y
+CONFIG_LIBVIRTIO_NET=y
+
+# Scheduler and boot
+CONFIG_LIBUKSCHED=y
+CONFIG_LIBUKBOOT=y
+# Keep semi-polling off, like the demo apps. Polling is a performance
+# option and the nginx gate does not need it.
+CONFIG_SPLI=n
+
+# Console output level
+CONFIG_LIBUKPRINT_KLVL_INFO=y
+
+# App marker (thin app: app-elfloader is the entry point)
+CONFIG_APPNGINX=y
+
+# Build
+CONFIG_OPTIMIZE_PERF=y
