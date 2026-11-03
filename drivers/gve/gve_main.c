@@ -1396,18 +1396,19 @@ static int gve_netdev_rxq_intr_enable(struct uk_netdev *dev,
 	return 1;
 }
 
-static int gve_netdev_rxq_intr_disable(struct uk_netdev *dev,
-				       struct uk_netdev_rx_queue *queue)
+/*
+ * Shared disable path for one RX queue. Mask the block first, then
+ * drop the handler. The op below and gve_rxq_free both call it: the
+ * ISR holds the queue pointer, so no caller may free or recreate a
+ * queue while its interrupt is still armed. Ticket 03d8b1c494.
+ */
+static void gve_rxq_intr_off(struct gve_device *gdev,
+			     struct uk_netdev_rx_queue *queue)
 {
-	struct gve_device *gdev = to_gvedev(dev);
 	unsigned int irq;
 
-	if (!gdev || !queue)
-		return -EINVAL;
 	if (!queue->intr_enabled)
-		return 0;
-
-	/* Mask the block first, then drop the handler. */
+		return;
 	mmio_write32(&gdev->db_bar2[queue->irq_db_idx], 0U);
 	mmio_write32(gve_msix_entry(gdev, queue->ntfy_id) +
 		     GVE_MSIX_ENTRY_CTRL / 4U, GVE_MSIX_ENTRY_CTRL_MASK);
@@ -1415,6 +1416,16 @@ static int gve_netdev_rxq_intr_disable(struct uk_netdev *dev,
 	uk_intctlr_irq_unregister(irq, gve_msix_isr);
 	queue->intr_enabled = 0;
 	uk_pr_info("gve: RXq%u interrupt mode off\n", queue->qid);
+}
+
+static int gve_netdev_rxq_intr_disable(struct uk_netdev *dev,
+				       struct uk_netdev_rx_queue *queue)
+{
+	struct gve_device *gdev = to_gvedev(dev);
+
+	if (!gdev || !queue)
+		return -EINVAL;
+	gve_rxq_intr_off(gdev, queue);
 	return 0;
 }
 
@@ -1774,6 +1785,15 @@ static void gve_rxq_free(struct gve_device *gdev,
 
 	if (!rxq)
 		return;
+	/*
+	 * Silence MSI-X before anything else. The registered ISR holds
+	 * this queue pointer. Disable first so no event can run on the
+	 * queue once the device destroys it and the frees below start,
+	 * including the leak path after a failed teardown. Reconfigure
+	 * gets the same guarantee: the fresh queue can re-register the
+	 * IRQ because the old handler is gone. Ticket 03d8b1c494.
+	 */
+	gve_rxq_intr_off(gdev, rxq);
 	a = rxq->alloc ? rxq->alloc : drv_alloc;
 	if (destroy_queue)
 		rc |= gve_adminq_destroy_rx_queue(gdev, rxq->qid);
