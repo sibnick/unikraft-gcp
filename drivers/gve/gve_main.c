@@ -335,6 +335,7 @@ static volatile void *gve_map_bar(uint64_t paddr, int slot)
 	struct uk_pagetable *pt;
 	uint64_t gb_base;
 	__vaddr_t va;
+	__pte_t pte;
 	unsigned int lvl;
 	uint32_t i;
 	int rc;
@@ -343,19 +344,28 @@ static volatile void *gve_map_bar(uint64_t paddr, int slot)
 		return NULL;
 
 	pt = uk_paging_pt_get_active();
-	if (!pt)
+	if (!pt) {
+		uk_pr_err("gve: no active page table: BAR map refused\n");
 		return NULL;
+	}
 
 	gb_base = paddr & ~0x3fffffffULL;
 	va = (__vaddr_t)(GVE_BAR_VA_BASE +
 			 (uint64_t)slot * GVE_BAR_VA_SLOT);
 
-	/* Refuse a slot whose window is already mapped. */
+	/* Refuse a slot whose window is already mapped. Note: the
+	 * walk returns 0 even when it stops on a not-present entry,
+	 * so the present bit of the returned PTE decides. Cloud run
+	 * ukg-1103-233604-448823 failed on the rc-only test. */
 	for (i = 0; i < GVE_BAR_PD_PAGES; i++) {
 		lvl = GVE_BAR_PDLVL;
 		if (uk_paging_pt_walk(pt, va + ((__u64)i << 21),
-				      &lvl, NULL, NULL) == 0)
+				      &lvl, NULL, &pte) == 0 &&
+		    UK_PAL_PT_Lx_PTE_PRESENT(pte, lvl)) {
+			uk_pr_err("gve: BAR slot %d window busy: map refused\n",
+				  slot);
 			return NULL;
+		}
 	}
 
 	rc = uk_paging_page_mapx(pt, va, (__paddr_t)gb_base,
@@ -364,8 +374,10 @@ static volatile void *gve_map_bar(uint64_t paddr, int slot)
 				 UK_PAGING_PAGE_FLAG_SIZE(GVE_BAR_PDLVL) |
 				 UK_PAGING_PAGE_FLAG_FORCE_SIZE,
 				 &mapx);
-	if (rc)
+	if (rc) {
+		uk_pr_err("gve: BAR slot %d page map failed: %d\n", slot, rc);
 		return NULL;
+	}
 
 	return (volatile void *)(uintptr_t)(va + (paddr & 0x3fffffffULL));
 }
@@ -477,6 +489,29 @@ static void gve_unmap_bar(int slot)
 }
 
 #endif /* CONFIG_LIBUKPAGING */
+
+/*
+ * Device DMA address for a driver buffer (ticket eae6a73726).
+ *
+ * A non-paging kernel identity-maps RAM, so the pointer value is
+ * also the physical address. The RSS and MC gates proved that
+ * form. With ukpaging the heap lives at
+ * CONFIG_LIBUKBOOT_HEAP_BASE (16 GiB here), so the pointer is not
+ * a device address: the device needs the physical frame behind it.
+ * Translate through the active page table, the same way the core
+ * uksglist and virtio code does. One base translation covers a
+ * whole buffer: the frame allocator backs a heap mapping with
+ * contiguous frames, the assumption the core virtio rings make
+ * too.
+ */
+static inline uint64_t gve_dma_addr(const void *vaddr)
+{
+#if CONFIG_LIBUKPAGING
+	return (uint64_t)uk_paging_virt_to_phys((__vaddr_t)(uintptr_t)vaddr);
+#else
+	return (uint64_t)(uintptr_t)vaddr;
+#endif
+}
 
 /*
  * Read one BAR size with the standard config-space probe: save the
@@ -734,7 +769,7 @@ static int gve_register_qpl(struct gve_device *gdev, struct uk_alloc *a,
 	memset(page_bus, 0, align_up_page((size_t)num_pages * sizeof(uint64_t)));
 
 	for (i = 0; i < num_pages; i++) {
-		uint64_t paddr = (uint64_t)(uintptr_t)(pages + (size_t)i * GVE_PAGE_SIZE);
+		uint64_t paddr = gve_dma_addr(pages + (size_t)i * GVE_PAGE_SIZE);
 
 		page_bus[i] = bswap64(paddr);
 	}
@@ -744,7 +779,7 @@ static int gve_register_qpl(struct gve_device *gdev, struct uk_alloc *a,
 	cmd.reg_page_list.page_list_id = bswap32(qpl_id);
 	cmd.reg_page_list.num_pages = bswap32(num_pages);
 	cmd.reg_page_list.page_address_list_addr =
-		bswap64((uint64_t)(uintptr_t)page_bus);
+		bswap64(gve_dma_addr(page_bus));
 	cmd.reg_page_list.page_size = bswap64(GVE_PAGE_SIZE);
 
 	rc = gve_adminq_exec(gdev->reg_bar0, gdev->adminq,
@@ -829,8 +864,8 @@ static int gve_configure_rss(struct gve_device *gdev)
 
 	gve_adminq_fill_configure_rss(&cmd, hash_types,
 				      GVE_RSS_HASH_ALG_TOEPLITZ,
-				      (uint64_t)(uintptr_t)key, key_size,
-				      (uint64_t)(uintptr_t)lut, lut_size);
+				      gve_dma_addr(key), key_size,
+				      gve_dma_addr(lut), lut_size);
 	rc = gve_adminq_exec(gdev->reg_bar0, gdev->adminq,
 			     &gdev->adminq_prod_cnt, &cmd, &cmd_status);
 	uk_pr_info("gve: CONFIGURE_RSS types=0x%x alg=top key=%u lut=%u queues=%u rc=%d status=0x%x\n",
@@ -917,8 +952,8 @@ static int gve_configure_resources(struct gve_device *gdev)
 
 		gve_adminq_fill_configure_resources(
 			&cmd,
-			(uint64_t)(uintptr_t)gdev->counter_array,
-			(uint64_t)(uintptr_t)gdev->irq_db_indices,
+			gve_dma_addr(gdev->counter_array),
+			gve_dma_addr(gdev->irq_db_indices),
 			gdev->num_event_counters,
 			num_ntfy,
 			(uint8_t)gdev->queue_format);
@@ -944,8 +979,8 @@ static int gve_configure_resources(struct gve_device *gdev)
 		gdev->queue_format = GVE_GQI_QPL_FORMAT;
 		gve_adminq_fill_configure_resources(
 			&cmd,
-			(uint64_t)(uintptr_t)gdev->counter_array,
-			(uint64_t)(uintptr_t)gdev->irq_db_indices,
+			gve_dma_addr(gdev->counter_array),
+			gve_dma_addr(gdev->irq_db_indices),
 			gdev->num_event_counters,
 			ntfy_candidates[0],
 			(uint8_t)gdev->queue_format);
@@ -981,7 +1016,7 @@ static int gve_configure_resources(struct gve_device *gdev)
 		cmd.get_ptype_map.ptype_map_len =
 			bswap64(sizeof(struct gve_ptype_lut));
 		cmd.get_ptype_map.ptype_map_addr =
-			bswap64((uint64_t)(uintptr_t)gdev->ptype_lut_dqo);
+			bswap64(gve_dma_addr(gdev->ptype_lut_dqo));
 
 		rc = gve_adminq_exec(gdev->reg_bar0, gdev->adminq,
 				     &gdev->adminq_prod_cnt, &cmd, &cmd_status);
@@ -1611,11 +1646,11 @@ static struct uk_netdev_tx_queue *gve_netdev_txq_configure(
 
 		gve_adminq_fill_create_tx_queue(
 			&cmd, queue_id,
-			(uint64_t)(uintptr_t)txq->q_resources,
-			(uint64_t)(uintptr_t)txq->dqo_tx_ring,
+			gve_dma_addr(txq->q_resources),
+			gve_dma_addr(txq->dqo_tx_ring),
 			GVE_RAW_ADDRESSING_QPL_ID,
 			txq->ntfy_id,
-			(uint64_t)(uintptr_t)txq->dqo_compl_ring,
+			gve_dma_addr(txq->dqo_compl_ring),
 			txq->cnt,
 			txq->comp_cnt);
 	} else {
@@ -1656,8 +1691,8 @@ static struct uk_netdev_tx_queue *gve_netdev_txq_configure(
 
 		gve_adminq_fill_create_tx_queue(
 			&cmd, queue_id,
-			(uint64_t)(uintptr_t)txq->q_resources,
-			(uint64_t)(uintptr_t)txq->gqi_tx_ring,
+			gve_dma_addr(txq->q_resources),
+			gve_dma_addr(txq->gqi_tx_ring),
 			qpl_id,
 			txq->ntfy_id,
 			0,
@@ -1845,7 +1880,7 @@ static struct uk_netdev_rx_queue *gve_netdev_rxq_configure(
 		rxq->dqo_cur_gen_bit = 1;
 
 		for (i = 0; i < (uint32_t)(rxq->buf_cnt - 1U); i++) {
-			uint64_t baddr = (uint64_t)(uintptr_t)(
+			uint64_t baddr = gve_dma_addr(
 				rxq->dqo_rx_bufs + (size_t)i * GVE_DEFAULT_RX_BUFFER_SIZE);
 
 			rxq->dqo_bufq_ring[i].buf_id = (uint16_t)i;
@@ -1856,9 +1891,9 @@ static struct uk_netdev_rx_queue *gve_netdev_rxq_configure(
 
 		gve_adminq_fill_create_rx_queue(
 			&cmd, queue_id, 0, rxq->ntfy_id,
-			(uint64_t)(uintptr_t)rxq->q_resources,
-			(uint64_t)(uintptr_t)rxq->dqo_complq_ring,
-			(uint64_t)(uintptr_t)rxq->dqo_bufq_ring,
+			gve_dma_addr(rxq->q_resources),
+			gve_dma_addr(rxq->dqo_complq_ring),
+			gve_dma_addr(rxq->dqo_bufq_ring),
 			GVE_RAW_ADDRESSING_QPL_ID,
 			rxq->cnt,
 			GVE_DEFAULT_RX_BUFFER_SIZE,
@@ -1909,7 +1944,7 @@ static struct uk_netdev_rx_queue *gve_netdev_rxq_configure(
 			       (size_t)rxq->num_qpl_pages * GVE_PAGE_SIZE);
 
 			for (i = 0; i < rxq->cnt; i++) {
-				uint64_t paddr = (uint64_t)(uintptr_t)(
+				uint64_t paddr = gve_dma_addr(
 					rxq->qpl_pages + (size_t)i * GVE_PAGE_SIZE);
 
 				rxq->gqi_data_ring[i].addr = bswap64(paddr);
@@ -1919,9 +1954,9 @@ static struct uk_netdev_rx_queue *gve_netdev_rxq_configure(
 
 		gve_adminq_fill_create_rx_queue(
 			&cmd, queue_id, queue_id, rxq->ntfy_id,
-			(uint64_t)(uintptr_t)rxq->q_resources,
-			(uint64_t)(uintptr_t)rxq->gqi_desc_ring,
-			(uint64_t)(uintptr_t)rxq->gqi_data_ring,
+			gve_dma_addr(rxq->q_resources),
+			gve_dma_addr(rxq->gqi_desc_ring),
+			gve_dma_addr(rxq->gqi_data_ring),
 			qpl_id,
 			rxq->cnt,
 			GVE_DEFAULT_RX_BUFFER_SIZE,
@@ -2215,7 +2250,7 @@ static int gve_netdev_xmit(struct uk_netdev *dev,
 		gve_dqo_fill_tx_general_ctx_desc(
 			&queue->dqo_tx_ring[ctx_slot].general_ctx);
 		gve_dqo_fill_tx_pkt_desc(&queue->dqo_tx_ring[pkt_slot].pkt,
-					 (uint64_t)(uintptr_t)dst,
+					 gve_dma_addr(dst),
 					 (uint16_t)pkt_slot,
 					 (uint16_t)padded_len);
 		__asm__ __volatile__("mfence" ::: "memory");
@@ -2255,7 +2290,7 @@ static int gve_netdev_xmit(struct uk_netdev *dev,
 		} else {
 			dst = queue->bounce_bufs +
 			      (size_t)slot * GVE_DEFAULT_RX_BUFFER_SIZE;
-			addr = (uint64_t)(uintptr_t)dst;
+			addr = gve_dma_addr(dst);
 		}
 
 		for (iter = pkt; iter != NULL; iter = iter->next) {
@@ -2360,7 +2395,7 @@ static int gve_netdev_recv(struct uk_netdev *dev,
 			bslot = queue->dqo_bufq_tail;
 			queue->dqo_bufq_ring[bslot].buf_id = buf_id;
 			queue->dqo_bufq_ring[bslot].buf_addr =
-				(uint64_t)(uintptr_t)(queue->dqo_rx_bufs +
+				gve_dma_addr(queue->dqo_rx_bufs +
 				(size_t)buf_id * GVE_DEFAULT_RX_BUFFER_SIZE);
 			queue->dqo_bufq_ring[bslot].header_buf_addr = 0;
 			__asm__ __volatile__("mfence" ::: "memory");
@@ -2587,7 +2622,7 @@ static int gve_add_dev(struct pci_device *pdev)
 	}
 	memset(adminq, 0, GVE_PAGE_SIZE);
 	gdev->adminq = adminq;
-	adminq_paddr = (uint64_t)(uintptr_t)adminq;
+	adminq_paddr = gve_dma_addr(adminq);
 
 	if (rev < 0x1) {
 		mmio_write32(&reg_bar0->adminq_pfn,
@@ -2640,7 +2675,7 @@ static int gve_add_dev(struct pci_device *pdev)
 	cmd.verify_driver_compatibility.driver_info_len =
 		bswap64(sizeof(*drv_info));
 	cmd.verify_driver_compatibility.driver_info_addr =
-		bswap64((uint64_t)(uintptr_t)drv_info);
+		bswap64(gve_dma_addr(drv_info));
 
 	rc = gve_adminq_exec(reg_bar0, adminq, &gdev->adminq_prod_cnt, &cmd,
 			     &cmd_status);
@@ -2665,7 +2700,7 @@ static int gve_add_dev(struct pci_device *pdev)
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.opcode = bswap32(GVE_ADMINQ_DESCRIBE_DEVICE);
 	cmd.describe_device.device_descriptor_addr =
-		bswap64((uint64_t)(uintptr_t)desc_buf);
+		bswap64(gve_dma_addr(desc_buf));
 	cmd.describe_device.device_descriptor_version = bswap32(1);
 	cmd.describe_device.available_length = bswap32(GVE_PAGE_SIZE);
 
