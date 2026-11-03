@@ -100,8 +100,8 @@ static int gve_intr_policy(void)
 }
 
 #if !CONFIG_LIBUKPAGING
-/* 2 MiB page directories for mapping BAR0 (slot 0) and BAR2 (slot 1) */
-static uint64_t gve_bar_pd[2][512] __attribute__((aligned(4096)));
+/* 2 MiB page directories: BAR0 (slot 0), BAR2 (slot 1), BAR1 (slot 2) */
+static uint64_t gve_bar_pd[3][512] __attribute__((aligned(4096)));
 #endif
 
 struct gve_device;
@@ -185,7 +185,9 @@ struct gve_device {
 	volatile struct gve_registers *reg_bar0;
 	volatile uint32_t *db_bar2;
 	uint64_t bar0_size;	/* BAR0 byte size from the config-space probe */
+	uint64_t bar1_size;	/* BAR1 byte size from the config-space probe */
 	uint64_t bar2_size;	/* BAR2 byte size from the config-space probe */
+	volatile void *msix_bar1;	/* BAR1 window: MSI-X table BAR, NULL when unmapped */
 	union gve_adminq_command *adminq;
 	uint32_t adminq_prod_cnt;
 
@@ -286,7 +288,7 @@ static inline size_t align_up_page(size_t sz)
  *     it faulted on the page-table frame in cloud run
  *     ukg-1103-230211-382378.
  *   - Without ukpaging, the Unikraft 0.21 boot page table is still
- *     active, so the driver writes PDPT entries 4 and 5 directly.
+ *     active, so the driver writes PDPT entries 4, 5 and 6 directly.
  *     The RSS and MC cloud gates proved this path.
  *
  * Both variants keep the BAR offset inside its 1 GiB frame, so the
@@ -340,7 +342,7 @@ static volatile void *gve_map_bar(uint64_t paddr, int slot)
 	uint32_t i;
 	int rc;
 
-	if (paddr == 0 || slot < 0 || slot > 1)
+	if (paddr == 0 || slot < 0 || slot > 2)
 		return NULL;
 
 	pt = uk_paging_pt_get_active();
@@ -392,7 +394,7 @@ static void gve_unmap_bar(int slot)
 {
 	struct uk_pagetable *pt;
 
-	if (slot < 0 || slot > 1)
+	if (slot < 0 || slot > 2)
 		return;
 
 	pt = uk_paging_pt_get_active();
@@ -412,11 +414,11 @@ static void gve_unmap_bar(int slot)
 
 /*
  * Return the PDPT entry this driver uses for a BAR slot, or NULL
- * when the slot index is invalid. Slots 0 and 1 map PDPT entries 4
- * and 5, covering the 4 GiB and 5 GiB virtual regions.
+ * when the slot index is invalid. Slots 0, 1 and 2 map PDPT entries
+ * 4, 5 and 6, covering the 4 GiB to 6 GiB virtual regions.
  *
  * Assumption: the Unikraft 0.21 boot page table leaves PDPT entries
- * 4 and 5 empty. The present-bit check in gve_map_bar turns a broken
+ * 4 to 6 empty. The present-bit check in gve_map_bar turns a broken
  * assumption into a clean failure: a second gVNIC device fails its
  * map instead of clobbering the first device's window.
  */
@@ -426,7 +428,7 @@ static volatile uint64_t *gve_pdpt_entry(int slot)
 	uint64_t *pml4;
 	uint64_t *pdpt0;
 
-	if (slot < 0 || slot > 1)
+	if (slot < 0 || slot > 2)
 		return NULL;
 
 	__asm__ __volatile__("movq %%cr3, %0" : "=r"(cr3));
@@ -1200,8 +1202,13 @@ static void gve_msix_probe_check(struct gve_device *gdev)
 		bar_size = (uint32_t)gdev->bar2_size;
 		gdev->msix_table = (volatile uint32_t *)
 			((volatile uint8_t *)gdev->db_bar2 + gdev->msix_tbl_off);
+	} else if (gdev->msix_tbl_bir == 1U && gdev->msix_bar1 != NULL) {
+		bar_size = (uint32_t)gdev->bar1_size;
+		gdev->msix_table = (volatile uint32_t *)
+			((volatile uint8_t *)gdev->msix_bar1 +
+			 gdev->msix_tbl_off);
 	} else {
-		uk_pr_info("gve: MSI-X table in BAR%u (driver maps BAR0 and BAR2 only): RX stays polled\n",
+		uk_pr_info("gve: MSI-X table BAR%u is not mapped: RX stays polled\n",
 			   gdev->msix_tbl_bir);
 		return;
 	}
@@ -2496,7 +2503,8 @@ static int gve_add_dev(struct pci_device *pdev)
 	struct gve_device *gdev;
 	uint8_t bus, dev, func, rev;
 	uint32_t cmd_reg;
-	uint64_t bar0_paddr, bar2_paddr;
+	uint64_t bar0_paddr, bar1_paddr, bar2_paddr;
+	uint32_t bar1_reg;
 	volatile struct gve_registers *reg_bar0;
 	volatile uint32_t *db_bar2;
 	uint32_t dev_status, max_tx_q, max_rx_q;
@@ -2512,6 +2520,7 @@ static int gve_add_dev(struct pci_device *pdev)
 	uint16_t num_opts, total_len, i;
 	uint32_t opt_off, desc_region;
 	int mapped_bar0 = 0;
+	int mapped_bar1 = 0;
 	int mapped_bar2 = 0;
 	int has_gqi_raw = 0;
 	int cmd_may_run = 0;	/* a timeout may have left a command pending */
@@ -2600,6 +2609,29 @@ static int gve_add_dev(struct pci_device *pdev)
 
 	uk_pr_info("gve: Mapped BAR0 vaddr=%p, BAR2 vaddr=%p\n",
 		   (const void *)reg_bar0, (const void *)db_bar2);
+
+	/*
+	 * The GCP gVNIC device keeps the MSI-X table in BAR1: cloud
+	 * run ukg-1103-235946-493550 reported table offset 0x10000
+	 * with BIR 1. The core datapath does not need that BAR, so a
+	 * failed map does not fail the probe. gdev->msix_bar1 stays
+	 * NULL and gve_msix_probe_check keeps RX polled. A 64-bit
+	 * BAR1 puts its high half in BAR2, the doorbell BAR that
+	 * must stay separate, so the driver refuses that layout.
+	 * Ticket eae6a73726.
+	 */
+	bar1_reg = uk_pci_read_config32(&pdev->addr, PCI_BASE_ADDRESS_1);
+	bar1_paddr = uk_pci_read_bar(&pdev->addr, PCI_BASE_ADDRESS_1);
+	gdev->bar1_size = gve_bar_size(pdev, PCI_BASE_ADDRESS_1);
+	if ((bar1_reg & 0x1U) == 0U && ((bar1_reg >> 1) & 0x3U) != 0x2U &&
+	    gve_bar_fits_window(bar1_paddr, gdev->bar1_size)) {
+		gdev->msix_bar1 = gve_map_bar(bar1_paddr, 2);
+		mapped_bar1 = gdev->msix_bar1 != NULL;
+	}
+	uk_pr_info("gve: BAR1 paddr=0x%llx size=%llu msix_table_window=%s\n",
+		   (unsigned long long)bar1_paddr,
+		   (unsigned long long)gdev->bar1_size,
+		   gdev->msix_bar1 ? "mapped" : "off: RX stays polled");
 
 	dev_status = bswap32(mmio_read32(&reg_bar0->device_status));
 	max_tx_q = bswap32(mmio_read32(&reg_bar0->max_tx_queues));
@@ -3026,6 +3058,8 @@ err:
 	} else {
 		uk_pr_err("gve: probe aborted with a command possibly pending, leaking adminq, driver info, and descriptor buffers\n");
 	}
+	if (mapped_bar1)
+		gve_unmap_bar(2);
 	if (mapped_bar2)
 		gve_unmap_bar(1);
 	if (mapped_bar0)
