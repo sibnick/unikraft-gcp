@@ -25,19 +25,36 @@ BUILD_DIR="${APP_DIR}/build"
 DISK_RAW="${BUILD_DIR}/disk.raw"
 IMAGE_NAME="${2:-${UKG_RUN}-img}"
 CMDLINE_ARGS="${3:-}"
+# Optional multiboot module: a CPIO initrd that GRUB loads next to the
+# kernel. app-elfloader samples (samples/nginx) use it as the guest
+# root filesystem. Empty keeps the disk layout of every earlier run.
+# Ticket 4ecf9dcedf.
+INITRD_SRC="${4:-}"
+# UKG_IMAGE_PUSH=0 builds the disk image locally and stops: no bucket,
+# no upload, no image registration. Host checks (samples/nginx
+# scripts/qemu_local.sh) use this mode so no billable call happens.
+# The default 1 keeps every existing caller unchanged. Ticket 4ecf9dcedf.
+UKG_IMAGE_PUSH="${UKG_IMAGE_PUSH:-1}"
+
+if [ -n "${INITRD_SRC}" ] && { [ ! -f "${INITRD_SRC}" ] || [ ! -s "${INITRD_SRC}" ]; }; then
+    echo "[ERROR] Initrd module not found or empty: ${INITRD_SRC}" >&2
+    exit 1
+fi
 
 # Validate before any filesystem or cloud operation. The name feeds a
 # local tar path, an upload object, and an image delete call. A
 # path-like or foreign value must never reach those. Ticket 5e6a2acd8a.
 ukg_validate_image_name "${IMAGE_NAME}" "${UKG_RUN}"
 
-if [ -z "${GCP_PROJECT}" ]; then
-    echo "[ERROR] GCP_PROJECT is not set." >&2
-    exit 1
-fi
-if [ -z "${GCP_BUCKET}" ]; then
-    echo "[ERROR] GCP_BUCKET is not set." >&2
-    exit 1
+if [ "${UKG_IMAGE_PUSH}" = "1" ]; then
+    if [ -z "${GCP_PROJECT}" ]; then
+        echo "[ERROR] GCP_PROJECT is not set." >&2
+        exit 1
+    fi
+    if [ -z "${GCP_BUCKET}" ]; then
+        echo "[ERROR] GCP_BUCKET is not set." >&2
+        exit 1
+    fi
 fi
 
 # Fail fast when the BIOS GRUB modules are missing. Without them the
@@ -50,8 +67,12 @@ if [ ! -d "${GRUB_PC_DIR}" ]; then
 fi
 
 echo "[INFO] Run ID: ${UKG_RUN}"
-echo "[INFO] Project: ${GCP_PROJECT}"
-echo "[INFO] Bucket: ${GCP_BUCKET}"
+if [ "${UKG_IMAGE_PUSH}" = "1" ]; then
+    echo "[INFO] Project: ${GCP_PROJECT}"
+    echo "[INFO] Bucket: ${GCP_BUCKET}"
+else
+    echo "[INFO] UKG_IMAGE_PUSH=0: local disk build only, no cloud calls."
+fi
 echo "[INFO] Building application in ${APP_DIR}..."
 
 # Build unikernel if binary does not exist
@@ -81,6 +102,18 @@ cp "${KERNEL_BIN}" "${STAGING_DIR}/boot/unikraft.elf"
 cp "${GRUB_PC_DIR}"/*.mod "${STAGING_DIR}/boot/grub/i386-pc/"
 cp "${GRUB_PC_DIR}"/*.lst "${STAGING_DIR}/boot/grub/i386-pc/"
 
+# Optional initrd module. GRUB loads it as a Multiboot module and the
+# unikernel unpacks it into ramfs at / (CONFIG_LIBVFSCORE_AUTOMOUNT_CI_
+# INITRD). Boot arguments after the ' --' separator in CMDLINE_ARGS go
+# to the application, so the runner puts every netdev.ip=... argument
+# before it and ukboot, not nginx, reads them. Ticket 4ecf9dcedf.
+INITRD_GRUB_LINE=""
+if [ -n "${INITRD_SRC}" ]; then
+    echo "[INFO] Adding initrd multiboot module: ${INITRD_SRC}"
+    cp "${INITRD_SRC}" "${STAGING_DIR}/boot/initrd.cpio"
+    INITRD_GRUB_LINE=$'\n    module /boot/initrd.cpio'
+fi
+
 cat << GRUB_CFG > "${STAGING_DIR}/boot/grub/grub.cfg"
 set default=0
 set timeout=1
@@ -90,7 +123,7 @@ terminal_input serial
 terminal_output serial
 
 menuentry 'unikraft' {
-    multiboot /boot/unikraft.elf ${CMDLINE_ARGS}
+    multiboot /boot/unikraft.elf ${CMDLINE_ARGS}${INITRD_GRUB_LINE}
     boot
 }
 GRUB_CFG
@@ -126,6 +159,12 @@ grub-mkimage -O i386-pc -o "${CORE_IMG}" -p "(hd0,msdos1)/boot/grub" \
     biosdisk part_msdos fat ext2 multiboot normal configfile serial terminfo
 dd if="${GRUB_PC_DIR}/boot.img" of="${DISK_RAW}" bs=446 count=1 conv=notrunc status=none
 dd if="${CORE_IMG}" of="${DISK_RAW}" bs=512 seek=1 conv=notrunc status=none
+
+if [ "${UKG_IMAGE_PUSH}" != "1" ]; then
+    echo "[SUCCESS] Local disk image ready: ${DISK_RAW}"
+    echo "DISK_RAW=${DISK_RAW}"
+    exit 0
+fi
 
 echo "[INFO] Packaging disk image as tar.gz for GCP..."
 # The local tar name and the uploaded object name match on purpose.

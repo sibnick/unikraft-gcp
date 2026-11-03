@@ -1,0 +1,37 @@
+From: Nik <sibnick@gmail.com>
+Subject: [PATCH] plat/kvm/x86: keep TLS bytes in the data segment for app-elfloader
+
+0001-plat-kvm-x86-drop-tls-phdrs.patch removed the tls and tls_load program
+headers. A configuration that carries real .tdata content, such as the
+app-elfloader sample, then fails to link: ld reports "section .tdata assigned
+to non-existent phdr". Re-annotate the TLS section into the data segment. The
+unikernel reads the TLS template through the _tls_start and _etdata symbols,
+not through PT_TLS, so no segment is lost and GRUB still sees three clean
+load segments. Ticket 4ecf9dcedf.
+---
+ plat/kvm/x86/link64.lds.S | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/plat/kvm/x86/link64.lds.S b/plat/kvm/x86/link64.lds.S
+index fc156a0..fea326c 100644
+--- a/plat/kvm/x86/link64.lds.S
++++ b/plat/kvm/x86/link64.lds.S
+@@ -26,6 +26,18 @@
+ #include <uk/arch/limits.h> /* for __PAGE_SIZE */
+ #include <uk/plat/common/common.lds.h>
+ 
++/* 0001-plat-kvm-x86-drop-tls-phdrs.patch removed the tls and tls_load
++ * program headers to keep GRUB from seeing overlapping load segments.
++ * A configuration with a real .tdata (app-elfloader) still has to land
++ * those bytes in a load segment. The unikernel reads the TLS template
++ * through the _tls_start and _etdata symbols, not through PT_TLS, so
++ * keep the TLS section inside the data segment instead.
++ */
++#undef UK_SEGMENT_TLS
++#define UK_SEGMENT_TLS
++#undef UK_SEGMENT_TLS_LOAD
++#define UK_SEGMENT_TLS_LOAD :data
++
+ #define BASE_ADDR 0x100000
+ 
+ PHDRS

@@ -1,0 +1,85 @@
+From: Nik <sibnick@gmail.com>
+Subject: [PATCH] plat/kvm/x86: make the LAPIC one-shot idle wake optional
+
+The nginx sample hangs on Google Cloud when the per-vCPU LAPIC one-shot wake
+is active. The prepare probe passes: the masked one-shot counter runs down.
+The guest still never wakes the halted core, so no packet is processed after
+the first idle. The probe cannot see a hypervisor that counts but never
+delivers the timer vector. Every GCP gate in this repo used the i8254 idle
+wake because the one-shot code arrived later, in patch 0003. Ticket
+4ecf9dcedf.
+
+Add CONFIG_KVM_X86_LAPIC_ONESHOT, default y, and guard the one-shot code and
+the dispatch in tscclock_cpu_block. A single-vCPU image can disable it and
+use the i8254 wake, the path proven on GCP.
+---
+ plat/kvm/Config.uk     | 13 +++++++++++++
+ plat/kvm/x86/tscclock.c |  6 +++++-
+ 2 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/plat/kvm/Config.uk b/plat/kvm/Config.uk
+index 34a433a..56fb2b1 100644
+--- a/plat/kvm/Config.uk
++++ b/plat/kvm/Config.uk
+@@ -141,3 +141,16 @@ config KVM_VMM_QEMU_ISA_DEBUG_EXIT
+ 	depends on LIBUKPM
+ 	depends on KVM_VMM_QEMU
+ 	depends on ARCH_X86_64
++
++config KVM_X86_LAPIC_ONESHOT
++	bool "Per-vCPU LAPIC one-shot CPU idle wake"
++	depends on ARCH_X86_64
++	default y
++	help
++	  Arm the local APIC timer of the calling core to wake a halted
++	  core. The i8254 fallback reaches only vCPU 0, so keep this
++	  enabled for multicore images. Single-core images can disable
++	  it and use the i8254 idle wake. The prepare probe checks that
++	  the masked one-shot counter runs down. Some hypervisors
++	  emulate the counter, but do not deliver the timer vector to a
++	  halted core, and the probe cannot see that case.
+diff --git a/plat/kvm/x86/tscclock.c b/plat/kvm/x86/tscclock.c
+index e9e3111..091231a 100644
+--- a/plat/kvm/x86/tscclock.c
++++ b/plat/kvm/x86/tscclock.c
+@@ -319,6 +319,7 @@ __u64 tscclock_epochoffset(void)
+  */
+ #define PIT_MIN_DELTA	16
+ 
++#if CONFIG_KVM_X86_LAPIC_ONESHOT
+ /*
+  * Per-vCPU LAPIC one-shot wake. [Ticket a5b91e7993]
+  *
+@@ -529,6 +530,7 @@ static void tscclock_cpu_block_lapic(unsigned int id, __u64 delta_ns)
+ 
+ 	uk_lcpu_halt_irq();
+ }
++#endif /* CONFIG_KVM_X86_LAPIC_ONESHOT */
+ 
+ /*
+  * Returns early if any interrupts are serviced, or if the requested delay is
+@@ -546,7 +548,7 @@ static void tscclock_cpu_block(__u64 until)
+ 	__u64 now, delta_ns;
+ 	__u64 delta_ticks;
+ 	unsigned int ticks;
+-	unsigned int id;
++	unsigned int id __maybe_unused;
+ 
+ 	UK_ASSERT(uk_lcpu_irqs_disabled());
+ 
+@@ -560,6 +562,7 @@ static void tscclock_cpu_block(__u64 until)
+ 	 * if it fails, this core keeps the i8254 arm.
+ 	 * [Ticket a5b91e7993]
+ 	 */
++#if CONFIG_KVM_X86_LAPIC_ONESHOT
+ 	id = uk_pcpuvar_current_get(uk_pcpuvar_cpu_id);
+ 	if (id < LAPIC_MAX_CPUS) {
+ 		if (!lapic_tried[id])
+@@ -569,6 +572,7 @@ static void tscclock_cpu_block(__u64 until)
+ 			return;
+ 		}
+ 	}
++#endif
+ 
+ 	/*
+ 	 * Compute delta in PIT ticks. Return if it is less than minimum safe

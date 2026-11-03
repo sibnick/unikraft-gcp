@@ -1,0 +1,61 @@
+From: Nik <sibnick@gmail.com>
+Subject: [PATCH] lib/posix-eventfd: accept FIONBIO on eventfd files
+
+The posix-fdio ioctl path sets the file mode for FIONBIO first, then forwards
+UKFILE_CTL_IOCTL to the file. The eventfd file ops use uk_file_nop_ctl, so
+the request returns -ENOSYS and uk_sys_ioctl() reports -ENOTTY. Applications
+that follow the POSIX pattern for a non-blocking eventfd then fail. nginx runs
+exactly that pattern: ioctl(eventfd, FIONBIO) in ngx_epoll_aio_init. Ticket
+4ecf9dcedf.
+
+Add a small ctl handler. It returns success for FIONBIO, because the mode is
+already applied, and passes every other request to uk_file_nop_ctl.
+---
+ lib/posix-eventfd/eventfd.c | 21 ++++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/lib/posix-eventfd/eventfd.c b/lib/posix-eventfd/eventfd.c
+index 6985d09..296dd71 100644
+--- a/lib/posix-eventfd/eventfd.c
++++ b/lib/posix-eventfd/eventfd.c
+@@ -5,6 +5,9 @@
+  */
+ 
+ #include <sys/eventfd.h>
++#include <sys/ioctl.h>
++
++#include <uk/file.h>
+ 
+ #include <uk/alloc.h>
+ #include <uk/errptr.h>
+@@ -109,13 +112,29 @@ static ssize_t evfd_write(const struct uk_file *f,
+ 	return sizeof(val);
+ }
+ 
++/*
++ * The posix-fdio layer applies FIONBIO to the open file mode before it
++ * dispatches UKFILE_CTL_IOCTL here. Without this handler the call falls
++ * through to -ENOSYS, which uk_sys_ioctl() turns into -ENOTTY, and the
++ * application sees a failed non-blocking switch. Accept the request:
++ * the flag is already set.
++ */
++static int evfd_ctl(const struct uk_file *f __unused, int fam, int req,
++		    uintptr_t arg1 __unused, uintptr_t arg2 __unused,
++		    uintptr_t arg3 __unused)
++{
++	if (fam == UKFILE_CTL_IOCTL && req == FIONBIO)
++		return 0;
++	return uk_file_nop_ctl(f, fam, req, arg1, arg2, arg3);
++}
++
+ static const struct uk_file_ops evfd_ops = {
+ 	.read = evfd_read,
+ 	.write = evfd_write,
+ 	.mem = uk_file_nop_mem,
+ 	.getstat = uk_file_nop_getstat,
+ 	.setstat = uk_file_nop_setstat,
+-	.ctl = uk_file_nop_ctl
++	.ctl = evfd_ctl
+ };
+ 
+ static void evfd_release(const struct uk_file *f, int what)

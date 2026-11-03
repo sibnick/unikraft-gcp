@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: BSD-3-Clause
-# Prepare pinned Unikraft core at RELEASE-0.21.0 (7351f8b563c9e6773da9fdd5bacde6ac91e32112)
-# and lib-lwip at RELEASE-0.21.0 (ec55ae17618feeb57c8c10109bcf5c42723e8e95).
+# Prepare pinned Unikraft core at RELEASE-0.21.0 (7351f8b563c9e6773da9fdd5bacde6ac91e32112),
+# lib-lwip at RELEASE-0.21.0 (ec55ae17618feeb57c8c10109bcf5c42723e8e95), and the
+# two libraries that samples/nginx needs: app-elfloader at RELEASE-0.21.0
+# (6ecbcd08d85b4688112a3b275a9c8446cf59e25d) and lib-libelf (libelf) at the commit
+# the proven ENA nginx build carried (c03d4ceb22a2b9e9799238f9c277a14284d313ad).
 # Fetch by commit hash, not by tag. A tag can move and then no longer
-# contains the pinned commit. Ticket 4347c2a8e6 L3.
+# contains the pinned commit. Ticket 4347c2a8e6 L3. The upstream
+# app-elfloader tag RELEASE-0.21.0 already moved once, so the hash pin is
+# mandatory. Ticket 4ecf9dcedf.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -15,6 +20,18 @@ UK_URL="https://github.com/unikraft/unikraft.git"
 LWIP_DEST="${ROOT_DIR}/.unikraft/libs/lwip"
 LWIP_COMMIT="ec55ae17618feeb57c8c10109bcf5c42723e8e95"
 LWIP_URL="https://github.com/unikraft/lib-lwip.git"
+
+# app-elfloader is not in the KraftKit package index. The samples/nginx
+# build uses this clone. Ticket 4ecf9dcedf.
+APPELFLOADER_DEST="${ROOT_DIR}/.unikraft/libs/app-elfloader"
+APPELFLOADER_COMMIT="6ecbcd08d85b4688112a3b275a9c8446cf59e25d"
+APPELFLOADER_URL="https://github.com/unikraft/app-elfloader.git"
+
+# app-elfloader reads ELF program headers through libelf (unikraft/lib-libelf).
+# This is the commit the proven ENA nginx build carried. Ticket 4ecf9dcedf.
+LIBELF_DEST="${ROOT_DIR}/.unikraft/libs/libelf"
+LIBELF_COMMIT="c03d4ceb22a2b9e9799238f9c277a14284d313ad"
+LIBELF_URL="https://github.com/unikraft/lib-libelf.git"
 
 # Clone or update one repository to the pinned commit. Shallow fetch
 # of the commit keeps the download small.
@@ -44,6 +61,12 @@ ukg_fetch_pinned "${UK_URL}" "${UK_DEST}" "${UK_COMMIT}"
 
 # 2. lib-lwip
 ukg_fetch_pinned "${LWIP_URL}" "${LWIP_DEST}" "${LWIP_COMMIT}"
+
+# 3. app-elfloader (no patches)
+ukg_fetch_pinned "${APPELFLOADER_URL}" "${APPELFLOADER_DEST}" "${APPELFLOADER_COMMIT}"
+
+# 4. libelf (no patches)
+ukg_fetch_pinned "${LIBELF_URL}" "${LIBELF_DEST}" "${LIBELF_COMMIT}"
 
 # Apply patches from patches/ directory if present.
 # Try the forward pass for one repository's patch set. Arg $1: target
@@ -130,3 +153,5 @@ fi
 
 echo "[SUCCESS] Unikraft core is ready at ${UK_DEST} (commit: ${UK_COMMIT})."
 echo "[SUCCESS] lib-lwip is ready at ${LWIP_DEST} (commit: ${LWIP_COMMIT})."
+echo "[SUCCESS] app-elfloader is ready at ${APPELFLOADER_DEST} (commit: ${APPELFLOADER_COMMIT})."
+echo "[SUCCESS] libelf is ready at ${LIBELF_DEST} (commit: ${LIBELF_COMMIT})."

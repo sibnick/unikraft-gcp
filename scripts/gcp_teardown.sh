@@ -262,7 +262,9 @@ clean_gcs_objects() {
         local obj
         for obj in "${RUN_ID}-img-disk.tar.gz" \
                    "${RUN_ID}-srv-img-disk.tar.gz" \
-                   "${RUN_ID}-cli-img-disk.tar.gz"; do
+                   "${RUN_ID}-srvb-img-disk.tar.gz" \
+                   "${RUN_ID}-cli-img-disk.tar.gz" \
+                   "${RUN_ID}-can-img-disk.tar.gz"; do
             remove_gcs_object "gs://${GCP_BUCKET}/${obj}"
         done
         return 0

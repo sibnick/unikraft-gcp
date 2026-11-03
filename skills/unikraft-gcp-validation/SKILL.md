@@ -25,6 +25,8 @@ the captured serial log for these exact tokens.
 | `GATE_GVE_PASS` | gve queues created and uk_netdev interface configured. Phase B2 done | `a1c1337265` |
 | `GATE_RSS_PASS` | gve carried traffic on every RX queue of N pairs: `GATE_RSS_PASS queues=N perq=...` in the server log. RSS multi-queue gate | `a9b1936640` |
 | `GATE_RSS_TRAFFIC` | gate-rss client saw 99 percent of its flow packets echoed back. RSS multi-queue gate, pair half | `a9b1936640` |
+| `GATE_NGINX_SMOKE_PASS` | client curl GET / returned HTTP 200 with the test page body: `GATE_NGINX_SMOKE_PASS status=200 marker=ok ...` in the client log. The served body also lands in the client serial log between `NGINX_BODY_BEGIN` and `NGINX_BODY_END`. nginx elfloader smoke gate | `4ecf9dcedf` |
+| `GATE_NGINX_SMOKE_FAIL` | client curl did not see HTTP 200 with the test page, or never reached the target. Follow with the failing fields | `4ecf9dcedf` |
 | `GATE_FAIL` | Any gate failed. Follow with the failing step name | current ticket |
 
 A run is valid only when the log shows the expected marker and the
@@ -102,6 +104,13 @@ command instead. Ticket c16353731a.
    every queue non-zero, and the client must show
    `GATE_RSS_TRAFFIC`. Run the gate once with two pairs and once with
    four pairs.
+8. nginx smoke (ticket `4ecf9dcedf`): `scripts/gcp_run_nginx.sh
+   <run-id>` boots the `samples/nginx` unikernel (app-elfloader plus a
+   CPIO initrd multiboot module) on a first or second generation VM
+   with virtio-net. The Ubuntu client VM fetches `GET /` with curl.
+   The client serial log must show `GATE_NGINX_SMOKE_PASS status=200
+   marker=ok`. The gate is client-side: the unikernel app is stock
+   nginx and prints no gate marker of its own.
 
 One agent drives one gate at a time. The full lifecycle is in
 `AGENTS.md`.

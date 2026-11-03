@@ -46,7 +46,11 @@ ukg_default_run_id() {
 # its anchored name filter from this list. A run script that creates
 # a resource with a new derived name must extend this list in the
 # same change. Ticket 74936642ce.
-UKG_RUN_SUFFIXES="srv cli img srv-img cli-img allow-internal"
+# can/can-img and srvb/srvb-img serve the instrumented diagnostic run:
+# a canary that runs the proven no-threads httpreply image, and a
+# second nginx target that carries the static-ARP peer boot argument.
+# Ticket 4ecf9dcedf.
+UKG_RUN_SUFFIXES="srv srvb cli img srv-img srvb-img cli-img can can-img allow-internal"
 
 # Print the anchored resource-name regex for one run id. The regex
 # matches the run id itself and every name derived from it through
