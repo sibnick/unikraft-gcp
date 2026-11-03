@@ -19,7 +19,12 @@
 #include <uk/netdev_core.h>
 #include <uk/netdev_driver.h>
 #include <uk/plat/time.h>
+#include <uk/intctlr.h>
 #include <gve.h>
+
+#if CONFIG_LIBUKLIBPARAM
+#include <uk/libparam.h>
+#endif
 
 #define DRIVER_NAME		"gve"
 #define GVE_PAGE_SIZE		4096UL
@@ -41,7 +46,53 @@
  */
 #define GVE_MAX_QUEUES		8U
 
+/*
+ * Bound on pool irqs: one per notification block plus the mgmt
+ * vector, for the largest pair budget the driver can hold. The pool
+ * is allocated at probe, so it must not depend on the queue count a
+ * caller configures later.
+ */
+#define GVE_MSIX_MAX_IRQS	(2U * GVE_MAX_QUEUES + 1U)
+
 static struct uk_alloc *drv_alloc;
+
+/*
+ * Interrupt RX switch (ticket eae6a73726). The boot parameter
+ * 'gve.intr=0' keeps every notification block masked, so the device
+ * never raises an MSI-X event and the stack falls back to its own
+ * polled RX path. The same fallback happens automatically when:
+ *   - the kernel has no local APIC EOI (CONFIG_LIBUKINTCTLR_APIC=n),
+ *   - the negotiated queue format is not DQO_RDA,
+ *   - or the MSI-X capability, table, or vectors are unavailable.
+ * With the interrupt path on, RX reaches lwIP through the uknetdev
+ * dispatcher thread, not through a poll thread.
+ */
+#if CONFIG_LIBUKLIBPARAM
+static int gve_intr = 1;
+UK_LIBPARAM_PARAM_ALIAS(intr, &gve_intr, int,
+			"Enable MSI-X interrupt RX (0=polled fallback)");
+#endif
+
+/*
+ * Decide the RX interrupt policy before the probe reads the MSI-X
+ * capability. The LAPIC EOI is mandatory: without it the in-service
+ * bit of the delivered vector stays set and the local APIC blocks
+ * that vector forever. The option is a preprocessor check because
+ * the symbol is simply absent in PIC-only kernels.
+ */
+static int gve_intr_policy(void)
+{
+#if CONFIG_LIBUKINTCTLR_APIC
+#if CONFIG_LIBUKLIBPARAM
+	return gve_intr;
+#else
+	return 1;
+#endif
+#else
+	uk_pr_info("gve: CONFIG_LIBUKINTCTLR_APIC is off: RX stays polled\n");
+	return 0;
+#endif
+}
 
 /* 2 MiB page directories for mapping BAR0 (slot 0) and BAR2 (slot 1) */
 static uint64_t gve_bar_pd[2][512] __attribute__((aligned(4096)));
@@ -114,6 +165,11 @@ struct uk_netdev_rx_queue {
 	uint8_t qpl_registered;	/* device holds this QPL: unregister on free */
 	uint8_t *qpl_pages;
 	uint64_t *qpl_page_bus;
+
+	/* MSI-X interrupt RX state (ticket eae6a73726) */
+	uint8_t intr_enabled;	/* rxq_intr_enable armed this queue */
+	uint32_t irq_db_idx;	/* BAR2 IRQ doorbell, checked at enable */
+	volatile uint32_t msix_events;	/* RX MSI-X events, ISR-owned */
 };
 
 struct gve_device {
@@ -164,6 +220,28 @@ struct gve_device {
 	uint16_t queue_pairs;
 	struct uk_netdev_tx_queue *txq[GVE_MAX_QUEUES];
 	struct uk_netdev_rx_queue *rxq[GVE_MAX_QUEUES];
+
+	/* MSI-X interrupt RX state (ticket eae6a73726). The device
+	 * maps notification block i to MSI-X table entry i because
+	 * CONFIGURE_DEVICE_RESOURCES uses ntfy_blk_msix_base_idx 0.
+	 * Each entry carries an irq from the platform pool allocated
+	 * at probe time, before the first info_get: info_get caches
+	 * the RX-interrupt feature into the stack, so after that
+	 * point the driver must never lose the path. Pool entry
+	 * msix_irq_pool[i] stores irq + 1; 0 means none. TX blocks
+	 * and the mgmt vector keep their table entry masked. */
+	int intr_want;			/* policy from gve.intr and APIC */
+	int msix_capable;		/* probe reserved the pool */
+	int msix_enabled;		/* table programmed by configure */
+	uint32_t msix_cap_off;		/* capability offset in config space */
+	uint32_t msix_tbl_off;		/* table byte offset inside its BAR */
+	uint32_t msix_tbl_size;		/* vector count from the capability */
+	uint8_t msix_tbl_bir;		/* BAR that holds the table */
+	volatile uint32_t *msix_table;	/* mapped table, or NULL */
+	uint16_t msix_irq_pool[GVE_MSIX_MAX_IRQS];
+	uint8_t msix_pool_cnt;
+	volatile uint32_t msix_events;	/* total RX MSI-X events, ISR-owned */
+	uint8_t msix_marker_done;	/* gate marker printed once */
 };
 
 #define to_gvedev(ndev) \
@@ -836,6 +914,335 @@ static int gve_netdev_probe(struct uk_netdev *dev)
 	return 0;
 }
 
+/*
+ * ---------------------------------------------------------------------
+ * MSI-X interrupt RX (ticket eae6a73726)
+ * ---------------------------------------------------------------------
+ *
+ * The device maps notification block i to MSI-X table entry i because
+ * CONFIGURE_DEVICE_RESOURCES uses ntfy_blk_msix_base_idx 0. Blocks
+ * below num_ntfy_blks / 2 carry TX completion events, the blocks from
+ * num_ntfy_blks / 2 on carry RX events, and index num_ntfy_blks is
+ * the mgmt vector. This driver submits TX by doorbell and reclaims
+ * TX completions inside the send path, so only RX blocks ever need a
+ * live vector: TX blocks and the mgmt vector stay masked.
+ *
+ * An RX block delivers events only after its queue enables interrupts
+ * (uk_netdev_rxq_intr_enable), which registers the interrupt handler,
+ * programs and unmasks the table entry, and arms the block through
+ * the IRQ doorbell. The DQO device masks a block when it delivers an
+ * event and treats a write of the enable bit as re-arm. The PCI PBA
+ * keeps an event that arrived while masked pending, so arming after
+ * the ring drains cannot lose a packet: that is the same contract the
+ * Linux gve driver relies on in gve_napi_poll_dqo.
+ */
+
+/* Message control word inside the capability, preserved across writes. */
+static void gve_msix_set_ctrl(struct gve_device *gdev, uint16_t set,
+			      uint16_t clear)
+{
+	struct pci_device *pdev = gdev->pdev;
+	uint32_t dword = uk_pci_read_config32(&pdev->addr, gdev->msix_cap_off);
+	uint32_t cw = (dword >> 16) & 0xffffU;
+
+	cw = (uint32_t)((cw & ~clear) | set);
+	dword = (dword & 0xffffU) | (cw << 16);
+	uk_pci_write_config32(&pdev->addr, gdev->msix_cap_off, dword);
+}
+
+static volatile uint32_t *gve_msix_entry(struct gve_device *gdev, uint32_t blk)
+{
+	return gdev->msix_table + blk * (GVE_MSIX_ENTRY_SIZE / 4U);
+}
+
+/*
+ * Find the MSI-X capability. Returns 0 and fills the capability
+ * offset, table size, table offset, and BIR. The walk is bounded:
+ * a looping capability list must not hang the probe.
+ */
+static int gve_msix_find_cap(struct pci_device *pdev, uint32_t *cap_off,
+			     uint32_t *tbl_size, uint32_t *tbl_off,
+			     uint8_t *tbl_bir)
+{
+	uint32_t status = uk_pci_read_config32(&pdev->addr,
+					       GVE_PCI_CFG_DWORD_STATUS);
+	uint32_t ptr, idnext;
+	int hops;
+
+	if (((status & 0xffffU) & GVE_PCI_STATUS_CAP_LIST) == 0)
+		return -ENODEV;
+
+	ptr = uk_pci_read_config32(&pdev->addr, GVE_PCI_CAP_LIST_PTR) & 0xffU;
+	for (hops = 0; hops < 48; hops++) {
+		uint32_t ctrl, tblreg;
+
+		if (ptr < 0x40U || (ptr & 0x3U) != 0)
+			break;	/* not a dword-aligned capability offset */
+		idnext = uk_pci_read_config32(&pdev->addr, ptr);
+		if ((idnext & 0xffU) == GVE_PCI_CAP_ID_MSIX) {
+			ctrl = (idnext >> 16) & 0xffffU;
+			tblreg = uk_pci_read_config32(&pdev->addr,
+						      ptr + GVE_MSIX_DWORD_TBLOFF);
+			*cap_off = ptr;
+			*tbl_size = GVE_MSIX_CTRL_SIZE(ctrl);
+			*tbl_off = GVE_MSIX_TBL_OFF(tblreg);
+			*tbl_bir = (uint8_t)GVE_MSIX_TBL_BIR(tblreg);
+			return 0;
+		}
+		ptr = (idnext >> 8) & 0xffU;
+	}
+	return -ENODEV;
+}
+
+/*
+ * Probe-time readiness check and pool reservation. Runs before the
+ * first uk_netdev_info_get, whose RX-interrupt feature the stack
+ * caches: after that point the interrupt path must never fail for a
+ * reason the probe could have seen. Hence the pool covers the worst
+ * notification-block count any configure outcome can use, and the
+ * table is resolved to a mapped BAR here.
+ */
+static void gve_msix_probe_check(struct gve_device *gdev)
+{
+	struct pci_device *pdev = gdev->pdev;
+	uint32_t worst_irqs, bar_size, got = 0;
+	unsigned int irq;
+	uint32_t i;
+
+	gdev->intr_want = gve_intr_policy();
+	if (!gdev->intr_want) {
+		uk_pr_info("gve: interrupt RX off: RX stays polled\n");
+		return;
+	}
+	if (gdev->queue_format != GVE_DQO_RDA_FORMAT) {
+		uk_pr_info("gve: queue format %s has no interrupt RX path: RX stays polled\n",
+			   gve_queue_format_name(gdev->queue_format));
+		return;
+	}
+	if (gve_msix_find_cap(pdev, &gdev->msix_cap_off, &gdev->msix_tbl_size,
+			      &gdev->msix_tbl_off, &gdev->msix_tbl_bir) != 0) {
+		uk_pr_info("gve: no MSI-X capability: RX stays polled\n");
+		return;
+	}
+	if (gdev->msix_tbl_bir == 0U) {
+		bar_size = (uint32_t)gdev->bar0_size;
+		gdev->msix_table = (volatile uint32_t *)
+			((volatile uint8_t *)gdev->reg_bar0 + gdev->msix_tbl_off);
+	} else if (gdev->msix_tbl_bir == 2U) {
+		bar_size = (uint32_t)gdev->bar2_size;
+		gdev->msix_table = (volatile uint32_t *)
+			((volatile uint8_t *)gdev->db_bar2 + gdev->msix_tbl_off);
+	} else {
+		uk_pr_info("gve: MSI-X table in BAR%u (driver maps BAR0 and BAR2 only): RX stays polled\n",
+			   gdev->msix_tbl_bir);
+		return;
+	}
+	if ((uint64_t)gdev->msix_tbl_off +
+	    (uint64_t)gdev->msix_tbl_size * GVE_MSIX_ENTRY_SIZE >
+	    (uint64_t)bar_size) {
+		uk_pr_info("gve: MSI-X table window past BAR%u size: RX stays polled\n",
+			   gdev->msix_tbl_bir);
+		return;
+	}
+
+	/*
+	 * Worst-case blocks: the configure path may request one block
+	 * per queue in each direction plus the mgmt vector. The pool
+	 * is capped, so a device with a wider fan-out keeps polled RX
+	 * instead of a pool sized at runtime.
+	 */
+	worst_irqs = gdev->max_tx_queues + gdev->max_rx_queues;
+	if (worst_irqs > gdev->num_event_counters)
+		worst_irqs = gdev->num_event_counters;
+	worst_irqs += 1U;	/* mgmt vector */
+	if (worst_irqs > GVE_MSIX_MAX_IRQS || worst_irqs > gdev->msix_tbl_size) {
+		uk_pr_info("gve: %u IRQs needed but pool is %u and table has %u: RX stays polled\n",
+			   worst_irqs, GVE_MSIX_MAX_IRQS, gdev->msix_tbl_size);
+		return;
+	}
+
+	/* Enable MSI-X with the function mask set: nothing may fire
+	 * before a handler exists. */
+	gve_msix_set_ctrl(gdev, GVE_MSIX_CTRL_ENABLE | GVE_MSIX_CTRL_MASKALL,
+			  0);
+
+	for (i = 0; i < worst_irqs; i++) {
+		for (;;) {
+			if (uk_intctlr_irq_alloc(&irq, 1) != 0) {
+				uint32_t j;
+
+				for (j = 0; j < got; j++) {
+					unsigned int old = gdev->msix_irq_pool[j] - 1U;
+
+					uk_intctlr_irq_free(&old, 1);
+					gdev->msix_irq_pool[j] = 0U;
+				}
+				uk_pr_info("gve: only %u of %u IRQs allocatable: RX stays polled\n",
+					   got, worst_irqs);
+				return;
+			}
+			/* Keep the platform static irqs (PIT 0, IPI 13
+			 * and 14, LAPIC timer 16) out of the pool. */
+			if (irq >= 17U)
+				break;
+		}
+		gdev->msix_irq_pool[i] = (uint16_t)(irq + 1U);
+		got++;
+		/* Keep every pool entry masked until enable programs it. */
+		mmio_write32(gve_msix_entry(gdev, i) +
+			     GVE_MSIX_ENTRY_CTRL / 4U, GVE_MSIX_ENTRY_CTRL_MASK);
+	}
+	gdev->msix_pool_cnt = (uint8_t)got;
+	gdev->msix_capable = 1;
+	uk_pr_info("gve: MSI-X ready: cap=0x%x, table=%u vectors BAR%u offset=0x%x, %u irqs reserved\n",
+		   gdev->msix_cap_off, gdev->msix_tbl_size,
+		   gdev->msix_tbl_bir, gdev->msix_tbl_off, got);
+}
+
+/*
+ * Release the function mask after resources are configured. RX table
+ * entries stay masked: uk_netdev_rxq_intr_enable unmasks exactly the
+ * queues whose consumer registers a handler. Called from
+ * gve_netdev_configure after CONFIGURE_DEVICE_RESOURCES.
+ */
+static void gve_msix_configure(struct gve_device *gdev)
+{
+	if (!gdev->msix_capable)
+		return;
+	if (gdev->queue_format != GVE_DQO_RDA_FORMAT) {
+		/*
+		 * The device refused DQO during CONFIGURE_DEVICE_RESOURCES.
+		 * An app that expects interrupt RX sees the error from
+		 * the enable call. Polled-only apps keep working, so
+		 * this is not a gate-fail here.
+		 */
+		uk_pr_err("gve: fell back from DQO after reserving the IRQ pool: interrupt RX unavailable\n");
+		return;
+	}
+	if (gdev->num_ntfy_blks + 1U > gdev->msix_pool_cnt) {
+		uk_pr_err("gve: %u notification blocks exceed the %u-entry IRQ pool: interrupt RX unavailable\n",
+			  gdev->num_ntfy_blks, gdev->msix_pool_cnt);
+		return;
+	}
+	gve_msix_set_ctrl(gdev, 0, GVE_MSIX_CTRL_MASKALL);
+	gdev->msix_enabled = 1;
+	uk_pr_info("gve: MSI-X on: RX blocks %u..%u armed per queue, %u other blocks masked\n",
+		   gdev->num_ntfy_blks / 2U, gdev->num_ntfy_blks - 1U,
+		   gdev->num_ntfy_blks / 2U + 1U);
+}
+
+/*
+ * MSI-X RX event for one queue. Runs in interrupt context. It hands
+ * the event to the uknetdev callback: with CONFIG_LIBUKNETDEV_DISPAT
+ * CHERTHREADS the semaphore wake moves the work to the dispatcher
+ * thread, which drains the ring and re-arms through the empty recv.
+ */
+static int gve_msix_isr(void *arg)
+{
+	struct uk_netdev_rx_queue *rxq = arg;
+	struct gve_device *gdev = rxq->gdev;
+	uint32_t ev;
+
+	ev = ++rxq->msix_events;
+	gdev->msix_events++;
+	if (ev == 1U || (ev & (ev - 1U)) == 0U)
+		uk_pr_info("gve: RX MSI-X event q=%u events=%u\n", rxq->qid, ev);
+	if (!gdev->msix_marker_done) {
+		gdev->msix_marker_done = 1;
+		printf("GATE_GVE_MSIX_PASS vector=%u q=%u\n",
+		       gdev->msix_irq_pool[rxq->ntfy_id] - 1U + 32U,
+		       rxq->qid);
+	}
+	uk_netdev_drv_rx_event(&gdev->netdev, rxq->qid);
+	return 1;
+}
+
+/*
+ * Put one RX queue into interrupt mode. The order is deliberate:
+ * handler first, then table entry (address, data, unmask), then the
+ * arm write. A late event therefore always finds a registered
+ * handler, and no event arrives before the entry is live.
+ */
+static int gve_netdev_rxq_intr_enable(struct uk_netdev *dev,
+				      struct uk_netdev_rx_queue *queue)
+{
+	struct gve_device *gdev = to_gvedev(dev);
+	volatile uint32_t *entry;
+	unsigned int irq;
+	uint32_t irqdb;
+	int rc;
+
+	if (!gdev || !queue)
+		return -EINVAL;
+	if (queue->intr_enabled)
+		return 0;
+	if (!gdev->msix_enabled || gdev->queue_format != GVE_DQO_RDA_FORMAT) {
+		uk_pr_err("gve: RXq%u interrupt mode requested but unavailable\n",
+			  queue->qid);
+		return -ENOTSUP;
+	}
+	if (queue->ntfy_id >= gdev->num_ntfy_blks ||
+	    queue->ntfy_id >= gdev->msix_pool_cnt ||
+	    gdev->msix_irq_pool[queue->ntfy_id] == 0U)
+		return -EINVAL;
+
+	irq = gdev->msix_irq_pool[queue->ntfy_id] - 1U;
+	irqdb = bswap32(gdev->irq_db_indices[queue->ntfy_id].index);
+	if (!gve_doorbell_in_range(irqdb, gdev->bar2_size)) {
+		uk_pr_err("gve: RXq%u IRQ doorbell %u out of range (bar2=%llu): interrupt RX off\n",
+			  queue->qid, irqdb, (unsigned long long)gdev->bar2_size);
+		return -EIO;
+	}
+
+	rc = uk_intctlr_irq_register(irq, gve_msix_isr, queue);
+	if (rc != 0) {
+		uk_pr_err("gve: RXq%u cannot register irq %u: %d\n",
+			  queue->qid, irq, rc);
+		return rc;
+	}
+
+	entry = gve_msix_entry(gdev, queue->ntfy_id);
+	mmio_write32(entry + GVE_MSIX_ENTRY_ADDR_LO / 4U, GVE_MSI_ADDR_LO);
+	mmio_write32(entry + GVE_MSIX_ENTRY_ADDR_HI / 4U, 0U);
+	mmio_write32(entry + GVE_MSIX_ENTRY_DATA / 4U, (uint32_t)(irq + 32U));
+	mmio_write32(entry + GVE_MSIX_ENTRY_CTRL / 4U, 0U);	/* unmask */
+
+	queue->irq_db_idx = irqdb;
+	queue->intr_enabled = 1;
+	mmio_write32(&gdev->db_bar2[irqdb],
+		     gve_itr_arm_value_dqo(GVE_ITR_DEFAULT_USEC));
+	uk_pr_info("gve: RXq%u interrupt mode on: vector=%u irq=%u doorbell=%u\n",
+		   queue->qid, irq + 32U, irq, irqdb);
+
+	/*
+	 * Return 1: lib-lwip polls the ring once after enabling, so
+	 * frames that landed before the first arm are delivered.
+	 */
+	return 1;
+}
+
+static int gve_netdev_rxq_intr_disable(struct uk_netdev *dev,
+				       struct uk_netdev_rx_queue *queue)
+{
+	struct gve_device *gdev = to_gvedev(dev);
+	unsigned int irq;
+
+	if (!gdev || !queue)
+		return -EINVAL;
+	if (!queue->intr_enabled)
+		return 0;
+
+	/* Mask the block first, then drop the handler. */
+	mmio_write32(&gdev->db_bar2[queue->irq_db_idx], 0U);
+	mmio_write32(gve_msix_entry(gdev, queue->ntfy_id) +
+		     GVE_MSIX_ENTRY_CTRL / 4U, GVE_MSIX_ENTRY_CTRL_MASK);
+	irq = gdev->msix_irq_pool[queue->ntfy_id] - 1U;
+	uk_intctlr_irq_unregister(irq, gve_msix_isr);
+	queue->intr_enabled = 0;
+	uk_pr_info("gve: RXq%u interrupt mode off\n", queue->qid);
+	return 0;
+}
+
 static void gve_netdev_info_get(struct uk_netdev *dev,
 				struct uk_netdev_info *dev_info)
 {
@@ -859,6 +1266,13 @@ static void gve_netdev_info_get(struct uk_netdev *dev,
 	dev_info->nb_encap_rx = 0;
 	dev_info->ioalign = GVE_PKT_BUF_ALIGN;
 	dev_info->features = 0;
+	/*
+	 * Advertise RX interrupts only when the probe reserved the
+	 * whole path. The stack caches this decision, so it must be
+	 * stable for the whole boot. Ticket eae6a73726.
+	 */
+	if (gdev->msix_capable)
+		dev_info->features |= UK_NETDEV_F_RXQ_INTR;
 }
 
 static int gve_netdev_configure(struct uk_netdev *dev,
@@ -867,6 +1281,7 @@ static int gve_netdev_configure(struct uk_netdev *dev,
 	struct gve_device *gdev = to_gvedev(dev);
 	uint32_t budget;
 	uint16_t pairs;
+	int rc;
 
 	if (!gdev || !conf)
 		return -EINVAL;
@@ -895,7 +1310,10 @@ static int gve_netdev_configure(struct uk_netdev *dev,
 	}
 
 	gdev->queue_pairs = pairs;
-	return gve_configure_resources(gdev);
+	rc = gve_configure_resources(gdev);
+	if (rc == 0)
+		gve_msix_configure(gdev);
+	return rc;
 }
 
 static int gve_netdev_txq_info_get(struct uk_netdev *dev, uint16_t queue_id,
@@ -1469,13 +1887,11 @@ static int gve_netdev_start(struct uk_netdev *dev)
 			mmio_write32(&gdev->db_bar2[rx_db_idx],
 				     gdev->rxq[q]->dqo_bufq_tail);
 			/*
-			 * The driver never arms the interrupt translation
-			 * rings. It enables no MSI-X vector and receives
-			 * every packet by polling, so an ITR write would
-			 * only let the device raise interrupts nobody
-			 * handles. The irq door block array stays
-			 * allocated because CONFIGURE_DEVICE_RESOURCES
-			 * requires it.
+			 * Nothing arms interrupts here. An RX queue
+			 * starts masked and moves to MSI-X delivery
+			 * only when its consumer calls
+			 * uk_netdev_rxq_intr_enable; until then only
+			 * polling delivers packets. Ticket eae6a73726.
 			 */
 		} else {
 			mmio_write32(&gdev->db_bar2[rx_db_idx],
@@ -1755,8 +2171,20 @@ static int gve_netdev_recv(struct uk_netdev *dev,
 		uint32_t bslot;
 
 		__asm__ __volatile__("" ::: "memory");
-		if (cdesc->generation != queue->dqo_cur_gen_bit)
+		if (cdesc->generation != queue->dqo_cur_gen_bit) {
+			/*
+			 * Ring empty. A queue in interrupt mode must
+			 * re-arm its block here: the device masked it
+			 * when it delivered the last event, and the
+			 * PCI PBA replays an event that arrived while
+			 * masked. An empty poll in polled mode never
+			 * touches the IRQ doorbell. Ticket eae6a73726.
+			 */
+			if (queue->intr_enabled)
+				mmio_write32(&gdev->db_bar2[queue->irq_db_idx],
+					     GVE_ITR_REARM_DQO);
 			return 0;
+		}
 
 		__asm__ __volatile__("lfence" ::: "memory");
 		pkt_len = cdesc->packet_len;
@@ -1891,6 +2319,8 @@ static const struct uk_netdev_ops gve_netdev_ops = {
 	.hwaddr_get = gve_netdev_hwaddr_get,
 	.mtu_get = gve_netdev_mtu_get,
 	.promiscuous_get = gve_netdev_promiscuous_get,
+	.rxq_intr_enable = gve_netdev_rxq_intr_enable,
+	.rxq_intr_disable = gve_netdev_rxq_intr_disable,
 };
 
 static int gve_add_dev(struct pci_device *pdev)
@@ -2369,6 +2799,14 @@ static int gve_add_dev(struct pci_device *pdev)
 			uk_pr_info("gve: Warning: device MTU %u exceeds the receive cap %u\n",
 				   gdev->mtu, gdev->max_mtu);
 	}
+
+	/*
+	 * Interrupt RX readiness runs before registration: the first
+	 * uk_netdev_info_get caches the feature decision, so the
+	 * probe must reserve everything the interrupt path needs.
+	 * Ticket eae6a73726.
+	 */
+	gve_msix_probe_check(gdev);
 
 	/* Register with uk_netdev */
 	gdev->netdev.ops = &gve_netdev_ops;

@@ -1,0 +1,8 @@
+# Nginx on Unikraft, gVNIC port. The application is app-elfloader
+# itself: it loads /usr/sbin/nginx from the CPIO initrd that lives in
+# samples/nginx. This config only marks the app and selects the
+# loader. See defconfig for the full config. Ticket eae6a73726.
+menuconfig APPNGINX_GVE
+	bool "Nginx web server via app-elfloader (GCP, gVNIC)"
+	default y
+	select APPELFLOADER

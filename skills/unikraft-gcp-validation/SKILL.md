@@ -27,6 +27,7 @@ the captured serial log for these exact tokens.
 | `GATE_RSS_TRAFFIC` | gate-rss client saw 99 percent of its flow packets echoed back. RSS multi-queue gate, pair half | `a9b1936640` |
 | `GATE_NGINX_SMOKE_PASS` | client curl GET / returned HTTP 200 with the test page body: `GATE_NGINX_SMOKE_PASS status=200 marker=ok ...` in the client log. The served body also lands in the client serial log between `NGINX_BODY_BEGIN` and `NGINX_BODY_END`. nginx elfloader smoke gate | `4ecf9dcedf` |
 | `GATE_NGINX_SMOKE_FAIL` | client curl did not see HTTP 200 with the test page, or never reached the target. Follow with the failing fields | `4ecf9dcedf` |
+| `GATE_GVE_MSIX_PASS` | the gve driver took its first MSI-X RX event: `GATE_GVE_MSIX_PASS vector=<v> q=<n>` in the server log. Vector v fired, queue q drained, and RX reached the stack through the dispatcher thread. The threaded interrupt RX gate pairs it with `GATE_NGINX_SMOKE_PASS` on the client | `eae6a73726` |
 | `GATE_FAIL` | Any gate failed. Follow with the failing step name | current ticket |
 
 A run is valid only when the log shows the expected marker and the
@@ -111,6 +112,18 @@ command instead. Ticket c16353731a.
    The client serial log must show `GATE_NGINX_SMOKE_PASS status=200
    marker=ok`. The gate is client-side: the unikernel app is stock
    nginx and prints no gate marker of its own.
+9. gVNIC MSI-X RX (ticket `eae6a73726`): `scripts/gcp_run_nginx_gve.sh
+   <run-id>` boots the `samples/nginx-gve` unikernel on a
+   `c3-standard-4` VM with a GVNIC interface. Same nginx stack, but
+   lwIP runs threaded and RX arrives through the gve MSI-X interrupt
+   path and the uknetdev dispatcher thread, not through a poll thread.
+   The server log must show `GATE_GVE_MSIX_PASS vector=<v> q=<n>` and
+   the client log must show `GATE_NGINX_SMOKE_PASS status=200
+   marker=ok`. The runner aborts before any cloud call when the build
+   carries `CONFIG_LWIP_UKNETDEV_POLLRX=y`: zero poll-thread activity
+   is a gate requirement. `gve.intr=0` is the documented fallback
+   switch for debug reruns of the same image; it keeps the device
+   masked and restores the polled path.
 
 One agent drives one gate at a time. The full lifecycle is in
 `AGENTS.md`.

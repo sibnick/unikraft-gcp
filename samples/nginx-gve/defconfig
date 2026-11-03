@@ -1,0 +1,146 @@
+# Nginx on Unikraft, gVNIC port (ticket eae6a73726).
+# Target: x86_64 KVM, one core, gVNIC (1ae0:0042) on a third
+# generation machine size (Path B). The same CPIO initrd built by
+# samples/nginx/scripts/build_rootfs.sh is passed by GRUB as a
+# multiboot module. RX arrives through the gve MSI-X interrupt path
+# and the uknetdev dispatcher thread, with no RX poll thread.
+# scripts/gcp_run_nginx_gve.sh drives the gate.
+
+# Architecture and platform
+CONFIG_ARCH_X86_64=y
+CONFIG_PLAT_KVM=y
+CONFIG_KVM_PCI=y
+
+# Interrupt controller: MSI-X delivery through the local APIC.
+# Vectors above the 8259 range need the LAPIC for EOI, and
+# CONFIG_LIBUKINTCTLR_APIC provides it. The build stays single-core,
+# like the proven virtio nginx gate (ticket 4ecf9dcedf): the boot
+# core owns the netif, its dispatcher thread, and the stack.
+# Ticket eae6a73726.
+CONFIG_LIBUKINTCTLR=y
+CONFIG_LIBUKINTCTLR_APIC=y
+
+# ELF loader application
+CONFIG_APPELFLOADER=y
+CONFIG_APPELFLOADER_VFSEXEC=y
+CONFIG_APPELFLOADER_CUSTOMAPPNAME=n
+CONFIG_APPELFLOADER_VFSEXEC_PATH="/usr/sbin/nginx"
+CONFIG_APPELFLOADER_STACK_NBPAGES=256
+
+# Demand paging and virtual memory, needed to map shared libraries
+CONFIG_HAVE_PAGING=y
+CONFIG_PAGING=y
+CONFIG_LIBUKVMEM=y
+CONFIG_LIBELF=y
+
+# Virtual filesystem. The CPIO initrd is loaded by GRUB as a multiboot
+# module and unpacked into ramfs at boot.
+CONFIG_LIBVFSCORE=y
+CONFIG_LIBVFSCORE_AUTOMOUNT_CI=y
+CONFIG_LIBVFSCORE_AUTOMOUNT_CI_INITRD=y
+CONFIG_LIBRAMFS=y
+CONFIG_LIBUKCPIO=y
+
+# Device files used by nginx
+CONFIG_LIBDEVFS=y
+CONFIG_LIBDEVFS_DEV_NULL=y
+CONFIG_LIBDEVFS_DEV_ZERO=y
+
+# POSIX layer used by nginx
+CONFIG_LIBSYSCALL_SHIM=y
+CONFIG_LIBSYSCALL_SHIM_HANDLER=y
+CONFIG_LIBPOSIX_PROCESS=y
+CONFIG_LIBPOSIX_PROCESS_ARCH_PRCTL=y
+CONFIG_LIBPOSIX_PROCESS_MULTITHREADING=y
+CONFIG_LIBPOSIX_FILE=y
+CONFIG_LIBPOSIX_POLL=y
+# Yield instead of sleeping inside epoll_wait with no events, like the
+# ENA original. Nginx spends its idle time in epoll_wait.
+CONFIG_LIBPOSIX_POLL_YIELD=y
+CONFIG_LIBPOSIX_SIGNAL=y
+CONFIG_LIBPOSIX_TIME=y
+CONFIG_LIBPOSIX_ENVIRON=y
+CONFIG_LIBPOSIX_SYSINFO=y
+CONFIG_LIBPOSIX_USER=y
+CONFIG_LIBUKSIGNAL=y
+CONFIG_LIBUKRANDOM=y
+CONFIG_LIBUKRANDOM_GETRANDOM=y
+CONFIG_LIBPOSIX_FUTEX=y
+# eventfd: nginx epoll notify. The ENA core carried this as the older
+# LIBPOSIX_EVENT symbol. Ticket 4ecf9dcedf.
+CONFIG_LIBPOSIX_EVENTFD=y
+# AF_UNIX socketpair: nginx tests socket handling with a socketpair at
+# startup. No unix socket is bound at run time.
+CONFIG_LIBPOSIX_UNIXSOCKET=y
+# strftime and calendar time for nginx log timestamps.
+CONFIG_LIBPOSIX_TIMEDATE=y
+# Periodic clock ticks, like all other samples. Gives the idle CPU a
+# steady wake source instead of one-shot timer programming per sleep.
+CONFIG_LIBUKTIME_PERIODIC=y
+
+# Network stack: lwIP in threaded mode. Nginx needs the event-driven
+# socket path: it blocks in epoll_wait and must be woken by lwIP when a
+# connection arrives.
+CONFIG_LIBUKNETDEV=y
+# Enables the netdev.ip boot parameter used by scripts/gcp_run_nginx_gve.sh.
+CONFIG_LIBUKNETDEV_EINFO_LIBPARAM=y
+# One queue pair: the threaded nginx gate serves one dispatcher, the
+# same shape as the proven virtio gate. Ticket eae6a73726.
+CONFIG_LIBUKNETDEV_MAXNBQUEUES=1
+CONFIG_LIBLWIP=y
+CONFIG_LWIP_IPV4=y
+CONFIG_LWIP_TCP=y
+CONFIG_LWIP_THREADS=y
+CONFIG_LWIP_SOCKET=y
+CONFIG_LWIP_DHCP=y
+CONFIG_LWIP_AUTOIFACE=y
+# The dispatcher thread is the RX consumer in this build. The gve MSI-X
+# event wakes it through the uknetdev semaphore; no poll thread is
+# created because the gve driver reports UK_NETDEV_F_RXQ_INTR.
+# Ticket eae6a73726.
+CONFIG_LIBUKNETDEV_DISPATCHERTHREADS=y
+# ICMP answers the client ping debug path, like the virtio gate.
+CONFIG_LWIP_ICMP=y
+# RX delivery: interrupt mode. CONFIG_LWIP_UKNETDEV_POLLRX stays off
+# on purpose (ticket eae6a73726): the gVNIC device does raise RX
+# interrupts over MSI-X, unlike the legacy virtio device of ticket
+# 4ecf9dcedf. Set the option to y and rebuild to fall back to the
+# polled RX thread. The runtime switch gve.intr=0 on the kernel
+# command line disables the MSI-X path the same way.
+# Static peer ARP: the GCP fabric never answers ARP for instance IPs,
+# so replies to inbound connections would queue in the ARP pending
+# pool forever. The gate run script passes the client address as
+# lwip.staticarp=<ip> on the boot line. Same convention as the C1 gate
+# apps (ticket 73b23402f0) and the virtio nginx gate (4ecf9dcedf).
+CONFIG_LWIP_UKNETDEV_STATICARP=y
+CONFIG_LIBUKLIBPARAM=y
+# Idle wake through the i8254 timer, the path every GCP gate in this
+# repo has used. The LAPIC one-shot wake arms and its counter runs
+# down, but no GCP run of this repo has proven that the timer vector
+# wakes a halted core. nginx is single vCPU, so the i8254 fallback is
+# enough. Core patch 0007-plat-kvm-x86-lapic-oneshot-option.
+CONFIG_KVM_X86_LAPIC_ONESHOT=n
+
+# gVNIC is the NIC of third generation and newer machine sizes, the
+# Path B target of this project (ticket a1c1337265 lineage). The
+# driver advertises RX-interrupt support only after it reserves the
+# MSI-X pool; every other case keeps polled RX.
+CONFIG_LIBUKBUS=y
+CONFIG_LIBUKBUS_PCI=y
+CONFIG_LIBGVE=y
+
+# Scheduler and boot
+CONFIG_LIBUKSCHED=y
+CONFIG_LIBUKBOOT=y
+# Keep semi-polling off, like the demo apps. Polling is a performance
+# option and the nginx gate does not need it.
+CONFIG_SPLI=n
+
+# Console output level
+CONFIG_LIBUKPRINT_KLVL_INFO=y
+
+# App marker (thin app: app-elfloader is the entry point)
+CONFIG_APPNGINX_GVE=y
+
+# Build
+CONFIG_OPTIMIZE_PERF=y
