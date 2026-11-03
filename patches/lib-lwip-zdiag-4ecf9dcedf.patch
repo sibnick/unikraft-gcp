@@ -1,8 +1,8 @@
 --- a/Config.uk
 +++ b/Config.uk
-@@ -374,6 +374,21 @@
- 		delivery is the pattern every proven cloud gate uses.
- 		Ticket 4ecf9dcedf.
+@@ -395,6 +395,21 @@
+ 		nginx, have no code of their own, so the library takes
+ 		over the job. Ticket 4ecf9dcedf.
  
 +config LWIP_UKG_DIAG
 +	bool "TEMP DIAG forensics (unikraft-gcp ticket 4ecf9dcedf)"
@@ -24,21 +24,10 @@
  	default n
 --- a/Makefile.uk
 +++ b/Makefile.uk
-@@ -75,6 +75,10 @@
- CXXINCLUDES-$(CONFIG_LIBLWIP) += $(LIBLWIP_COMMON_INCLUDES-y)
- $(eval $(call uknetdev_scratch_mem,$(CONFIG_LWIP_UKNETDEV_SCRATCH)))
- 
-+# TEMP DIAG (unikraft-gcp ticket 4ecf9dcedf): register libparam with
-+# the 'lwip.' prefix so lwip.diagpeers=<ipv4> reaches diag.c.
-+$(eval $(call addlib_paramprefix,liblwip,lwip))
-+
- ################################################################################
- # Library flags
- ################################################################################
-@@ -135,6 +139,8 @@
- LIBLWIP_SRCS-y += $(LIBLWIP_EXTRACTED)/netif/ethernet.c
- LIBLWIP_SRCS-$(CONFIG_LWIP_UKNETDEV) += $(LIBLWIP_BASE)/netbuf.c|unikraft
+@@ -141,6 +141,8 @@
  LIBLWIP_SRCS-$(CONFIG_LWIP_UKNETDEV) += $(LIBLWIP_BASE)/uknetdev.c|unikraft
+ # Static ARP entries for boot-declared peers (ticket 4ecf9dcedf).
+ LIBLWIP_SRCS-$(CONFIG_LWIP_UKNETDEV_STATICARP) += $(LIBLWIP_BASE)/staticarp.c|unikraft
 +# TEMP DIAG (unikraft-gcp ticket 4ecf9dcedf): periodic serial forensics
 +LIBLWIP_SRCS-$(CONFIG_LWIP_UKG_DIAG) += $(LIBLWIP_BASE)/diag.c|unikraft
  

@@ -116,9 +116,15 @@ ukg_install_teardown_trap
 # the application. Nothing follows the separator, so nginx starts with
 # no arguments. Without the separator nginx exits with
 # 'nginx: invalid option'.
+# lwip.staticarp=<client ip>: the GCP fabric does not answer ARP for
+# instance IPs, so the target needs a static ARP entry for the client
+# to send any reply (run ukg-1103-005311-601275: SYN-ACKs queued in
+# the ARP pending pool forever). Library file staticarp.c installs it
+# from the gateway MAC. Same convention as the C1 gate apps, ticket
+# 73b23402f0. Ticket 4ecf9dcedf.
 echo "[INFO] Building server image ${SRV_IMG}..."
 "${SCRIPT_DIR}/gcp_build_image.sh" "${ROOT_DIR}/samples/nginx" "${SRV_IMG}" \
-    "unikraft netdev.ip=${SRV_IP}/${NETMASK}:${GATEWAY} --" "${INITRD}"
+    "unikraft netdev.ip=${SRV_IP}/${NETMASK}:${GATEWAY} lwip.staticarp=${CLI_IP} --" "${INITRD}"
 
 # 2. Render the curl client startup script. Everything it prints goes
 # to /dev/console, which lands in the GCP serial log. It waits for a

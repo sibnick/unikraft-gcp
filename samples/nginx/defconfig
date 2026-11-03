@@ -93,10 +93,17 @@ CONFIG_LWIP_ICMP=y
 # ukg-1102-225945-367273 measured rx=0 under client SYN load while
 # the polled canary served the same subnet. Ticket 4ecf9dcedf.
 CONFIG_LWIP_UKNETDEV_POLLRX=y
-# TEMP (ticket 4ecf9dcedf decisive run 2026-11-03): forensics ON for
-# one owner-approved instrumented run (poll-thread liveness, tcpip
-# mbox, tcp pcb census on COM1). Flip back to n right after the run.
-CONFIG_LWIP_UKG_DIAG=y
+# Static peer ARP: the GCP fabric never answers ARP for instance IPs,
+# so replies to inbound connections would queue in the ARP pending
+# pool forever (measured in run ukg-1103-005311-601275: ARPQ 3/4,
+# SYN-ACKs queued, no established connection). The gate run script
+# passes the client address as lwip.staticarp=<ip> on the boot line.
+# Same convention as the C1 gate apps, ticket 73b23402f0.
+CONFIG_LWIP_UKNETDEV_STATICARP=y
+# TEMP forensics (ticket 4ecf9dcedf): diag.c counters and the
+# lwip.diagpeers boot argument stay in the tree, default-off, marked
+# for later cleanup. Was y for the decisive run 2026-11-03 only.
+CONFIG_LWIP_UKG_DIAG=n
 # Idle wake through the i8254 timer, the path every GCP gate in this
 # repo has used. The LAPIC one-shot wake arms and its counter runs
 # down, but no GCP run of this repo has proven that the timer vector
