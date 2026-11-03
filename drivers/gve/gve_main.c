@@ -26,6 +26,11 @@
 #include <uk/libparam.h>
 #endif
 
+#if CONFIG_LIBUKPAGING
+#include <uk/paging.h>
+#include <uk/arch/x86_64.h>	/* PTE cache bits PWT and PCD */
+#endif
+
 #define DRIVER_NAME		"gve"
 #define GVE_PAGE_SIZE		4096UL
 #define GVE_PKT_BUF_ALIGN	2048UL
@@ -94,8 +99,10 @@ static int gve_intr_policy(void)
 #endif
 }
 
+#if !CONFIG_LIBUKPAGING
 /* 2 MiB page directories for mapping BAR0 (slot 0) and BAR2 (slot 1) */
 static uint64_t gve_bar_pd[2][512] __attribute__((aligned(4096)));
+#endif
 
 struct gve_device;
 
@@ -268,6 +275,130 @@ static inline size_t align_up_page(size_t sz)
 }
 
 /*
+ * Map one physical 1 GiB frame, which holds a BAR, into a fixed
+ * virtual window, and undo the mapping. Two implementations exist:
+ *
+ *   - With ukpaging (CONFIG_LIBUKPAGING), map through the
+ *     uk_paging_page_mapx() API. The ukpaging kernel address space
+ *     does not identity-map the frames of its own page tables, and
+ *     ukvmem claims the low addresses for RAM, the heap, and VMAs.
+ *     Reading CR3 and writing raw page-table entries is wrong there:
+ *     it faulted on the page-table frame in cloud run
+ *     ukg-1103-230211-382378.
+ *   - Without ukpaging, the Unikraft 0.21 boot page table is still
+ *     active, so the driver writes PDPT entries 4 and 5 directly.
+ *     The RSS and MC cloud gates proved this path.
+ *
+ * Both variants keep the BAR offset inside its 1 GiB frame, so the
+ * caller gets a usable pointer from the BAR physical address alone.
+ * Both refuse a slot that already carries a mapping: a second gVNIC
+ * device fails its map instead of clobbering the first window.
+ */
+#if CONFIG_LIBUKPAGING
+
+/*
+ * Window layout: one 1 GiB slot per BAR, starting at 8 TiB. The
+ * default kernel heap sits at CONFIG_LIBUKBOOT_HEAP_BASE (16 GiB in
+ * this sample), ukvmem VMAs start at CONFIG_LIBUKVMEM_DEFAULT_BASE
+ * (1 TiB), and the ukpaging direct map lives at the top of the
+ * address space. 8 TiB is clear of all three.
+ */
+#define GVE_BAR_VA_BASE		0x080000000000ULL	/* 8 TiB */
+#define GVE_BAR_VA_SLOT		0x400000000ULL		/* 1 GiB */
+#define GVE_BAR_PDLVL		1U			/* 2 MiB pages */
+#define GVE_BAR_PD_PAGES	512U			/* 512 * 2 MiB */
+
+/*
+ * Page mapper hook: make every leaf PTE uncacheable with PCD and
+ * PWT. Doorbell writes and device_status reads must reach the
+ * device, and must not come from or go to the CPU caches.
+ */
+static int gve_bar_mapx_uc(struct uk_pagetable *pt __unused,
+			   __vaddr_t vaddr __unused,
+			   __vaddr_t pt_vaddr __unused,
+			   unsigned int level __unused,
+			   __pte_t *pte, void *ctx __unused)
+{
+	*pte |= UK_ARCH_X86_64_PTE_PCD | UK_ARCH_X86_64_PTE_PWT;
+	return 0;
+}
+
+/*
+ * Map the BAR frame into the slot with ukpaging. The probe runs on
+ * the kernel address space, before the elfloader clones it for the
+ * application, so the window is present in every address space and
+ * stays valid for the ISR and the doorbell writes.
+ */
+static volatile void *gve_map_bar(uint64_t paddr, int slot)
+{
+	struct uk_paging_page_mapx mapx = { .map = gve_bar_mapx_uc };
+	struct uk_pagetable *pt;
+	uint64_t gb_base;
+	__vaddr_t va;
+	unsigned int lvl;
+	uint32_t i;
+	int rc;
+
+	if (paddr == 0 || slot < 0 || slot > 1)
+		return NULL;
+
+	pt = uk_paging_pt_get_active();
+	if (!pt)
+		return NULL;
+
+	gb_base = paddr & ~0x3fffffffULL;
+	va = (__vaddr_t)(GVE_BAR_VA_BASE +
+			 (uint64_t)slot * GVE_BAR_VA_SLOT);
+
+	/* Refuse a slot whose window is already mapped. */
+	for (i = 0; i < GVE_BAR_PD_PAGES; i++) {
+		lvl = GVE_BAR_PDLVL;
+		if (uk_paging_pt_walk(pt, va + ((__u64)i << 21),
+				      &lvl, NULL, NULL) == 0)
+			return NULL;
+	}
+
+	rc = uk_paging_page_mapx(pt, va, (__paddr_t)gb_base,
+				 GVE_BAR_PD_PAGES,
+				 UK_PAGING_PAGE_ATTR_PROT_RW,
+				 UK_PAGING_PAGE_FLAG_SIZE(GVE_BAR_PDLVL) |
+				 UK_PAGING_PAGE_FLAG_FORCE_SIZE,
+				 &mapx);
+	if (rc)
+		return NULL;
+
+	return (volatile void *)(uintptr_t)(va + (paddr & 0x3fffffffULL));
+}
+
+/*
+ * Clear one BAR slot window. KEEP_FRAMES is required: the window
+ * covers device memory, which the frame allocator never owned, so
+ * the unmap must not release those frames. Ranges without a mapping
+ * are skipped, so an unmapped slot is a clean no-op.
+ */
+static void gve_unmap_bar(int slot)
+{
+	struct uk_pagetable *pt;
+
+	if (slot < 0 || slot > 1)
+		return;
+
+	pt = uk_paging_pt_get_active();
+	if (!pt)
+		return;
+
+	uk_paging_page_unmap(pt,
+			     (__vaddr_t)(GVE_BAR_VA_BASE +
+					 (uint64_t)slot * GVE_BAR_VA_SLOT),
+			     GVE_BAR_PD_PAGES,
+			     UK_PAGING_PAGE_FLAG_SIZE(GVE_BAR_PDLVL) |
+			     UK_PAGING_PAGE_FLAG_FORCE_SIZE |
+			     UK_PAGING_PAGE_FLAG_KEEP_FRAMES);
+}
+
+#else /* !CONFIG_LIBUKPAGING */
+
+/*
  * Return the PDPT entry this driver uses for a BAR slot, or NULL
  * when the slot index is invalid. Slots 0 and 1 map PDPT entries 4
  * and 5, covering the 4 GiB and 5 GiB virtual regions.
@@ -344,6 +475,8 @@ static void gve_unmap_bar(int slot)
 	__asm__ __volatile__("movq %%cr3, %0" : "=r"(cr3));
 	__asm__ __volatile__("movq %0, %%cr3" :: "r"(cr3) : "memory");
 }
+
+#endif /* CONFIG_LIBUKPAGING */
 
 /*
  * Read one BAR size with the standard config-space probe: save the
