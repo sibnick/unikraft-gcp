@@ -1120,4 +1120,71 @@ static inline uint32_t gve_ntfy_cap(uint32_t want, uint32_t counters)
 	return want < counters ? want : counters;
 }
 
+/*
+ * PCI MSI-X capability (PCI r3.0 section 6.8.2). The gVNIC device
+ * raises RX events through MSI-X entries placed in one of its BARs.
+ * The driver walks the capability list, programs one entry per RX
+ * notification block, and masks every other entry. Ticket eae6a73726.
+ *
+ * Names carry a GVE_ prefix on purpose: the platform exposes no
+ * generic MSI-X helper, so these constants stay driver-private.
+ *
+ * Capability dword layout, offsets from the capability base:
+ *   +0  byte 0: capability id, byte 1: next pointer, word at +2: control
+ *   +4  table offset (bits 31:3) and BIR (bits 2:0)
+ *   +8  PBA offset (bits 31:3) and BIR (bits 2:0)
+ */
+#define GVE_PCI_CAP_LIST_PTR		0x34U	/* first capability entry */
+#define GVE_PCI_CFG_DWORD_STATUS	0x04U	/* status dword, low word */
+#define GVE_PCI_STATUS_CAP_LIST		(1U << 4)
+#define GVE_PCI_CAP_ID_MSIX		0x11U
+#define GVE_MSIX_DWORD_IDNEXT		0U	/* id, next, control word */
+#define GVE_MSIX_DWORD_TBLOFF		4U	/* table offset / BIR */
+/* Control word (the high half of the ID/next dword) bit fields. */
+#define GVE_MSIX_CTRL_ENABLE		0x8000U	/* bit 15: MSI-X enable */
+#define GVE_MSIX_CTRL_MASKALL		0x4000U	/* bit 14: function mask */
+#define GVE_MSIX_CTRL_SIZE(cw)		(((cw) & 0x7ffU) + 1U)
+#define GVE_MSIX_TBL_BIR(off_reg)	((off_reg) & 0x7U)
+#define GVE_MSIX_TBL_OFF(off_reg)	((off_reg) & ~0x7U)
+#define GVE_MSIX_ENTRY_SIZE		16U
+#define GVE_MSIX_ENTRY_ADDR_LO		0U
+#define GVE_MSIX_ENTRY_ADDR_HI		4U
+#define GVE_MSIX_ENTRY_DATA		8U
+#define GVE_MSIX_ENTRY_CTRL		12U
+#define GVE_MSIX_ENTRY_CTRL_MASK	1U
+/* MSI message address: xAPIC base, physical destination, fixed mode.
+ * Destination APIC id 0 is the boot core, where the netif, its
+ * dispatcher thread, and the stack all run in this unikernel.
+ */
+#define GVE_MSI_ADDR_LO			0xfee00000U
+
+/*
+ * DQO IRQ doorbell values. The device masks a notification block when
+ * it delivers an MSI-X event. Writing the enable bit to the block's
+ * IRQ doorbell re-arms it. The NO_UPDATE code keeps the interrupt
+ * interval that the first arm programmed. The values match the Linux
+ * gve driver. Ticket eae6a73726.
+ */
+#define GVE_ITR_ENABLE_BIT_DQO		(1U << 0)
+#define GVE_ITR_NO_UPDATE_DQO		(3U << 3)
+#define GVE_ITR_INTERVAL_DQO_SHIFT	5U
+#define GVE_ITR_INTERVAL_DQO_MASK	((1U << 12) - 1U)
+#define GVE_ITR_DEFAULT_USEC		8U
+#define GVE_ITR_REARM_DQO		(GVE_ITR_NO_UPDATE_DQO | \
+					 GVE_ITR_ENABLE_BIT_DQO)
+
+/*
+ * Arm value for one interval in microseconds. The interval field has
+ * 2 us granularity, so the value shifts after the divide. Pure, so the
+ * host test in tests/test_gve.c can check it.
+ */
+static inline uint32_t gve_itr_arm_value_dqo(uint32_t interval_us)
+{
+	uint32_t val = GVE_ITR_ENABLE_BIT_DQO;
+
+	val |= ((interval_us >> 1) & GVE_ITR_INTERVAL_DQO_MASK)
+	       << GVE_ITR_INTERVAL_DQO_SHIFT;
+	return val;
+}
+
 #endif /* __UK_DRV_GVE_H__ */

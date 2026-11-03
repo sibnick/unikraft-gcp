@@ -827,6 +827,25 @@ static void test_rss_key_fill(void)
 		assert(key[i] == (uint8_t)(0xffU - (i % 64U)));
 }
 
+static void test_itr_arm_value_dqo(void)
+{
+	/* Initial arm at the default 8 us: interval field (8 >> 1)
+	   in bit 5, enable bit set. Linux gve uses the same value. */
+	assert(gve_itr_arm_value_dqo(GVE_ITR_DEFAULT_USEC) == 0x81U);
+	/* Re-arm with no interval update: NO_UPDATE field plus
+	   enable. The device auto-masks the block on every event,
+	   so this write is what re-enables delivery. */
+	assert(GVE_ITR_REARM_DQO == 0x19U);
+	/* Zero interval means "deliver as fast as possible": only
+	   the enable bit remains. */
+	assert(gve_itr_arm_value_dqo(0U) == GVE_ITR_ENABLE_BIT_DQO);
+	/* The interval field is 12 bits: the value wraps, it does
+	   not spill into the reserved or NO_UPDATE bits. */
+	assert((gve_itr_arm_value_dqo(1U << 20) & GVE_ITR_NO_UPDATE_DQO)
+	       == 0U);
+	assert(gve_itr_arm_value_dqo(2U << 17) == GVE_ITR_ENABLE_BIT_DQO);
+}
+
 int main(void)
 {
 	test_adminq_configure_resources();
@@ -856,6 +875,7 @@ int main(void)
 	test_adminq_configure_rss();
 	test_rss_lut_fill();
 	test_rss_key_fill();
+	test_itr_arm_value_dqo();
 	printf("test_gve: all unit tests passed\n");
 	return 0;
 }

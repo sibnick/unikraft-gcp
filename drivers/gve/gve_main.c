@@ -19,7 +19,17 @@
 #include <uk/netdev_core.h>
 #include <uk/netdev_driver.h>
 #include <uk/plat/time.h>
+#include <uk/intctlr.h>
 #include <gve.h>
+
+#if CONFIG_LIBUKLIBPARAM
+#include <uk/libparam.h>
+#endif
+
+#if CONFIG_LIBUKPAGING
+#include <uk/paging.h>
+#include <uk/arch/x86_64.h>	/* PTE cache bits PWT and PCD */
+#endif
 
 #define DRIVER_NAME		"gve"
 #define GVE_PAGE_SIZE		4096UL
@@ -41,10 +51,58 @@
  */
 #define GVE_MAX_QUEUES		8U
 
+/*
+ * Bound on pool irqs: one per notification block plus the mgmt
+ * vector, for the largest pair budget the driver can hold. The pool
+ * is allocated at probe, so it must not depend on the queue count a
+ * caller configures later.
+ */
+#define GVE_MSIX_MAX_IRQS	(2U * GVE_MAX_QUEUES + 1U)
+
 static struct uk_alloc *drv_alloc;
 
-/* 2 MiB page directories for mapping BAR0 (slot 0) and BAR2 (slot 1) */
-static uint64_t gve_bar_pd[2][512] __attribute__((aligned(4096)));
+/*
+ * Interrupt RX switch (ticket eae6a73726). The boot parameter
+ * 'gve.intr=0' keeps every notification block masked, so the device
+ * never raises an MSI-X event and the stack falls back to its own
+ * polled RX path. The same fallback happens automatically when:
+ *   - the kernel has no local APIC EOI (CONFIG_LIBUKINTCTLR_APIC=n),
+ *   - the negotiated queue format is not DQO_RDA,
+ *   - or the MSI-X capability, table, or vectors are unavailable.
+ * With the interrupt path on, RX reaches lwIP through the uknetdev
+ * dispatcher thread, not through a poll thread.
+ */
+#if CONFIG_LIBUKLIBPARAM
+static int gve_intr = 1;
+UK_LIBPARAM_PARAM_ALIAS(intr, &gve_intr, int,
+			"Enable MSI-X interrupt RX (0=polled fallback)");
+#endif
+
+/*
+ * Decide the RX interrupt policy before the probe reads the MSI-X
+ * capability. The LAPIC EOI is mandatory: without it the in-service
+ * bit of the delivered vector stays set and the local APIC blocks
+ * that vector forever. The option is a preprocessor check because
+ * the symbol is simply absent in PIC-only kernels.
+ */
+static int gve_intr_policy(void)
+{
+#if CONFIG_LIBUKINTCTLR_APIC
+#if CONFIG_LIBUKLIBPARAM
+	return gve_intr;
+#else
+	return 1;
+#endif
+#else
+	uk_pr_info("gve: CONFIG_LIBUKINTCTLR_APIC is off: RX stays polled\n");
+	return 0;
+#endif
+}
+
+#if !CONFIG_LIBUKPAGING
+/* 2 MiB page directories: BAR0 (slot 0), BAR2 (slot 1), BAR1 (slot 2) */
+static uint64_t gve_bar_pd[3][512] __attribute__((aligned(4096)));
+#endif
 
 struct gve_device;
 
@@ -114,6 +172,11 @@ struct uk_netdev_rx_queue {
 	uint8_t qpl_registered;	/* device holds this QPL: unregister on free */
 	uint8_t *qpl_pages;
 	uint64_t *qpl_page_bus;
+
+	/* MSI-X interrupt RX state (ticket eae6a73726) */
+	uint8_t intr_enabled;	/* rxq_intr_enable armed this queue */
+	uint32_t irq_db_idx;	/* BAR2 IRQ doorbell, checked at enable */
+	volatile uint32_t msix_events;	/* RX MSI-X events, ISR-owned */
 };
 
 struct gve_device {
@@ -122,7 +185,9 @@ struct gve_device {
 	volatile struct gve_registers *reg_bar0;
 	volatile uint32_t *db_bar2;
 	uint64_t bar0_size;	/* BAR0 byte size from the config-space probe */
+	uint64_t bar1_size;	/* BAR1 byte size from the config-space probe */
 	uint64_t bar2_size;	/* BAR2 byte size from the config-space probe */
+	volatile void *msix_bar1;	/* BAR1 window: MSI-X table BAR, NULL when unmapped */
 	union gve_adminq_command *adminq;
 	uint32_t adminq_prod_cnt;
 
@@ -164,6 +229,28 @@ struct gve_device {
 	uint16_t queue_pairs;
 	struct uk_netdev_tx_queue *txq[GVE_MAX_QUEUES];
 	struct uk_netdev_rx_queue *rxq[GVE_MAX_QUEUES];
+
+	/* MSI-X interrupt RX state (ticket eae6a73726). The device
+	 * maps notification block i to MSI-X table entry i because
+	 * CONFIGURE_DEVICE_RESOURCES uses ntfy_blk_msix_base_idx 0.
+	 * Each entry carries an irq from the platform pool allocated
+	 * at probe time, before the first info_get: info_get caches
+	 * the RX-interrupt feature into the stack, so after that
+	 * point the driver must never lose the path. Pool entry
+	 * msix_irq_pool[i] stores irq + 1; 0 means none. TX blocks
+	 * and the mgmt vector keep their table entry masked. */
+	int intr_want;			/* policy from gve.intr and APIC */
+	int msix_capable;		/* probe reserved the pool */
+	int msix_enabled;		/* table programmed by configure */
+	uint32_t msix_cap_off;		/* capability offset in config space */
+	uint32_t msix_tbl_off;		/* table byte offset inside its BAR */
+	uint32_t msix_tbl_size;		/* vector count from the capability */
+	uint8_t msix_tbl_bir;		/* BAR that holds the table */
+	volatile uint32_t *msix_table;	/* mapped table, or NULL */
+	uint16_t msix_irq_pool[GVE_MSIX_MAX_IRQS];
+	uint8_t msix_pool_cnt;
+	volatile uint32_t msix_events;	/* total RX MSI-X events, ISR-owned */
+	uint8_t msix_marker_done;	/* gate marker printed once */
 };
 
 #define to_gvedev(ndev) \
@@ -190,12 +277,148 @@ static inline size_t align_up_page(size_t sz)
 }
 
 /*
+ * Map one physical 1 GiB frame, which holds a BAR, into a fixed
+ * virtual window, and undo the mapping. Two implementations exist:
+ *
+ *   - With ukpaging (CONFIG_LIBUKPAGING), map through the
+ *     uk_paging_page_mapx() API. The ukpaging kernel address space
+ *     does not identity-map the frames of its own page tables, and
+ *     ukvmem claims the low addresses for RAM, the heap, and VMAs.
+ *     Reading CR3 and writing raw page-table entries is wrong there:
+ *     it faulted on the page-table frame in cloud run
+ *     ukg-1103-230211-382378.
+ *   - Without ukpaging, the Unikraft 0.21 boot page table is still
+ *     active, so the driver writes PDPT entries 4, 5 and 6 directly.
+ *     The RSS and MC cloud gates proved this path.
+ *
+ * Both variants keep the BAR offset inside its 1 GiB frame, so the
+ * caller gets a usable pointer from the BAR physical address alone.
+ * Both refuse a slot that already carries a mapping: a second gVNIC
+ * device fails its map instead of clobbering the first window.
+ */
+#if CONFIG_LIBUKPAGING
+
+/*
+ * Window layout: one 1 GiB slot per BAR, starting at 8 TiB. The
+ * default kernel heap sits at CONFIG_LIBUKBOOT_HEAP_BASE (16 GiB in
+ * this sample), ukvmem VMAs start at CONFIG_LIBUKVMEM_DEFAULT_BASE
+ * (1 TiB), and the ukpaging direct map lives at the top of the
+ * address space. 8 TiB is clear of all three.
+ */
+#define GVE_BAR_VA_BASE		0x080000000000ULL	/* 8 TiB */
+#define GVE_BAR_VA_SLOT		0x400000000ULL		/* 1 GiB */
+#define GVE_BAR_PDLVL		1U			/* 2 MiB pages */
+#define GVE_BAR_PD_PAGES	512U			/* 512 * 2 MiB */
+
+/*
+ * Page mapper hook: make every leaf PTE uncacheable with PCD and
+ * PWT. Doorbell writes and device_status reads must reach the
+ * device, and must not come from or go to the CPU caches.
+ */
+static int gve_bar_mapx_uc(struct uk_pagetable *pt __unused,
+			   __vaddr_t vaddr __unused,
+			   __vaddr_t pt_vaddr __unused,
+			   unsigned int level __unused,
+			   __pte_t *pte, void *ctx __unused)
+{
+	*pte |= UK_ARCH_X86_64_PTE_PCD | UK_ARCH_X86_64_PTE_PWT;
+	return 0;
+}
+
+/*
+ * Map the BAR frame into the slot with ukpaging. The probe runs on
+ * the kernel address space, before the elfloader clones it for the
+ * application, so the window is present in every address space and
+ * stays valid for the ISR and the doorbell writes.
+ */
+static volatile void *gve_map_bar(uint64_t paddr, int slot)
+{
+	struct uk_paging_page_mapx mapx = { .map = gve_bar_mapx_uc };
+	struct uk_pagetable *pt;
+	uint64_t gb_base;
+	__vaddr_t va;
+	__pte_t pte;
+	unsigned int lvl;
+	uint32_t i;
+	int rc;
+
+	if (paddr == 0 || slot < 0 || slot > 2)
+		return NULL;
+
+	pt = uk_paging_pt_get_active();
+	if (!pt) {
+		uk_pr_err("gve: no active page table: BAR map refused\n");
+		return NULL;
+	}
+
+	gb_base = paddr & ~0x3fffffffULL;
+	va = (__vaddr_t)(GVE_BAR_VA_BASE +
+			 (uint64_t)slot * GVE_BAR_VA_SLOT);
+
+	/* Refuse a slot whose window is already mapped. Note: the
+	 * walk returns 0 even when it stops on a not-present entry,
+	 * so the present bit of the returned PTE decides. Cloud run
+	 * ukg-1103-233604-448823 failed on the rc-only test. */
+	for (i = 0; i < GVE_BAR_PD_PAGES; i++) {
+		lvl = GVE_BAR_PDLVL;
+		if (uk_paging_pt_walk(pt, va + ((__u64)i << 21),
+				      &lvl, NULL, &pte) == 0 &&
+		    UK_PAL_PT_Lx_PTE_PRESENT(pte, lvl)) {
+			uk_pr_err("gve: BAR slot %d window busy: map refused\n",
+				  slot);
+			return NULL;
+		}
+	}
+
+	rc = uk_paging_page_mapx(pt, va, (__paddr_t)gb_base,
+				 GVE_BAR_PD_PAGES,
+				 UK_PAGING_PAGE_ATTR_PROT_RW,
+				 UK_PAGING_PAGE_FLAG_SIZE(GVE_BAR_PDLVL) |
+				 UK_PAGING_PAGE_FLAG_FORCE_SIZE,
+				 &mapx);
+	if (rc) {
+		uk_pr_err("gve: BAR slot %d page map failed: %d\n", slot, rc);
+		return NULL;
+	}
+
+	return (volatile void *)(uintptr_t)(va + (paddr & 0x3fffffffULL));
+}
+
+/*
+ * Clear one BAR slot window. KEEP_FRAMES is required: the window
+ * covers device memory, which the frame allocator never owned, so
+ * the unmap must not release those frames. Ranges without a mapping
+ * are skipped, so an unmapped slot is a clean no-op.
+ */
+static void gve_unmap_bar(int slot)
+{
+	struct uk_pagetable *pt;
+
+	if (slot < 0 || slot > 2)
+		return;
+
+	pt = uk_paging_pt_get_active();
+	if (!pt)
+		return;
+
+	uk_paging_page_unmap(pt,
+			     (__vaddr_t)(GVE_BAR_VA_BASE +
+					 (uint64_t)slot * GVE_BAR_VA_SLOT),
+			     GVE_BAR_PD_PAGES,
+			     UK_PAGING_PAGE_FLAG_SIZE(GVE_BAR_PDLVL) |
+			     UK_PAGING_PAGE_FLAG_FORCE_SIZE |
+			     UK_PAGING_PAGE_FLAG_KEEP_FRAMES);
+}
+
+#else /* !CONFIG_LIBUKPAGING */
+
+/*
  * Return the PDPT entry this driver uses for a BAR slot, or NULL
- * when the slot index is invalid. Slots 0 and 1 map PDPT entries 4
- * and 5, covering the 4 GiB and 5 GiB virtual regions.
+ * when the slot index is invalid. Slots 0, 1 and 2 map PDPT entries
+ * 4, 5 and 6, covering the 4 GiB to 6 GiB virtual regions.
  *
  * Assumption: the Unikraft 0.21 boot page table leaves PDPT entries
- * 4 and 5 empty. The present-bit check in gve_map_bar turns a broken
+ * 4 to 6 empty. The present-bit check in gve_map_bar turns a broken
  * assumption into a clean failure: a second gVNIC device fails its
  * map instead of clobbering the first device's window.
  */
@@ -205,7 +428,7 @@ static volatile uint64_t *gve_pdpt_entry(int slot)
 	uint64_t *pml4;
 	uint64_t *pdpt0;
 
-	if (slot < 0 || slot > 1)
+	if (slot < 0 || slot > 2)
 		return NULL;
 
 	__asm__ __volatile__("movq %%cr3, %0" : "=r"(cr3));
@@ -265,6 +488,31 @@ static void gve_unmap_bar(int slot)
 	*entry = 0ULL;
 	__asm__ __volatile__("movq %%cr3, %0" : "=r"(cr3));
 	__asm__ __volatile__("movq %0, %%cr3" :: "r"(cr3) : "memory");
+}
+
+#endif /* CONFIG_LIBUKPAGING */
+
+/*
+ * Device DMA address for a driver buffer (ticket eae6a73726).
+ *
+ * A non-paging kernel identity-maps RAM, so the pointer value is
+ * also the physical address. The RSS and MC gates proved that
+ * form. With ukpaging the heap lives at
+ * CONFIG_LIBUKBOOT_HEAP_BASE (16 GiB here), so the pointer is not
+ * a device address: the device needs the physical frame behind it.
+ * Translate through the active page table, the same way the core
+ * uksglist and virtio code does. One base translation covers a
+ * whole buffer: the frame allocator backs a heap mapping with
+ * contiguous frames, the assumption the core virtio rings make
+ * too.
+ */
+static inline uint64_t gve_dma_addr(const void *vaddr)
+{
+#if CONFIG_LIBUKPAGING
+	return (uint64_t)uk_paging_virt_to_phys((__vaddr_t)(uintptr_t)vaddr);
+#else
+	return (uint64_t)(uintptr_t)vaddr;
+#endif
 }
 
 /*
@@ -523,7 +771,7 @@ static int gve_register_qpl(struct gve_device *gdev, struct uk_alloc *a,
 	memset(page_bus, 0, align_up_page((size_t)num_pages * sizeof(uint64_t)));
 
 	for (i = 0; i < num_pages; i++) {
-		uint64_t paddr = (uint64_t)(uintptr_t)(pages + (size_t)i * GVE_PAGE_SIZE);
+		uint64_t paddr = gve_dma_addr(pages + (size_t)i * GVE_PAGE_SIZE);
 
 		page_bus[i] = bswap64(paddr);
 	}
@@ -533,7 +781,7 @@ static int gve_register_qpl(struct gve_device *gdev, struct uk_alloc *a,
 	cmd.reg_page_list.page_list_id = bswap32(qpl_id);
 	cmd.reg_page_list.num_pages = bswap32(num_pages);
 	cmd.reg_page_list.page_address_list_addr =
-		bswap64((uint64_t)(uintptr_t)page_bus);
+		bswap64(gve_dma_addr(page_bus));
 	cmd.reg_page_list.page_size = bswap64(GVE_PAGE_SIZE);
 
 	rc = gve_adminq_exec(gdev->reg_bar0, gdev->adminq,
@@ -618,8 +866,8 @@ static int gve_configure_rss(struct gve_device *gdev)
 
 	gve_adminq_fill_configure_rss(&cmd, hash_types,
 				      GVE_RSS_HASH_ALG_TOEPLITZ,
-				      (uint64_t)(uintptr_t)key, key_size,
-				      (uint64_t)(uintptr_t)lut, lut_size);
+				      gve_dma_addr(key), key_size,
+				      gve_dma_addr(lut), lut_size);
 	rc = gve_adminq_exec(gdev->reg_bar0, gdev->adminq,
 			     &gdev->adminq_prod_cnt, &cmd, &cmd_status);
 	uk_pr_info("gve: CONFIGURE_RSS types=0x%x alg=top key=%u lut=%u queues=%u rc=%d status=0x%x\n",
@@ -706,8 +954,8 @@ static int gve_configure_resources(struct gve_device *gdev)
 
 		gve_adminq_fill_configure_resources(
 			&cmd,
-			(uint64_t)(uintptr_t)gdev->counter_array,
-			(uint64_t)(uintptr_t)gdev->irq_db_indices,
+			gve_dma_addr(gdev->counter_array),
+			gve_dma_addr(gdev->irq_db_indices),
 			gdev->num_event_counters,
 			num_ntfy,
 			(uint8_t)gdev->queue_format);
@@ -733,8 +981,8 @@ static int gve_configure_resources(struct gve_device *gdev)
 		gdev->queue_format = GVE_GQI_QPL_FORMAT;
 		gve_adminq_fill_configure_resources(
 			&cmd,
-			(uint64_t)(uintptr_t)gdev->counter_array,
-			(uint64_t)(uintptr_t)gdev->irq_db_indices,
+			gve_dma_addr(gdev->counter_array),
+			gve_dma_addr(gdev->irq_db_indices),
 			gdev->num_event_counters,
 			ntfy_candidates[0],
 			(uint8_t)gdev->queue_format);
@@ -770,7 +1018,7 @@ static int gve_configure_resources(struct gve_device *gdev)
 		cmd.get_ptype_map.ptype_map_len =
 			bswap64(sizeof(struct gve_ptype_lut));
 		cmd.get_ptype_map.ptype_map_addr =
-			bswap64((uint64_t)(uintptr_t)gdev->ptype_lut_dqo);
+			bswap64(gve_dma_addr(gdev->ptype_lut_dqo));
 
 		rc = gve_adminq_exec(gdev->reg_bar0, gdev->adminq,
 				     &gdev->adminq_prod_cnt, &cmd, &cmd_status);
@@ -836,6 +1084,340 @@ static int gve_netdev_probe(struct uk_netdev *dev)
 	return 0;
 }
 
+/*
+ * ---------------------------------------------------------------------
+ * MSI-X interrupt RX (ticket eae6a73726)
+ * ---------------------------------------------------------------------
+ *
+ * The device maps notification block i to MSI-X table entry i because
+ * CONFIGURE_DEVICE_RESOURCES uses ntfy_blk_msix_base_idx 0. Blocks
+ * below num_ntfy_blks / 2 carry TX completion events, the blocks from
+ * num_ntfy_blks / 2 on carry RX events, and index num_ntfy_blks is
+ * the mgmt vector. This driver submits TX by doorbell and reclaims
+ * TX completions inside the send path, so only RX blocks ever need a
+ * live vector: TX blocks and the mgmt vector stay masked.
+ *
+ * An RX block delivers events only after its queue enables interrupts
+ * (uk_netdev_rxq_intr_enable), which registers the interrupt handler,
+ * programs and unmasks the table entry, and arms the block through
+ * the IRQ doorbell. The DQO device masks a block when it delivers an
+ * event and treats a write of the enable bit as re-arm. The PCI PBA
+ * keeps an event that arrived while masked pending, so arming after
+ * the ring drains cannot lose a packet: that is the same contract the
+ * Linux gve driver relies on in gve_napi_poll_dqo.
+ */
+
+/* Message control word inside the capability, preserved across writes. */
+static void gve_msix_set_ctrl(struct gve_device *gdev, uint16_t set,
+			      uint16_t clear)
+{
+	struct pci_device *pdev = gdev->pdev;
+	uint32_t dword = uk_pci_read_config32(&pdev->addr, gdev->msix_cap_off);
+	uint32_t cw = (dword >> 16) & 0xffffU;
+
+	cw = (uint32_t)((cw & ~clear) | set);
+	dword = (dword & 0xffffU) | (cw << 16);
+	uk_pci_write_config32(&pdev->addr, gdev->msix_cap_off, dword);
+}
+
+static volatile uint32_t *gve_msix_entry(struct gve_device *gdev, uint32_t blk)
+{
+	return gdev->msix_table + blk * (GVE_MSIX_ENTRY_SIZE / 4U);
+}
+
+/*
+ * Find the MSI-X capability. Returns 0 and fills the capability
+ * offset, table size, table offset, and BIR. The walk is bounded:
+ * a looping capability list must not hang the probe.
+ */
+static int gve_msix_find_cap(struct pci_device *pdev, uint32_t *cap_off,
+			     uint32_t *tbl_size, uint32_t *tbl_off,
+			     uint8_t *tbl_bir)
+{
+	uint32_t status = uk_pci_read_config32(&pdev->addr,
+					       GVE_PCI_CFG_DWORD_STATUS);
+	uint32_t ptr, idnext;
+	int hops;
+
+	if (((status & 0xffffU) & GVE_PCI_STATUS_CAP_LIST) == 0)
+		return -ENODEV;
+
+	ptr = uk_pci_read_config32(&pdev->addr, GVE_PCI_CAP_LIST_PTR) & 0xffU;
+	for (hops = 0; hops < 48; hops++) {
+		uint32_t ctrl, tblreg;
+
+		if (ptr < 0x40U || (ptr & 0x3U) != 0)
+			break;	/* not a dword-aligned capability offset */
+		idnext = uk_pci_read_config32(&pdev->addr, ptr);
+		if ((idnext & 0xffU) == GVE_PCI_CAP_ID_MSIX) {
+			ctrl = (idnext >> 16) & 0xffffU;
+			tblreg = uk_pci_read_config32(&pdev->addr,
+						      ptr + GVE_MSIX_DWORD_TBLOFF);
+			*cap_off = ptr;
+			*tbl_size = GVE_MSIX_CTRL_SIZE(ctrl);
+			*tbl_off = GVE_MSIX_TBL_OFF(tblreg);
+			*tbl_bir = (uint8_t)GVE_MSIX_TBL_BIR(tblreg);
+			return 0;
+		}
+		ptr = (idnext >> 8) & 0xffU;
+	}
+	return -ENODEV;
+}
+
+/*
+ * Probe-time readiness check and pool reservation. Runs before the
+ * first uk_netdev_info_get, whose RX-interrupt feature the stack
+ * caches: after that point the interrupt path must never fail for a
+ * reason the probe could have seen. Hence the pool covers the worst
+ * notification-block count any configure outcome can use, and the
+ * table is resolved to a mapped BAR here.
+ */
+static void gve_msix_probe_check(struct gve_device *gdev)
+{
+	struct pci_device *pdev = gdev->pdev;
+	uint32_t worst_irqs, bar_size, got = 0;
+	unsigned int irq;
+	uint32_t i;
+
+	gdev->intr_want = gve_intr_policy();
+	if (!gdev->intr_want) {
+		uk_pr_info("gve: interrupt RX off: RX stays polled\n");
+		return;
+	}
+	if (gdev->queue_format != GVE_DQO_RDA_FORMAT) {
+		uk_pr_info("gve: queue format %s has no interrupt RX path: RX stays polled\n",
+			   gve_queue_format_name(gdev->queue_format));
+		return;
+	}
+	if (gve_msix_find_cap(pdev, &gdev->msix_cap_off, &gdev->msix_tbl_size,
+			      &gdev->msix_tbl_off, &gdev->msix_tbl_bir) != 0) {
+		uk_pr_info("gve: no MSI-X capability: RX stays polled\n");
+		return;
+	}
+	if (gdev->msix_tbl_bir == 0U) {
+		bar_size = (uint32_t)gdev->bar0_size;
+		gdev->msix_table = (volatile uint32_t *)
+			((volatile uint8_t *)gdev->reg_bar0 + gdev->msix_tbl_off);
+	} else if (gdev->msix_tbl_bir == 2U) {
+		bar_size = (uint32_t)gdev->bar2_size;
+		gdev->msix_table = (volatile uint32_t *)
+			((volatile uint8_t *)gdev->db_bar2 + gdev->msix_tbl_off);
+	} else if (gdev->msix_tbl_bir == 1U && gdev->msix_bar1 != NULL) {
+		bar_size = (uint32_t)gdev->bar1_size;
+		gdev->msix_table = (volatile uint32_t *)
+			((volatile uint8_t *)gdev->msix_bar1 +
+			 gdev->msix_tbl_off);
+	} else {
+		uk_pr_info("gve: MSI-X table BAR%u is not mapped: RX stays polled\n",
+			   gdev->msix_tbl_bir);
+		return;
+	}
+	if ((uint64_t)gdev->msix_tbl_off +
+	    (uint64_t)gdev->msix_tbl_size * GVE_MSIX_ENTRY_SIZE >
+	    (uint64_t)bar_size) {
+		uk_pr_info("gve: MSI-X table window past BAR%u size: RX stays polled\n",
+			   gdev->msix_tbl_bir);
+		return;
+	}
+
+	/*
+	 * Worst-case blocks: the configure path may request one block
+	 * per queue in each direction plus the mgmt vector. The pool
+	 * is capped, so a device with a wider fan-out keeps polled RX
+	 * instead of a pool sized at runtime.
+	 */
+	worst_irqs = gdev->max_tx_queues + gdev->max_rx_queues;
+	if (worst_irqs > gdev->num_event_counters)
+		worst_irqs = gdev->num_event_counters;
+	worst_irqs += 1U;	/* mgmt vector */
+	if (worst_irqs > GVE_MSIX_MAX_IRQS || worst_irqs > gdev->msix_tbl_size) {
+		uk_pr_info("gve: %u IRQs needed but pool is %u and table has %u: RX stays polled\n",
+			   worst_irqs, GVE_MSIX_MAX_IRQS, gdev->msix_tbl_size);
+		return;
+	}
+
+	/* Enable MSI-X with the function mask set: nothing may fire
+	 * before a handler exists. */
+	gve_msix_set_ctrl(gdev, GVE_MSIX_CTRL_ENABLE | GVE_MSIX_CTRL_MASKALL,
+			  0);
+
+	for (i = 0; i < worst_irqs; i++) {
+		for (;;) {
+			if (uk_intctlr_irq_alloc(&irq, 1) != 0) {
+				uint32_t j;
+
+				for (j = 0; j < got; j++) {
+					unsigned int old = gdev->msix_irq_pool[j] - 1U;
+
+					uk_intctlr_irq_free(&old, 1);
+					gdev->msix_irq_pool[j] = 0U;
+				}
+				uk_pr_info("gve: only %u of %u IRQs allocatable: RX stays polled\n",
+					   got, worst_irqs);
+				return;
+			}
+			/* Keep the platform static irqs (PIT 0, IPI 13
+			 * and 14, LAPIC timer 16) out of the pool. */
+			if (irq >= 17U)
+				break;
+		}
+		gdev->msix_irq_pool[i] = (uint16_t)(irq + 1U);
+		got++;
+		/* Keep every pool entry masked until enable programs it. */
+		mmio_write32(gve_msix_entry(gdev, i) +
+			     GVE_MSIX_ENTRY_CTRL / 4U, GVE_MSIX_ENTRY_CTRL_MASK);
+	}
+	gdev->msix_pool_cnt = (uint8_t)got;
+	gdev->msix_capable = 1;
+	uk_pr_info("gve: MSI-X ready: cap=0x%x, table=%u vectors BAR%u offset=0x%x, %u irqs reserved\n",
+		   gdev->msix_cap_off, gdev->msix_tbl_size,
+		   gdev->msix_tbl_bir, gdev->msix_tbl_off, got);
+}
+
+/*
+ * Release the function mask after resources are configured. RX table
+ * entries stay masked: uk_netdev_rxq_intr_enable unmasks exactly the
+ * queues whose consumer registers a handler. Called from
+ * gve_netdev_configure after CONFIGURE_DEVICE_RESOURCES.
+ */
+static void gve_msix_configure(struct gve_device *gdev)
+{
+	if (!gdev->msix_capable)
+		return;
+	if (gdev->queue_format != GVE_DQO_RDA_FORMAT) {
+		/*
+		 * The device refused DQO during CONFIGURE_DEVICE_RESOURCES.
+		 * An app that expects interrupt RX sees the error from
+		 * the enable call. Polled-only apps keep working, so
+		 * this is not a gate-fail here.
+		 */
+		uk_pr_err("gve: fell back from DQO after reserving the IRQ pool: interrupt RX unavailable\n");
+		return;
+	}
+	if (gdev->num_ntfy_blks + 1U > gdev->msix_pool_cnt) {
+		uk_pr_err("gve: %u notification blocks exceed the %u-entry IRQ pool: interrupt RX unavailable\n",
+			  gdev->num_ntfy_blks, gdev->msix_pool_cnt);
+		return;
+	}
+	gve_msix_set_ctrl(gdev, 0, GVE_MSIX_CTRL_MASKALL);
+	gdev->msix_enabled = 1;
+	uk_pr_info("gve: MSI-X on: RX blocks %u..%u armed per queue, %u other blocks masked\n",
+		   gdev->num_ntfy_blks / 2U, gdev->num_ntfy_blks - 1U,
+		   gdev->num_ntfy_blks / 2U + 1U);
+}
+
+/*
+ * MSI-X RX event for one queue. Runs in interrupt context. It hands
+ * the event to the uknetdev callback: with CONFIG_LIBUKNETDEV_DISPAT
+ * CHERTHREADS the semaphore wake moves the work to the dispatcher
+ * thread, which drains the ring and re-arms through the empty recv.
+ */
+static int gve_msix_isr(void *arg)
+{
+	struct uk_netdev_rx_queue *rxq = arg;
+	struct gve_device *gdev = rxq->gdev;
+	uint32_t ev;
+
+	ev = ++rxq->msix_events;
+	gdev->msix_events++;
+	if (ev == 1U || (ev & (ev - 1U)) == 0U)
+		uk_pr_info("gve: RX MSI-X event q=%u events=%u\n", rxq->qid, ev);
+	if (!gdev->msix_marker_done) {
+		gdev->msix_marker_done = 1;
+		printf("GATE_GVE_MSIX_PASS vector=%u q=%u\n",
+		       gdev->msix_irq_pool[rxq->ntfy_id] - 1U + 32U,
+		       rxq->qid);
+	}
+	uk_netdev_drv_rx_event(&gdev->netdev, rxq->qid);
+	return 1;
+}
+
+/*
+ * Put one RX queue into interrupt mode. The order is deliberate:
+ * handler first, then table entry (address, data, unmask), then the
+ * arm write. A late event therefore always finds a registered
+ * handler, and no event arrives before the entry is live.
+ */
+static int gve_netdev_rxq_intr_enable(struct uk_netdev *dev,
+				      struct uk_netdev_rx_queue *queue)
+{
+	struct gve_device *gdev = to_gvedev(dev);
+	volatile uint32_t *entry;
+	unsigned int irq;
+	uint32_t irqdb;
+	int rc;
+
+	if (!gdev || !queue)
+		return -EINVAL;
+	if (queue->intr_enabled)
+		return 0;
+	if (!gdev->msix_enabled || gdev->queue_format != GVE_DQO_RDA_FORMAT) {
+		uk_pr_err("gve: RXq%u interrupt mode requested but unavailable\n",
+			  queue->qid);
+		return -ENOTSUP;
+	}
+	if (queue->ntfy_id >= gdev->num_ntfy_blks ||
+	    queue->ntfy_id >= gdev->msix_pool_cnt ||
+	    gdev->msix_irq_pool[queue->ntfy_id] == 0U)
+		return -EINVAL;
+
+	irq = gdev->msix_irq_pool[queue->ntfy_id] - 1U;
+	irqdb = bswap32(gdev->irq_db_indices[queue->ntfy_id].index);
+	if (!gve_doorbell_in_range(irqdb, gdev->bar2_size)) {
+		uk_pr_err("gve: RXq%u IRQ doorbell %u out of range (bar2=%llu): interrupt RX off\n",
+			  queue->qid, irqdb, (unsigned long long)gdev->bar2_size);
+		return -EIO;
+	}
+
+	rc = uk_intctlr_irq_register(irq, gve_msix_isr, queue);
+	if (rc != 0) {
+		uk_pr_err("gve: RXq%u cannot register irq %u: %d\n",
+			  queue->qid, irq, rc);
+		return rc;
+	}
+
+	entry = gve_msix_entry(gdev, queue->ntfy_id);
+	mmio_write32(entry + GVE_MSIX_ENTRY_ADDR_LO / 4U, GVE_MSI_ADDR_LO);
+	mmio_write32(entry + GVE_MSIX_ENTRY_ADDR_HI / 4U, 0U);
+	mmio_write32(entry + GVE_MSIX_ENTRY_DATA / 4U, (uint32_t)(irq + 32U));
+	mmio_write32(entry + GVE_MSIX_ENTRY_CTRL / 4U, 0U);	/* unmask */
+
+	queue->irq_db_idx = irqdb;
+	queue->intr_enabled = 1;
+	mmio_write32(&gdev->db_bar2[irqdb],
+		     gve_itr_arm_value_dqo(GVE_ITR_DEFAULT_USEC));
+	uk_pr_info("gve: RXq%u interrupt mode on: vector=%u irq=%u doorbell=%u\n",
+		   queue->qid, irq + 32U, irq, irqdb);
+
+	/*
+	 * Return 1: lib-lwip polls the ring once after enabling, so
+	 * frames that landed before the first arm are delivered.
+	 */
+	return 1;
+}
+
+static int gve_netdev_rxq_intr_disable(struct uk_netdev *dev,
+				       struct uk_netdev_rx_queue *queue)
+{
+	struct gve_device *gdev = to_gvedev(dev);
+	unsigned int irq;
+
+	if (!gdev || !queue)
+		return -EINVAL;
+	if (!queue->intr_enabled)
+		return 0;
+
+	/* Mask the block first, then drop the handler. */
+	mmio_write32(&gdev->db_bar2[queue->irq_db_idx], 0U);
+	mmio_write32(gve_msix_entry(gdev, queue->ntfy_id) +
+		     GVE_MSIX_ENTRY_CTRL / 4U, GVE_MSIX_ENTRY_CTRL_MASK);
+	irq = gdev->msix_irq_pool[queue->ntfy_id] - 1U;
+	uk_intctlr_irq_unregister(irq, gve_msix_isr);
+	queue->intr_enabled = 0;
+	uk_pr_info("gve: RXq%u interrupt mode off\n", queue->qid);
+	return 0;
+}
+
 static void gve_netdev_info_get(struct uk_netdev *dev,
 				struct uk_netdev_info *dev_info)
 {
@@ -859,6 +1441,13 @@ static void gve_netdev_info_get(struct uk_netdev *dev,
 	dev_info->nb_encap_rx = 0;
 	dev_info->ioalign = GVE_PKT_BUF_ALIGN;
 	dev_info->features = 0;
+	/*
+	 * Advertise RX interrupts only when the probe reserved the
+	 * whole path. The stack caches this decision, so it must be
+	 * stable for the whole boot. Ticket eae6a73726.
+	 */
+	if (gdev->msix_capable)
+		dev_info->features |= UK_NETDEV_F_RXQ_INTR;
 }
 
 static int gve_netdev_configure(struct uk_netdev *dev,
@@ -867,6 +1456,7 @@ static int gve_netdev_configure(struct uk_netdev *dev,
 	struct gve_device *gdev = to_gvedev(dev);
 	uint32_t budget;
 	uint16_t pairs;
+	int rc;
 
 	if (!gdev || !conf)
 		return -EINVAL;
@@ -895,7 +1485,10 @@ static int gve_netdev_configure(struct uk_netdev *dev,
 	}
 
 	gdev->queue_pairs = pairs;
-	return gve_configure_resources(gdev);
+	rc = gve_configure_resources(gdev);
+	if (rc == 0)
+		gve_msix_configure(gdev);
+	return rc;
 }
 
 static int gve_netdev_txq_info_get(struct uk_netdev *dev, uint16_t queue_id,
@@ -1060,11 +1653,11 @@ static struct uk_netdev_tx_queue *gve_netdev_txq_configure(
 
 		gve_adminq_fill_create_tx_queue(
 			&cmd, queue_id,
-			(uint64_t)(uintptr_t)txq->q_resources,
-			(uint64_t)(uintptr_t)txq->dqo_tx_ring,
+			gve_dma_addr(txq->q_resources),
+			gve_dma_addr(txq->dqo_tx_ring),
 			GVE_RAW_ADDRESSING_QPL_ID,
 			txq->ntfy_id,
-			(uint64_t)(uintptr_t)txq->dqo_compl_ring,
+			gve_dma_addr(txq->dqo_compl_ring),
 			txq->cnt,
 			txq->comp_cnt);
 	} else {
@@ -1105,8 +1698,8 @@ static struct uk_netdev_tx_queue *gve_netdev_txq_configure(
 
 		gve_adminq_fill_create_tx_queue(
 			&cmd, queue_id,
-			(uint64_t)(uintptr_t)txq->q_resources,
-			(uint64_t)(uintptr_t)txq->gqi_tx_ring,
+			gve_dma_addr(txq->q_resources),
+			gve_dma_addr(txq->gqi_tx_ring),
 			qpl_id,
 			txq->ntfy_id,
 			0,
@@ -1294,7 +1887,7 @@ static struct uk_netdev_rx_queue *gve_netdev_rxq_configure(
 		rxq->dqo_cur_gen_bit = 1;
 
 		for (i = 0; i < (uint32_t)(rxq->buf_cnt - 1U); i++) {
-			uint64_t baddr = (uint64_t)(uintptr_t)(
+			uint64_t baddr = gve_dma_addr(
 				rxq->dqo_rx_bufs + (size_t)i * GVE_DEFAULT_RX_BUFFER_SIZE);
 
 			rxq->dqo_bufq_ring[i].buf_id = (uint16_t)i;
@@ -1305,9 +1898,9 @@ static struct uk_netdev_rx_queue *gve_netdev_rxq_configure(
 
 		gve_adminq_fill_create_rx_queue(
 			&cmd, queue_id, 0, rxq->ntfy_id,
-			(uint64_t)(uintptr_t)rxq->q_resources,
-			(uint64_t)(uintptr_t)rxq->dqo_complq_ring,
-			(uint64_t)(uintptr_t)rxq->dqo_bufq_ring,
+			gve_dma_addr(rxq->q_resources),
+			gve_dma_addr(rxq->dqo_complq_ring),
+			gve_dma_addr(rxq->dqo_bufq_ring),
 			GVE_RAW_ADDRESSING_QPL_ID,
 			rxq->cnt,
 			GVE_DEFAULT_RX_BUFFER_SIZE,
@@ -1358,7 +1951,7 @@ static struct uk_netdev_rx_queue *gve_netdev_rxq_configure(
 			       (size_t)rxq->num_qpl_pages * GVE_PAGE_SIZE);
 
 			for (i = 0; i < rxq->cnt; i++) {
-				uint64_t paddr = (uint64_t)(uintptr_t)(
+				uint64_t paddr = gve_dma_addr(
 					rxq->qpl_pages + (size_t)i * GVE_PAGE_SIZE);
 
 				rxq->gqi_data_ring[i].addr = bswap64(paddr);
@@ -1368,9 +1961,9 @@ static struct uk_netdev_rx_queue *gve_netdev_rxq_configure(
 
 		gve_adminq_fill_create_rx_queue(
 			&cmd, queue_id, queue_id, rxq->ntfy_id,
-			(uint64_t)(uintptr_t)rxq->q_resources,
-			(uint64_t)(uintptr_t)rxq->gqi_desc_ring,
-			(uint64_t)(uintptr_t)rxq->gqi_data_ring,
+			gve_dma_addr(rxq->q_resources),
+			gve_dma_addr(rxq->gqi_desc_ring),
+			gve_dma_addr(rxq->gqi_data_ring),
 			qpl_id,
 			rxq->cnt,
 			GVE_DEFAULT_RX_BUFFER_SIZE,
@@ -1469,13 +2062,11 @@ static int gve_netdev_start(struct uk_netdev *dev)
 			mmio_write32(&gdev->db_bar2[rx_db_idx],
 				     gdev->rxq[q]->dqo_bufq_tail);
 			/*
-			 * The driver never arms the interrupt translation
-			 * rings. It enables no MSI-X vector and receives
-			 * every packet by polling, so an ITR write would
-			 * only let the device raise interrupts nobody
-			 * handles. The irq door block array stays
-			 * allocated because CONFIGURE_DEVICE_RESOURCES
-			 * requires it.
+			 * Nothing arms interrupts here. An RX queue
+			 * starts masked and moves to MSI-X delivery
+			 * only when its consumer calls
+			 * uk_netdev_rxq_intr_enable; until then only
+			 * polling delivers packets. Ticket eae6a73726.
 			 */
 		} else {
 			mmio_write32(&gdev->db_bar2[rx_db_idx],
@@ -1666,7 +2257,7 @@ static int gve_netdev_xmit(struct uk_netdev *dev,
 		gve_dqo_fill_tx_general_ctx_desc(
 			&queue->dqo_tx_ring[ctx_slot].general_ctx);
 		gve_dqo_fill_tx_pkt_desc(&queue->dqo_tx_ring[pkt_slot].pkt,
-					 (uint64_t)(uintptr_t)dst,
+					 gve_dma_addr(dst),
 					 (uint16_t)pkt_slot,
 					 (uint16_t)padded_len);
 		__asm__ __volatile__("mfence" ::: "memory");
@@ -1706,7 +2297,7 @@ static int gve_netdev_xmit(struct uk_netdev *dev,
 		} else {
 			dst = queue->bounce_bufs +
 			      (size_t)slot * GVE_DEFAULT_RX_BUFFER_SIZE;
-			addr = (uint64_t)(uintptr_t)dst;
+			addr = gve_dma_addr(dst);
 		}
 
 		for (iter = pkt; iter != NULL; iter = iter->next) {
@@ -1755,8 +2346,20 @@ static int gve_netdev_recv(struct uk_netdev *dev,
 		uint32_t bslot;
 
 		__asm__ __volatile__("" ::: "memory");
-		if (cdesc->generation != queue->dqo_cur_gen_bit)
+		if (cdesc->generation != queue->dqo_cur_gen_bit) {
+			/*
+			 * Ring empty. A queue in interrupt mode must
+			 * re-arm its block here: the device masked it
+			 * when it delivered the last event, and the
+			 * PCI PBA replays an event that arrived while
+			 * masked. An empty poll in polled mode never
+			 * touches the IRQ doorbell. Ticket eae6a73726.
+			 */
+			if (queue->intr_enabled)
+				mmio_write32(&gdev->db_bar2[queue->irq_db_idx],
+					     GVE_ITR_REARM_DQO);
 			return 0;
+		}
 
 		__asm__ __volatile__("lfence" ::: "memory");
 		pkt_len = cdesc->packet_len;
@@ -1799,7 +2402,7 @@ static int gve_netdev_recv(struct uk_netdev *dev,
 			bslot = queue->dqo_bufq_tail;
 			queue->dqo_bufq_ring[bslot].buf_id = buf_id;
 			queue->dqo_bufq_ring[bslot].buf_addr =
-				(uint64_t)(uintptr_t)(queue->dqo_rx_bufs +
+				gve_dma_addr(queue->dqo_rx_bufs +
 				(size_t)buf_id * GVE_DEFAULT_RX_BUFFER_SIZE);
 			queue->dqo_bufq_ring[bslot].header_buf_addr = 0;
 			__asm__ __volatile__("mfence" ::: "memory");
@@ -1891,6 +2494,8 @@ static const struct uk_netdev_ops gve_netdev_ops = {
 	.hwaddr_get = gve_netdev_hwaddr_get,
 	.mtu_get = gve_netdev_mtu_get,
 	.promiscuous_get = gve_netdev_promiscuous_get,
+	.rxq_intr_enable = gve_netdev_rxq_intr_enable,
+	.rxq_intr_disable = gve_netdev_rxq_intr_disable,
 };
 
 static int gve_add_dev(struct pci_device *pdev)
@@ -1898,7 +2503,8 @@ static int gve_add_dev(struct pci_device *pdev)
 	struct gve_device *gdev;
 	uint8_t bus, dev, func, rev;
 	uint32_t cmd_reg;
-	uint64_t bar0_paddr, bar2_paddr;
+	uint64_t bar0_paddr, bar1_paddr, bar2_paddr;
+	uint32_t bar1_reg;
 	volatile struct gve_registers *reg_bar0;
 	volatile uint32_t *db_bar2;
 	uint32_t dev_status, max_tx_q, max_rx_q;
@@ -1914,6 +2520,7 @@ static int gve_add_dev(struct pci_device *pdev)
 	uint16_t num_opts, total_len, i;
 	uint32_t opt_off, desc_region;
 	int mapped_bar0 = 0;
+	int mapped_bar1 = 0;
 	int mapped_bar2 = 0;
 	int has_gqi_raw = 0;
 	int cmd_may_run = 0;	/* a timeout may have left a command pending */
@@ -2003,6 +2610,29 @@ static int gve_add_dev(struct pci_device *pdev)
 	uk_pr_info("gve: Mapped BAR0 vaddr=%p, BAR2 vaddr=%p\n",
 		   (const void *)reg_bar0, (const void *)db_bar2);
 
+	/*
+	 * The GCP gVNIC device keeps the MSI-X table in BAR1: cloud
+	 * run ukg-1103-235946-493550 reported table offset 0x10000
+	 * with BIR 1. The core datapath does not need that BAR, so a
+	 * failed map does not fail the probe. gdev->msix_bar1 stays
+	 * NULL and gve_msix_probe_check keeps RX polled. A 64-bit
+	 * BAR1 puts its high half in BAR2, the doorbell BAR that
+	 * must stay separate, so the driver refuses that layout.
+	 * Ticket eae6a73726.
+	 */
+	bar1_reg = uk_pci_read_config32(&pdev->addr, PCI_BASE_ADDRESS_1);
+	bar1_paddr = uk_pci_read_bar(&pdev->addr, PCI_BASE_ADDRESS_1);
+	gdev->bar1_size = gve_bar_size(pdev, PCI_BASE_ADDRESS_1);
+	if ((bar1_reg & 0x1U) == 0U && ((bar1_reg >> 1) & 0x3U) != 0x2U &&
+	    gve_bar_fits_window(bar1_paddr, gdev->bar1_size)) {
+		gdev->msix_bar1 = gve_map_bar(bar1_paddr, 2);
+		mapped_bar1 = gdev->msix_bar1 != NULL;
+	}
+	uk_pr_info("gve: BAR1 paddr=0x%llx size=%llu msix_table_window=%s\n",
+		   (unsigned long long)bar1_paddr,
+		   (unsigned long long)gdev->bar1_size,
+		   gdev->msix_bar1 ? "mapped" : "off: RX stays polled");
+
 	dev_status = bswap32(mmio_read32(&reg_bar0->device_status));
 	max_tx_q = bswap32(mmio_read32(&reg_bar0->max_tx_queues));
 	max_rx_q = bswap32(mmio_read32(&reg_bar0->max_rx_queues));
@@ -2024,7 +2654,7 @@ static int gve_add_dev(struct pci_device *pdev)
 	}
 	memset(adminq, 0, GVE_PAGE_SIZE);
 	gdev->adminq = adminq;
-	adminq_paddr = (uint64_t)(uintptr_t)adminq;
+	adminq_paddr = gve_dma_addr(adminq);
 
 	if (rev < 0x1) {
 		mmio_write32(&reg_bar0->adminq_pfn,
@@ -2077,7 +2707,7 @@ static int gve_add_dev(struct pci_device *pdev)
 	cmd.verify_driver_compatibility.driver_info_len =
 		bswap64(sizeof(*drv_info));
 	cmd.verify_driver_compatibility.driver_info_addr =
-		bswap64((uint64_t)(uintptr_t)drv_info);
+		bswap64(gve_dma_addr(drv_info));
 
 	rc = gve_adminq_exec(reg_bar0, adminq, &gdev->adminq_prod_cnt, &cmd,
 			     &cmd_status);
@@ -2102,7 +2732,7 @@ static int gve_add_dev(struct pci_device *pdev)
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.opcode = bswap32(GVE_ADMINQ_DESCRIBE_DEVICE);
 	cmd.describe_device.device_descriptor_addr =
-		bswap64((uint64_t)(uintptr_t)desc_buf);
+		bswap64(gve_dma_addr(desc_buf));
 	cmd.describe_device.device_descriptor_version = bswap32(1);
 	cmd.describe_device.available_length = bswap32(GVE_PAGE_SIZE);
 
@@ -2370,6 +3000,14 @@ static int gve_add_dev(struct pci_device *pdev)
 				   gdev->mtu, gdev->max_mtu);
 	}
 
+	/*
+	 * Interrupt RX readiness runs before registration: the first
+	 * uk_netdev_info_get caches the feature decision, so the
+	 * probe must reserve everything the interrupt path needs.
+	 * Ticket eae6a73726.
+	 */
+	gve_msix_probe_check(gdev);
+
 	/* Register with uk_netdev */
 	gdev->netdev.ops = &gve_netdev_ops;
 	gdev->netdev.rx_one = gve_netdev_recv;
@@ -2420,6 +3058,8 @@ err:
 	} else {
 		uk_pr_err("gve: probe aborted with a command possibly pending, leaking adminq, driver info, and descriptor buffers\n");
 	}
+	if (mapped_bar1)
+		gve_unmap_bar(2);
 	if (mapped_bar2)
 		gve_unmap_bar(1);
 	if (mapped_bar0)

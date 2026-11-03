@@ -456,7 +456,7 @@ ukg_wrk_ok() {
         /Socket errors:/   { c = $4; r = $6; w = $8; t = $10
                              gsub(/,/, "", c); gsub(/,/, "", r)
                              gsub(/,/, "", w); gsub(/,/, "", t) }
-        /Non-2xx/          { n = $1 }
+        /Non-2xx/          { n = $NF }
         END {
             if (rps == "" || rps + 0 <= 0) exit 1
             if (c + 0 > 0 || r + 0 > 0 || w + 0 > 0) exit 1

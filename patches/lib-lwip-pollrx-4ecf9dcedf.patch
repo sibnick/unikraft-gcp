@@ -22,6 +22,22 @@
  	default n
 --- a/uknetdev.c
 +++ b/uknetdev.c
+@@ -54,5 +54,15 @@
+ #include <uk/atomic.h>
+ 
+ #include <uk/essentials.h>
++
++/*
++ * The branches below read CONFIG_LWIP_UKNETDEV_POLLRX as 0 or 1. A
++ * kernel with the option off does not define the symbol at all, so
++ * give that case the value 0. Ticket eae6a73726 exposed this while
++ * building the first threaded, interrupt-driven gVNIC sample.
++ */
++#ifndef CONFIG_LWIP_UKNETDEV_POLLRX
++#define CONFIG_LWIP_UKNETDEV_POLLRX 0
++#endif
+ 
+ #if CONFIG_LWIP_NOTHREADS && LWIP_PERCORE
 @@ -512,7 +512,20 @@
  	/* Enable and disable interrupts according to netif's up/down status */
  

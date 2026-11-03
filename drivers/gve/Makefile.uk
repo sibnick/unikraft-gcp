@@ -1,5 +1,10 @@
 $(eval $(call addlib_s,libgve,$(CONFIG_LIBGVE)))
 
+# Register libparam with the 'gve.' prefix so gve.intr=<0|1> reaches
+# gve_main.c (ticket eae6a73726). The macro is inert when
+# CONFIG_LIBUKLIBPARAM is off.
+$(eval $(call addlib_paramprefix,libgve,gve))
+
 LIBGVE_CINCLUDES-y += -I$(LIBGVE_BASE)/include
 
 LIBGVE_SRCS-y += $(LIBGVE_BASE)/gve_main.c

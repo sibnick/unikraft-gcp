@@ -173,7 +173,7 @@ VERDICT=$(tr -d '\r' < /tmp/wrk-report.txt | awk '
     /Socket errors:/   { c = $4; r = $6; w = $8; t = $10
                          gsub(/,/, "", c); gsub(/,/, "", r)
                          gsub(/,/, "", w); gsub(/,/, "", t) }
-    /Non-2xx/          { n = $1 }
+    /Non-2xx/          { n = $NF }
     END {
         if (rps == "" || rps + 0 <= 0)
             { print "FAIL no Requests/sec value in the wrk report"; exit }

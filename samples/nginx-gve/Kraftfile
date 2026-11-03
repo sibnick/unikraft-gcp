@@ -1,0 +1,119 @@
+spec: v0.6
+
+name: nginx-gve
+version: 0.1.0
+description: Nginx web server on a Unikraft unikernel on Google Cloud (gVNIC, threaded lwIP, third generation sizes)
+
+unikraft:
+  version: RELEASE-0.21.0
+  kconfig:
+    # Architecture and platform
+    - CONFIG_ARCH_X86_64=y
+    - CONFIG_PLAT_KVM=y
+    - CONFIG_KVM_PCI=y
+
+    # Local APIC for MSI-X delivery (EAE6 lineage, ticket eae6a73726)
+    - CONFIG_LIBUKINTCTLR=y
+    - CONFIG_LIBUKINTCTLR_APIC=y
+
+    # ELF loader application
+    - CONFIG_APPELFLOADER=y
+    - CONFIG_APPELFLOADER_VFSEXEC=y
+    - CONFIG_APPELFLOADER_CUSTOMAPPNAME=n
+    - CONFIG_APPELFLOADER_VFSEXEC_PATH=/usr/sbin/nginx
+    - CONFIG_APPELFLOADER_STACK_NBPAGES=256
+
+    # Demand paging and virtual memory, needed to map shared libraries
+    - CONFIG_HAVE_PAGING=y
+    - CONFIG_PAGING=y
+    - CONFIG_LIBUKVMEM=y
+    - CONFIG_LIBELF=y
+
+    # Virtual filesystem. The CPIO initrd is loaded by GRUB as a
+    # multiboot module and unpacked into ramfs at boot.
+    - CONFIG_LIBVFSCORE=y
+    - CONFIG_LIBVFSCORE_AUTOMOUNT_CI=y
+    - CONFIG_LIBVFSCORE_AUTOMOUNT_CI_INITRD=y
+    - CONFIG_LIBRAMFS=y
+    - CONFIG_LIBUKCPIO=y
+
+    # Device files used by nginx
+    - CONFIG_LIBDEVFS=y
+    - CONFIG_LIBDEVFS_DEV_NULL=y
+    - CONFIG_LIBDEVFS_DEV_ZERO=y
+
+    # POSIX layer used by nginx
+    - CONFIG_LIBSYSCALL_SHIM=y
+    - CONFIG_LIBSYSCALL_SHIM_HANDLER=y
+    - CONFIG_LIBPOSIX_PROCESS=y
+    - CONFIG_LIBPOSIX_PROCESS_ARCH_PRCTL=y
+    - CONFIG_LIBPOSIX_PROCESS_MULTITHREADING=y
+    - CONFIG_LIBPOSIX_FILE=y
+    - CONFIG_LIBPOSIX_POLL=y
+    - CONFIG_LIBPOSIX_POLL_YIELD=y
+    - CONFIG_LIBPOSIX_SIGNAL=y
+    - CONFIG_LIBPOSIX_TIME=y
+    - CONFIG_LIBPOSIX_ENVIRON=y
+    - CONFIG_LIBPOSIX_SYSINFO=y
+    - CONFIG_LIBPOSIX_USER=y
+    - CONFIG_LIBUKSIGNAL=y
+    - CONFIG_LIBUKRANDOM=y
+    - CONFIG_LIBUKRANDOM_GETRANDOM=y
+    - CONFIG_LIBPOSIX_FUTEX=y
+    - CONFIG_LIBPOSIX_EVENT=y
+
+    # Network stack: lwIP in threaded mode. RX arrives through the
+    # gve MSI-X interrupt path and the uknetdev dispatcher thread.
+    # CONFIG_LWIP_UKNETDEV_POLLRX stays off: that option is the
+    # polled fallback switch (ticket eae6a73726).
+    - CONFIG_LIBUKNETDEV=y
+    - CONFIG_LIBUKNETDEV_EINFO_LIBPARAM=y
+    - CONFIG_LIBUKNETDEV_MAXNBQUEUES=1
+    - CONFIG_LIBLWIP=y
+    - CONFIG_LWIP_IPV4=y
+    - CONFIG_LWIP_TCP=y
+    - CONFIG_LWIP_THREADS=y
+    - CONFIG_LWIP_SOCKET=y
+    - CONFIG_LWIP_DHCP=y
+    - CONFIG_LWIP_AUTOIFACE=y
+    - CONFIG_LIBUKNETDEV_DISPATCHERTHREADS=y
+    - CONFIG_LWIP_UKNETDEV_STATICARP=y
+    - CONFIG_LIBUKLIBPARAM=y
+
+    # gVNIC is the NIC of third generation machine sizes (Path B).
+    - CONFIG_LIBGVE=y
+
+    # Scheduler and boot
+    - CONFIG_LIBUKSCHED=y
+    - CONFIG_LIBUKBOOT=y
+
+    # Console output level
+    - CONFIG_LIBUKPRINT_KLVL_INFO=y
+
+    # App marker (thin app: app-elfloader is the entry point)
+    - CONFIG_APPNGINX_GVE=y
+
+    # Build
+    - CONFIG_OPTIMIZE_PERF=y
+
+targets:
+  - name: gcp-x86_64
+    architecture: x86_64
+    platform: kvm
+
+libraries:
+  # app-elfloader is not in the KraftKit package index.
+  # scripts/prepare-unikraft.sh clones it at RELEASE-0.21.0, the release
+  # that matches Unikraft 0.21, pinned by commit hash. Ticket 4ecf9dcedf.
+  elfloader:
+    source: ../../.unikraft/libs/app-elfloader
+    version: 6ecbcd08d85b4688112a3b275a9c8446cf59e25d
+  lwip:
+    version: RELEASE-0.21.0
+  # app-elfloader reads ELF program headers through libelf.
+  libelf:
+    source: ../../.unikraft/libs/libelf
+    version: c03d4ceb22a2b9e9799238f9c277a14284d313ad
+  # gVNIC driver from this repository.
+  gve:
+    source: ../../drivers/gve
