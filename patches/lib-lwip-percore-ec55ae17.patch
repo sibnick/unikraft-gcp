@@ -19,6 +19,12 @@ Description: Per-core lwIP state files required by the main lwIP port patch.
   reserve, and pools smaller than the core count live in that reserve
   entirely. Ticket de29b056ef.
 
+  Shared state hardening. The nested patch 0016 moves the lwIP source
+  port counter, the TCP ISS base, and the udp and raw pcb lists into
+  per-core state, gives each core its own port slice, and makes the
+  three netif mutators assert the boot-core-only contract. LWIP_SNMP
+  with per-core mode now fails at compile time. Ticket 7582e2ea37.
+
 diff --git a/include/lwip_percore.h b/include/lwip_percore.h
 new file mode 100644
 index 0000000..ad76837
