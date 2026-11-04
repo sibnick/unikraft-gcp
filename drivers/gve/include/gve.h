@@ -13,6 +13,13 @@
 #define GVE_PCI_DEVICE_ID		0x0042
 
 /*
+ * x86_64 base page size in bytes. The driver allocates and
+ * translates device buffers at this granularity. gve_main.c uses
+ * the same macro for its allocator and page-table arithmetic.
+ */
+#define GVE_PAGE_SIZE			4096ULL
+
+/*
  * BAR0 register layout (big-endian fields). Natural alignment
  * already reproduces the hardware offsets, so the struct stays
  * unpacked: passing &reg_bar0->member to the mmio helpers then
@@ -1039,6 +1046,37 @@ static inline int gve_qpl_within_limit(uint64_t total, uint64_t num_pages,
 	if (max_pages == 0ULL)
 		return 1;
 	return (total + num_pages) <= max_pages;
+}
+
+/*
+ * Decide whether one page-table translation result can be a device
+ * DMA address for a driver buffer. uk_paging_virt_to_phys() reports
+ * an unmapped address through an assert in debug builds. A release
+ * build reads whatever the entry holds: a missing mapping comes back
+ * as the page offset alone, and an all-ones entry comes back as the
+ * all-ones word. A unikraft heap frame is never physical page 0, so
+ * both values indicate a failed translation. Return 1 when the
+ * caller may use the address. Ticket dd5b22a059.
+ */
+static inline int gve_dma_paddr_is_valid(uint64_t paddr)
+{
+	return (paddr >= GVE_PAGE_SIZE) && (paddr != ~0ULL);
+}
+
+/*
+ * Decide whether two neighboring virtual pages are neighboring
+ * physical frames. prev is the device address of one page start,
+ * next the device address of the page immediately after it. The
+ * driver may describe a buffer with one DMA address only when every
+ * page of the buffer follows the previous one with no gap. That is
+ * the rule the core uksglist code applies when it counts segments.
+ * The unsigned subtraction wraps on a reversed pair, so a bogus
+ * next value fails. Return 1 when the frames are adjacent. Ticket
+ * dd5b22a059.
+ */
+static inline int gve_dma_pages_adjacent(uint64_t prev, uint64_t next)
+{
+	return (next - prev) == GVE_PAGE_SIZE;
 }
 
 #define GVE_BAR_WINDOW_SIZE	(1ULL << 30)	/* one 1 GiB PDPT window */

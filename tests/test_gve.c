@@ -3,7 +3,8 @@
  * Host unit tests for Google Virtual Ethernet (gVNIC) protocol structures,
  * Admin Queue command builders, GQI/DQO descriptor ring logic, TX free-slot
  * accounting, chain bound checks, RX tailroom decisions, refill doorbell
- * thresholds, and the MSI-X marker decision.
+ * thresholds, the MSI-X marker decision, and the device DMA translation
+ * checks.
  */
 
 #include <stdio.h>
@@ -870,6 +871,51 @@ static void test_msix_marker_due(void)
 	assert(gve_msix_marker_due(1024U, 0U));
 }
 
+/*
+ * Device DMA translation checks. uk_paging_virt_to_phys cannot
+ * report a failed walk in a release build: a missing mapping comes
+ * back as the page offset alone, and non-contiguous heap frames
+ * would make the device touch the wrong guest memory. The driver
+ * rejects both cases before programming a descriptor. Ticket
+ * dd5b22a059.
+ */
+static void test_dma_translation(void)
+{
+	/* The page constant is shared with the driver translation. */
+	assert(GVE_PAGE_SIZE == 4096ULL);
+
+	/* A translation below one page means the walk found nothing:
+	   an absent entry reads zero, so the result is the offset. */
+	assert(!gve_dma_paddr_is_valid(0ULL));
+	assert(!gve_dma_paddr_is_valid(1ULL));
+	assert(!gve_dma_paddr_is_valid(GVE_PAGE_SIZE - 1ULL));
+	/* The all-ones word is the other bogus entry value. */
+	assert(!gve_dma_paddr_is_valid(~0ULL));
+
+	/* Frame 1 and above are usable device addresses. The unikraft
+	   heap never lives in physical page 0. */
+	assert(gve_dma_paddr_is_valid(GVE_PAGE_SIZE));
+	assert(gve_dma_paddr_is_valid(GVE_PAGE_SIZE + 0x800ULL));
+	/* The 16 GiB heap base translates into valid range. */
+	assert(gve_dma_paddr_is_valid(0x400000000ULL));
+
+	/* Adjacent frames: the only layout one DMA address may
+	   describe. */
+	assert(gve_dma_pages_adjacent(0x1000ULL, 0x2000ULL));
+	assert(gve_dma_pages_adjacent(0x400000000ULL, 0x400001000ULL));
+	/* Same frame twice, a gap, or a reversed pair: refuse. */
+	assert(!gve_dma_pages_adjacent(0x1000ULL, 0x1000ULL));
+	assert(!gve_dma_pages_adjacent(0x1000ULL, 0x3000ULL));
+	assert(!gve_dma_pages_adjacent(0x3000ULL, 0x1000ULL));
+	/* Bogus walk results (zero page, garbage) never sit exactly
+	   one page after a valid address. */
+	assert(!gve_dma_pages_adjacent(0x400001000ULL, 0x800ULL));
+	assert(!gve_dma_pages_adjacent(0x400001000ULL, ~0ULL));
+	/* Offsets inside a frame break adjacency the same way: the
+	   device address of a page start is frame-aligned. */
+	assert(!gve_dma_pages_adjacent(0x1000ULL, 0x2800ULL));
+}
+
 int main(void)
 {
 	test_adminq_configure_resources();
@@ -901,6 +947,7 @@ int main(void)
 	test_rss_key_fill();
 	test_itr_arm_value_dqo();
 	test_msix_marker_due();
+	test_dma_translation();
 	printf("test_gve: all unit tests passed\n");
 	return 0;
 }

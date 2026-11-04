@@ -33,7 +33,6 @@
 #endif
 
 #define DRIVER_NAME		"gve"
-#define GVE_PAGE_SIZE		4096UL
 #define GVE_PKT_BUF_ALIGN	2048UL
 /*
  * Admin Queue completion bound. The Linux gve driver waits up to
@@ -119,6 +118,7 @@ struct uk_netdev_tx_queue {
 	uint32_t db_idx;	/* device BAR2 doorbell index, checked at configure */
 	struct gve_queue_resources *q_resources;
 	uint8_t *bounce_bufs;
+	uint64_t bounce_dma;	/* device address of bounce_bufs, checked at configure */
 
 	/* DQO_RDA rings and state */
 	union gve_tx_desc_dqo *dqo_tx_ring;
@@ -157,6 +157,7 @@ struct uk_netdev_rx_queue {
 	struct gve_rx_desc_dqo *dqo_bufq_ring;
 	struct gve_rx_compl_desc_dqo *dqo_complq_ring;
 	uint8_t *dqo_rx_bufs;
+	uint64_t dqo_rx_bufs_dma;	/* device address, contiguity checked at configure */
 	uint32_t dqo_bufq_tail;
 	uint32_t dqo_refill_pending;	/* reposts since last doorbell */
 	uint32_t dqo_complq_head;
@@ -493,25 +494,60 @@ static void gve_unmap_bar(int slot)
 #endif /* CONFIG_LIBUKPAGING */
 
 /*
- * Device DMA address for a driver buffer (ticket eae6a73726).
+ * Map one driver buffer into the device DMA address space (ticket
+ * dd5b22a059).
  *
- * A non-paging kernel identity-maps RAM, so the pointer value is
- * also the physical address. The RSS and MC gates proved that
- * form. With ukpaging the heap lives at
- * CONFIG_LIBUKBOOT_HEAP_BASE (16 GiB here), so the pointer is not
- * a device address: the device needs the physical frame behind it.
- * Translate through the active page table, the same way the core
- * uksglist and virtio code does. One base translation covers a
- * whole buffer: the frame allocator backs a heap mapping with
- * contiguous frames, the assumption the core virtio rings make
- * too.
+ * Uniquekraft/KVM dma_map semantics: the platform exposes no
+ * dma_map_ops entry to call. Without ukpaging the kernel
+ * identity-maps RAM, so a dma_map is the identity: the pointer is
+ * already the device address, the form the RSS and MC gates proved.
+ * With ukpaging the heap sits at CONFIG_LIBUKBOOT_HEAP_BASE (16 GiB
+ * here), so the pointer is not a device address. The core DMA path,
+ * uksglist, translates one entry per page through the active page
+ * table and accepts a single-address description only while two
+ * neighboring pages are adjacent in physical memory.
+ *
+ * uk_paging_virt_to_phys() cannot report a failed walk: it asserts
+ * in debug builds, and a release build gets the raw entry value. So
+ * this helper checks every result (gve_dma_paddr_is_valid) and walks
+ * the pages after the first: the whole span must be one adjacent run
+ * of frames (gve_dma_pages_adjacent). A buffer that fails here must
+ * fail its caller path. Handing the device a bogus or non-contiguous
+ * address makes it read or write the wrong guest memory: silent
+ * corruption by DMA. On success *dma_out holds the device address of
+ * the first byte and the device may touch len contiguous bytes from
+ * there.
  */
-static inline uint64_t gve_dma_addr(const void *vaddr)
+static int gve_dma_map(const void *vaddr, size_t len, uint64_t *dma_out)
 {
+	if (vaddr == NULL || len == 0UL || dma_out == NULL)
+		return -EINVAL;
 #if CONFIG_LIBUKPAGING
-	return (uint64_t)uk_paging_virt_to_phys((__vaddr_t)(uintptr_t)vaddr);
+	uintptr_t v = (uintptr_t)vaddr;
+	uintptr_t page_v;
+	uint64_t base, prev;
+
+	base = (uint64_t)uk_paging_virt_to_phys((__vaddr_t)v);
+	if (!gve_dma_paddr_is_valid(base))
+		return -EFAULT;
+	prev = base;
+	page_v = (v & ~(GVE_PAGE_SIZE - 1ULL)) + GVE_PAGE_SIZE;
+	while (page_v < v + len) {
+		uint64_t p =
+			(uint64_t)uk_paging_virt_to_phys((__vaddr_t)page_v);
+
+		if (!gve_dma_paddr_is_valid(p) ||
+		    !gve_dma_pages_adjacent(prev, p))
+			return -EFAULT;
+		prev = p;
+		page_v += (uintptr_t)GVE_PAGE_SIZE;
+	}
+	*dma_out = base;
+	return 0;
 #else
-	return (uint64_t)(uintptr_t)vaddr;
+	/* Identity-mapped RAM: the pointer is the device address. */
+	*dma_out = (uint64_t)(uintptr_t)vaddr;
+	return 0;
 #endif
 }
 
@@ -736,6 +772,7 @@ static int gve_register_qpl(struct gve_device *gdev, struct uk_alloc *a,
 {
 	uint8_t *pages;
 	uint64_t *page_bus;
+	uint64_t bus_dma = 0;
 	union gve_adminq_command cmd;
 	uint32_t cmd_status = 0;
 	uint32_t i;
@@ -771,17 +808,35 @@ static int gve_register_qpl(struct gve_device *gdev, struct uk_alloc *a,
 	memset(page_bus, 0, align_up_page((size_t)num_pages * sizeof(uint64_t)));
 
 	for (i = 0; i < num_pages; i++) {
-		uint64_t paddr = gve_dma_addr(pages + (size_t)i * GVE_PAGE_SIZE);
+		uint64_t paddr;
 
+		rc = gve_dma_map(pages + (size_t)i * GVE_PAGE_SIZE,
+				 GVE_PAGE_SIZE, &paddr);
+		if (rc != 0) {
+			uk_pr_err("gve: QPL id %u page %u has no usable DMA address (%d)\n",
+				  qpl_id, i, rc);
+			uk_free(a, page_bus);
+			uk_free(a, pages);
+			return rc;
+		}
 		page_bus[i] = bswap64(paddr);
+	}
+
+	rc = gve_dma_map(page_bus, (size_t)num_pages * sizeof(uint64_t),
+			 &bus_dma);
+	if (rc != 0) {
+		uk_pr_err("gve: QPL id %u bus list has no usable DMA address (%d)\n",
+			  qpl_id, rc);
+		uk_free(a, page_bus);
+		uk_free(a, pages);
+		return rc;
 	}
 
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.opcode = bswap32(GVE_ADMINQ_REGISTER_PAGE_LIST);
 	cmd.reg_page_list.page_list_id = bswap32(qpl_id);
 	cmd.reg_page_list.num_pages = bswap32(num_pages);
-	cmd.reg_page_list.page_address_list_addr =
-		bswap64(gve_dma_addr(page_bus));
+	cmd.reg_page_list.page_address_list_addr = bswap64(bus_dma);
 	cmd.reg_page_list.page_size = bswap64(GVE_PAGE_SIZE);
 
 	rc = gve_adminq_exec(gdev->reg_bar0, gdev->adminq,
@@ -840,6 +895,8 @@ static int gve_configure_rss(struct gve_device *gdev)
 					 (1U << GVE_RSS_HASH_UDPV6));
 	union gve_adminq_command cmd;
 	uint32_t cmd_status = 0;
+	uint64_t key_dma = 0;
+	uint64_t lut_dma = 0;
 	uint8_t *key;
 	uint32_t *lut;
 	int rc;
@@ -864,10 +921,22 @@ static int gve_configure_rss(struct gve_device *gdev)
 	gve_rss_fill_key(key, key_size);
 	gve_rss_fill_lut(lut, lut_size, pairs);
 
+	rc = gve_dma_map(key, key_size, &key_dma);
+	if (rc == 0)
+		rc = gve_dma_map(lut, (size_t)lut_size * sizeof(uint32_t),
+				 &lut_dma);
+	if (rc != 0) {
+		uk_pr_err("gve: RSS buffers have no usable DMA address (%d)\n",
+			  rc);
+		uk_free(drv_alloc, key);
+		uk_free(drv_alloc, lut);
+		return rc;
+	}
+
 	gve_adminq_fill_configure_rss(&cmd, hash_types,
 				      GVE_RSS_HASH_ALG_TOEPLITZ,
-				      gve_dma_addr(key), key_size,
-				      gve_dma_addr(lut), lut_size);
+				      key_dma, key_size,
+				      lut_dma, lut_size);
 	rc = gve_adminq_exec(gdev->reg_bar0, gdev->adminq,
 			     &gdev->adminq_prod_cnt, &cmd, &cmd_status);
 	uk_pr_info("gve: CONFIGURE_RSS types=0x%x alg=top key=%u lut=%u queues=%u rc=%d status=0x%x\n",
@@ -885,6 +954,8 @@ static int gve_configure_resources(struct gve_device *gdev)
 {
 	union gve_adminq_command cmd;
 	uint32_t cmd_status = 0;
+	uint64_t cnt_dma = 0;
+	uint64_t db_dma = 0;
 	uint32_t ntfy_candidates[2];
 	uint32_t ntfy_want;
 	int cand_idx;
@@ -949,13 +1020,34 @@ static int gve_configure_resources(struct gve_device *gdev)
 	if (ntfy_candidates[1] < ntfy_candidates[0])
 		ntfy_candidates[1] = ntfy_candidates[0];
 
+	/*
+	 * The device writes one counter and one irq db index per
+	 * notification block. Translate both arrays once and refuse
+	 * the call when either has no usable DMA address, so no
+	 * CONFIGURE command can carry a bogus device address.
+	 * Ticket dd5b22a059.
+	 */
+	rc = gve_dma_map(gdev->counter_array,
+			 (size_t)gdev->num_event_counters * sizeof(uint32_t),
+			 &cnt_dma);
+	if (rc == 0)
+		rc = gve_dma_map(gdev->irq_db_indices,
+				 (size_t)gdev->num_event_counters *
+				 sizeof(struct gve_irq_db),
+				 &db_dma);
+	if (rc != 0) {
+		uk_pr_err("gve: counter or irq db array has no usable DMA address (%d)\n",
+			  rc);
+		goto fail;
+	}
+
 	for (cand_idx = 0; cand_idx < 2; cand_idx++) {
 		uint32_t num_ntfy = ntfy_candidates[cand_idx];
 
 		gve_adminq_fill_configure_resources(
 			&cmd,
-			gve_dma_addr(gdev->counter_array),
-			gve_dma_addr(gdev->irq_db_indices),
+			cnt_dma,
+			db_dma,
 			gdev->num_event_counters,
 			num_ntfy,
 			(uint8_t)gdev->queue_format);
@@ -981,8 +1073,8 @@ static int gve_configure_resources(struct gve_device *gdev)
 		gdev->queue_format = GVE_GQI_QPL_FORMAT;
 		gve_adminq_fill_configure_resources(
 			&cmd,
-			gve_dma_addr(gdev->counter_array),
-			gve_dma_addr(gdev->irq_db_indices),
+			cnt_dma,
+			db_dma,
 			gdev->num_event_counters,
 			ntfy_candidates[0],
 			(uint8_t)gdev->queue_format);
@@ -1000,6 +1092,8 @@ static int gve_configure_resources(struct gve_device *gdev)
 		goto fail;
 
 	if (gdev->queue_format == GVE_DQO_RDA_FORMAT) {
+		uint64_t ptype_dma = 0;
+
 		if (!gdev->ptype_lut_dqo) {
 			gdev->ptype_lut_dqo = uk_memalign(
 				drv_alloc, GVE_PAGE_SIZE,
@@ -1013,20 +1107,34 @@ static int gve_configure_resources(struct gve_device *gdev)
 			got_ptype = 1;
 		}
 
-		memset(&cmd, 0, sizeof(cmd));
-		cmd.opcode = bswap32(GVE_ADMINQ_GET_PTYPE_MAP);
-		cmd.get_ptype_map.ptype_map_len =
-			bswap64(sizeof(struct gve_ptype_lut));
-		cmd.get_ptype_map.ptype_map_addr =
-			bswap64(gve_dma_addr(gdev->ptype_lut_dqo));
-
-		rc = gve_adminq_exec(gdev->reg_bar0, gdev->adminq,
-				     &gdev->adminq_prod_cnt, &cmd, &cmd_status);
-		uk_pr_info("gve: GET_PTYPE_MAP rc=%d status=0x%x\n",
-			   rc, cmd_status);
+		/*
+		 * GET_PTYPE_MAP is optional: a device that rejects it
+		 * still runs with the driver default ptype table. So a
+		 * buffer without a usable DMA address skips the
+		 * command instead of failing configure. Ticket
+		 * dd5b22a059.
+		 */
+		rc = gve_dma_map(gdev->ptype_lut_dqo,
+				 sizeof(struct gve_ptype_lut), &ptype_dma);
 		if (rc != 0) {
-			uk_pr_info("gve: Warning: GET_PTYPE_MAP returned status=0x%x\n",
-				   cmd_status);
+			uk_pr_info("gve: Warning: ptype map has no usable DMA address (%d), skipping GET_PTYPE_MAP\n",
+				   rc);
+		} else {
+			memset(&cmd, 0, sizeof(cmd));
+			cmd.opcode = bswap32(GVE_ADMINQ_GET_PTYPE_MAP);
+			cmd.get_ptype_map.ptype_map_len =
+				bswap64(sizeof(struct gve_ptype_lut));
+			cmd.get_ptype_map.ptype_map_addr = bswap64(ptype_dma);
+
+			rc = gve_adminq_exec(gdev->reg_bar0, gdev->adminq,
+					     &gdev->adminq_prod_cnt, &cmd,
+					     &cmd_status);
+			uk_pr_info("gve: GET_PTYPE_MAP rc=%d status=0x%x\n",
+				   rc, cmd_status);
+			if (rc != 0) {
+				uk_pr_info("gve: Warning: GET_PTYPE_MAP returned status=0x%x\n",
+					   cmd_status);
+			}
 		}
 	}
 
@@ -1601,6 +1709,9 @@ static struct uk_netdev_tx_queue *gve_netdev_txq_configure(
 	struct uk_netdev_tx_queue *txq;
 	union gve_adminq_command cmd;
 	uint32_t cmd_status = 0;
+	uint64_t qres_dma = 0;
+	uint64_t ring_dma = 0;
+	uint64_t comp_dma = 0;
 	struct uk_alloc *a;
 	size_t bounce_sz;
 	int rc;
@@ -1669,13 +1780,38 @@ static struct uk_netdev_tx_queue *gve_netdev_txq_configure(
 		memset(txq->bounce_bufs, 0, bounce_sz);
 		txq->dqo_cur_gen_bit = 1;
 
+		/*
+		 * Translate every queue buffer before CREATE_TX_QUEUE.
+		 * A ring or bounce area without one contiguous physical
+		 * range must fail the queue instead of handing the
+		 * device a bogus address. Ticket dd5b22a059.
+		 */
+		rc = gve_dma_map(txq->q_resources, GVE_PAGE_SIZE, &qres_dma);
+		if (rc == 0)
+			rc = gve_dma_map(txq->dqo_tx_ring,
+					 (size_t)txq->cnt * sizeof(union gve_tx_desc_dqo),
+					 &ring_dma);
+		if (rc == 0)
+			rc = gve_dma_map(txq->dqo_compl_ring,
+					 (size_t)txq->comp_cnt * sizeof(struct gve_tx_compl_desc),
+					 &comp_dma);
+		if (rc == 0)
+			rc = gve_dma_map(txq->bounce_bufs,
+					 (size_t)txq->cnt * GVE_DEFAULT_RX_BUFFER_SIZE,
+					 &txq->bounce_dma);
+		if (rc != 0) {
+			uk_pr_err("gve: TX%u queue buffers have no usable DMA address (%d)\n",
+				  queue_id, rc);
+			goto err_free;
+		}
+
 		gve_adminq_fill_create_tx_queue(
 			&cmd, queue_id,
-			gve_dma_addr(txq->q_resources),
-			gve_dma_addr(txq->dqo_tx_ring),
+			qres_dma,
+			ring_dma,
 			GVE_RAW_ADDRESSING_QPL_ID,
 			txq->ntfy_id,
-			gve_dma_addr(txq->dqo_compl_ring),
+			comp_dma,
 			txq->cnt,
 			txq->comp_cnt);
 	} else {
@@ -1714,10 +1850,28 @@ static struct uk_netdev_tx_queue *gve_netdev_txq_configure(
 			memset(txq->bounce_bufs, 0, bounce_sz);
 		}
 
+		/* Same rule as the DQO branch: checked device
+		 * addresses before CREATE_TX_QUEUE. Ticket dd5b22a059.
+		 */
+		rc = gve_dma_map(txq->q_resources, GVE_PAGE_SIZE, &qres_dma);
+		if (rc == 0)
+			rc = gve_dma_map(txq->gqi_tx_ring,
+					 (size_t)txq->cnt * sizeof(union gve_tx_desc),
+					 &ring_dma);
+		if (rc == 0 && txq->bounce_bufs != NULL)
+			rc = gve_dma_map(txq->bounce_bufs,
+					 (size_t)txq->cnt * GVE_DEFAULT_RX_BUFFER_SIZE,
+					 &txq->bounce_dma);
+		if (rc != 0) {
+			uk_pr_err("gve: TX%u queue buffers have no usable DMA address (%d)\n",
+				  queue_id, rc);
+			goto err_free;
+		}
+
 		gve_adminq_fill_create_tx_queue(
 			&cmd, queue_id,
-			gve_dma_addr(txq->q_resources),
-			gve_dma_addr(txq->gqi_tx_ring),
+			qres_dma,
+			ring_dma,
 			qpl_id,
 			txq->ntfy_id,
 			0,
@@ -1836,6 +1990,11 @@ static struct uk_netdev_rx_queue *gve_netdev_rxq_configure(
 	struct uk_netdev_rx_queue *rxq;
 	union gve_adminq_command cmd;
 	uint32_t cmd_status = 0;
+	uint64_t qres_dma = 0;
+	uint64_t complq_dma = 0;
+	uint64_t bufq_dma = 0;
+	uint64_t desc_dma = 0;
+	uint64_t data_dma = 0;
 	struct uk_alloc *a;
 	uint32_t i;
 	int rc;
@@ -1904,21 +2063,47 @@ static struct uk_netdev_rx_queue *gve_netdev_rxq_configure(
 		memset(rxq->dqo_rx_bufs, 0, bufs_sz);
 		rxq->dqo_cur_gen_bit = 1;
 
-		for (i = 0; i < (uint32_t)(rxq->buf_cnt - 1U); i++) {
-			uint64_t baddr = gve_dma_addr(
-				rxq->dqo_rx_bufs + (size_t)i * GVE_DEFAULT_RX_BUFFER_SIZE);
+		/*
+		 * Translate every queue buffer before CREATE_RX_QUEUE.
+		 * The RX buffer area carries the whole receive path, so
+		 * its contiguity is checked once here. The receive path
+		 * then derives each buffer address from the validated
+		 * base instead of translating per repost. Ticket
+		 * dd5b22a059.
+		 */
+		rc = gve_dma_map(rxq->q_resources, GVE_PAGE_SIZE, &qres_dma);
+		if (rc == 0)
+			rc = gve_dma_map(rxq->dqo_complq_ring,
+					 (size_t)rxq->cnt * sizeof(struct gve_rx_compl_desc_dqo),
+					 &complq_dma);
+		if (rc == 0)
+			rc = gve_dma_map(rxq->dqo_bufq_ring,
+					 (size_t)rxq->buf_cnt * sizeof(struct gve_rx_desc_dqo),
+					 &bufq_dma);
+		if (rc == 0)
+			rc = gve_dma_map(rxq->dqo_rx_bufs,
+					 (size_t)rxq->buf_cnt * GVE_DEFAULT_RX_BUFFER_SIZE,
+					 &rxq->dqo_rx_bufs_dma);
+		if (rc != 0) {
+			uk_pr_err("gve: RX%u queue buffers have no usable DMA address (%d)\n",
+				  queue_id, rc);
+			goto err_free;
+		}
 
+		for (i = 0; i < (uint32_t)(rxq->buf_cnt - 1U); i++) {
 			rxq->dqo_bufq_ring[i].buf_id = (uint16_t)i;
-			rxq->dqo_bufq_ring[i].buf_addr = baddr;
+			rxq->dqo_bufq_ring[i].buf_addr =
+				rxq->dqo_rx_bufs_dma +
+				(uint64_t)i * GVE_DEFAULT_RX_BUFFER_SIZE;
 			rxq->dqo_bufq_ring[i].header_buf_addr = 0;
 		}
 		rxq->dqo_bufq_tail = (uint32_t)(rxq->buf_cnt - 1U);
 
 		gve_adminq_fill_create_rx_queue(
 			&cmd, queue_id, 0, rxq->ntfy_id,
-			gve_dma_addr(rxq->q_resources),
-			gve_dma_addr(rxq->dqo_complq_ring),
-			gve_dma_addr(rxq->dqo_bufq_ring),
+			qres_dma,
+			complq_dma,
+			bufq_dma,
 			GVE_RAW_ADDRESSING_QPL_ID,
 			rxq->cnt,
 			GVE_DEFAULT_RX_BUFFER_SIZE,
@@ -1969,19 +2154,42 @@ static struct uk_netdev_rx_queue *gve_netdev_rxq_configure(
 			       (size_t)rxq->num_qpl_pages * GVE_PAGE_SIZE);
 
 			for (i = 0; i < rxq->cnt; i++) {
-				uint64_t paddr = gve_dma_addr(
-					rxq->qpl_pages + (size_t)i * GVE_PAGE_SIZE);
+				uint64_t paddr;
 
+				rc = gve_dma_map(
+					rxq->qpl_pages + (size_t)i * GVE_PAGE_SIZE,
+					GVE_PAGE_SIZE, &paddr);
+				if (rc != 0) {
+					uk_pr_err("gve: RX%u RDA page %u has no usable DMA address (%d)\n",
+						  queue_id, i, rc);
+					goto err_free;
+				}
 				rxq->gqi_data_ring[i].addr = bswap64(paddr);
 			}
 		}
 		rxq->gqi_fill_cnt = rxq->cnt;
 
+		/* Same rule as the DQO branch. Ticket dd5b22a059. */
+		rc = gve_dma_map(rxq->q_resources, GVE_PAGE_SIZE, &qres_dma);
+		if (rc == 0)
+			rc = gve_dma_map(rxq->gqi_desc_ring,
+					 (size_t)rxq->cnt * sizeof(struct gve_rx_desc),
+					 &desc_dma);
+		if (rc == 0)
+			rc = gve_dma_map(rxq->gqi_data_ring,
+					 (size_t)rxq->cnt * sizeof(union gve_rx_data_slot),
+					 &data_dma);
+		if (rc != 0) {
+			uk_pr_err("gve: RX%u queue buffers have no usable DMA address (%d)\n",
+				  queue_id, rc);
+			goto err_free;
+		}
+
 		gve_adminq_fill_create_rx_queue(
 			&cmd, queue_id, queue_id, rxq->ntfy_id,
-			gve_dma_addr(rxq->q_resources),
-			gve_dma_addr(rxq->gqi_desc_ring),
-			gve_dma_addr(rxq->gqi_data_ring),
+			qres_dma,
+			desc_dma,
+			data_dma,
 			qpl_id,
 			rxq->cnt,
 			GVE_DEFAULT_RX_BUFFER_SIZE,
@@ -2275,7 +2483,8 @@ static int gve_netdev_xmit(struct uk_netdev *dev,
 		gve_dqo_fill_tx_general_ctx_desc(
 			&queue->dqo_tx_ring[ctx_slot].general_ctx);
 		gve_dqo_fill_tx_pkt_desc(&queue->dqo_tx_ring[pkt_slot].pkt,
-					 gve_dma_addr(dst),
+					 queue->bounce_dma +
+					 (uint64_t)pkt_slot * GVE_DEFAULT_RX_BUFFER_SIZE,
 					 (uint16_t)pkt_slot,
 					 (uint16_t)padded_len);
 		__asm__ __volatile__("mfence" ::: "memory");
@@ -2315,7 +2524,8 @@ static int gve_netdev_xmit(struct uk_netdev *dev,
 		} else {
 			dst = queue->bounce_bufs +
 			      (size_t)slot * GVE_DEFAULT_RX_BUFFER_SIZE;
-			addr = gve_dma_addr(dst);
+			addr = queue->bounce_dma +
+			       (uint64_t)slot * GVE_DEFAULT_RX_BUFFER_SIZE;
 		}
 
 		for (iter = pkt; iter != NULL; iter = iter->next) {
@@ -2428,8 +2638,8 @@ static int gve_netdev_recv(struct uk_netdev *dev,
 			bslot = queue->dqo_bufq_tail;
 			queue->dqo_bufq_ring[bslot].buf_id = buf_id;
 			queue->dqo_bufq_ring[bslot].buf_addr =
-				gve_dma_addr(queue->dqo_rx_bufs +
-				(size_t)buf_id * GVE_DEFAULT_RX_BUFFER_SIZE);
+				queue->dqo_rx_bufs_dma +
+				(uint64_t)buf_id * GVE_DEFAULT_RX_BUFFER_SIZE;
 			queue->dqo_bufq_ring[bslot].header_buf_addr = 0;
 			__asm__ __volatile__("mfence" ::: "memory");
 
@@ -2537,7 +2747,9 @@ static int gve_add_dev(struct pci_device *pdev)
 	const char *ver_str = "GVE-1.0.0\n";
 	const char *p;
 	union gve_adminq_command *adminq = NULL;
-	uint64_t adminq_paddr;
+	uint64_t adminq_paddr = 0;
+	uint64_t drv_info_dma = 0;
+	uint64_t desc_dma = 0;
 	struct gve_driver_info *drv_info = NULL;
 	uint8_t *desc_buf = NULL;
 	struct gve_device_descriptor *desc;
@@ -2680,7 +2892,12 @@ static int gve_add_dev(struct pci_device *pdev)
 	}
 	memset(adminq, 0, GVE_PAGE_SIZE);
 	gdev->adminq = adminq;
-	adminq_paddr = gve_dma_addr(adminq);
+	rc = gve_dma_map(adminq, GVE_PAGE_SIZE, &adminq_paddr);
+	if (rc != 0) {
+		printf("GATE_FAIL: gve adminq has no usable DMA address (%d)\n",
+		       rc);
+		goto err;
+	}
 
 	if (rev < 0x1) {
 		mmio_write32(&reg_bar0->adminq_pfn,
@@ -2732,8 +2949,14 @@ static int gve_add_dev(struct pci_device *pdev)
 	cmd.opcode = bswap32(GVE_ADMINQ_VERIFY_DRIVER_COMPATIBILITY);
 	cmd.verify_driver_compatibility.driver_info_len =
 		bswap64(sizeof(*drv_info));
+	rc = gve_dma_map(drv_info, sizeof(*drv_info), &drv_info_dma);
+	if (rc != 0) {
+		printf("GATE_FAIL: gve driver_info has no usable DMA address (%d)\n",
+		       rc);
+		goto err;
+	}
 	cmd.verify_driver_compatibility.driver_info_addr =
-		bswap64(gve_dma_addr(drv_info));
+		bswap64(drv_info_dma);
 
 	rc = gve_adminq_exec(reg_bar0, adminq, &gdev->adminq_prod_cnt, &cmd,
 			     &cmd_status);
@@ -2755,10 +2978,16 @@ static int gve_add_dev(struct pci_device *pdev)
 	}
 	memset(desc_buf, 0, GVE_PAGE_SIZE);
 
+	rc = gve_dma_map(desc_buf, GVE_PAGE_SIZE, &desc_dma);
+	if (rc != 0) {
+		printf("GATE_FAIL: gve desc_buf has no usable DMA address (%d)\n",
+		       rc);
+		goto err;
+	}
+
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.opcode = bswap32(GVE_ADMINQ_DESCRIBE_DEVICE);
-	cmd.describe_device.device_descriptor_addr =
-		bswap64(gve_dma_addr(desc_buf));
+	cmd.describe_device.device_descriptor_addr = bswap64(desc_dma);
 	cmd.describe_device.device_descriptor_version = bswap32(1);
 	cmd.describe_device.available_length = bswap32(GVE_PAGE_SIZE);
 
