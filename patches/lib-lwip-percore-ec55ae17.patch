@@ -25,6 +25,11 @@ Description: Per-core lwIP state files required by the main lwIP port patch.
   three netif mutators assert the boot-core-only contract. LWIP_SNMP
   with per-core mode now fails at compile time. Ticket 7582e2ea37.
 
+  Cross-core socket use. A socket fd opened on one core and used on
+  another core now fails with EBADF at the socket lookup, before any
+  per-core stack state of the calling core can corrupt the owner's
+  pcb lists. Ticket c07f809ed7.
+
 diff --git a/include/lwip_percore.h b/include/lwip_percore.h
 new file mode 100644
 index 0000000..eaedcd8
@@ -462,10 +467,10 @@ index 0000000..88dd298
 + extern "C" {
 diff --git a/patches/0016-per-core-stack-state.patch b/patches/0016-per-core-stack-state.patch
 new file mode 100644
-index 0000000..b3a7f2c
+index 0000000..fdc99e0
 --- /dev/null
 +++ b/patches/0016-per-core-stack-state.patch
-@@ -0,0 +1,716 @@
+@@ -0,0 +1,726 @@
 +--- a/src/include/lwip/priv/tcp_priv.h
 ++++ b/src/include/lwip/priv/tcp_priv.h
 +@@ -323,6 +323,17 @@
@@ -908,7 +913,7 @@ index 0000000..b3a7f2c
 + #endif /* LWIP_SOCKET_SELECT || LWIP_SOCKET_POLL */
 + 
 + #define sock_set_errno(sk, e) do { \
-+@@ -417,11 +427,24 @@
++@@ -417,11 +427,34 @@
 + tryget_socket_unconn_nouse(int fd)
 + {
 +   int s = fd - LWIP_SOCKET_OFFSET;
@@ -923,6 +928,16 @@ index 0000000..b3a7f2c
 ++    LWIP_DEBUGF(SOCKETS_DEBUG, ("tryget_socket_unconn(%d): invalid\n", fd));
 ++    return NULL;
 ++  }
+++  if (core != (int)lwip_current_core_id()) {
+++    /* This fd belongs to another core. Every stack call that follows
+++     * this lookup uses the per-core state of the calling core: the pcb
+++     * lists, the memp pools, the select list. Running it on the owner's
+++     * socket would corrupt the owner's lists. Fail with EBADF instead.
+++     * Ticket c07f809ed7. */
+++    LWIP_DEBUGF(SOCKETS_DEBUG, ("tryget_socket_unconn(%d): wrong core\n", fd));
+++    set_errno(EBADF);
+++    return NULL;
+++  }
 ++  return &lwip_get_core_state_by_id(core)->sockets[idx];
 ++#else
 ++  if (s >= NUM_SOCKETS) {
@@ -934,7 +949,7 @@ index 0000000..b3a7f2c
 + }
 + 
 + struct lwip_sock *
-+@@ -486,7 +509,11 @@
++@@ -486,7 +519,11 @@
 + {
 +   struct lwip_sock *sock = tryget_socket(fd);
 +   if (!sock) {
@@ -946,7 +961,7 @@ index 0000000..b3a7f2c
 +       LWIP_DEBUGF(SOCKETS_DEBUG, ("get_socket(%d): invalid\n", fd));
 +     }
 +     set_errno(EBADF);
-+@@ -510,6 +537,37 @@
++@@ -510,6 +547,37 @@
 +   SYS_ARCH_DECL_PROTECT(lev);
 +   LWIP_UNUSED_ARG(accepted);
 + 
@@ -984,7 +999,7 @@ index 0000000..b3a7f2c
 +   /* allocate a new socket identifier */
 +   for (i = 0; i < NUM_SOCKETS; ++i) {
 +     /* Protect socket array */
-+@@ -542,6 +600,7 @@
++@@ -542,6 +610,7 @@
 +     SYS_ARCH_UNPROTECT(lev);
 +   }
 +   return -1;
@@ -992,7 +1007,7 @@ index 0000000..b3a7f2c
 + }
 + 
 + /** Free a socket (under lock)
-+@@ -664,8 +723,13 @@
++@@ -664,8 +733,13 @@
 +     done_socket(sock);
 +     return -1;
 +   }
@@ -1006,7 +1021,7 @@ index 0000000..b3a7f2c
 + 
 +   /* See event_callback: If data comes in right away after an accept, even
 +    * though the server task might not have created a new socket yet.
-+@@ -1742,7 +1806,11 @@
++@@ -1742,7 +1816,11 @@
 +     return -1;
 +   }
 +   conn->socket = i;
@@ -1018,7 +1033,7 @@ index 0000000..b3a7f2c
 +   LWIP_DEBUGF(SOCKETS_DEBUG, ("%d\n", i));
 +   set_errno(0);
 +   return i;
-+@@ -2883,6 +2951,9 @@
++@@ -2883,6 +2961,9 @@
 +   case SO_KEEPALIVE:
 +     return SOF_KEEPALIVE;
 +   case SO_REUSEADDR:
@@ -1028,7 +1043,7 @@ index 0000000..b3a7f2c
 +     return SOF_REUSEADDR;
 +   default:
 +     LWIP_ASSERT("Unknown socket option", 0);
-+@@ -2934,6 +3005,9 @@
++@@ -2934,6 +3015,9 @@
 +         case SO_KEEPALIVE:
 + #if SO_REUSE
 +         case SO_REUSEADDR:
@@ -1038,7 +1053,7 @@ index 0000000..b3a7f2c
 + #endif /* SO_REUSE */
 +           if ((optname == SO_BROADCAST) &&
 +               (NETCONNTYPE_GROUP(sock->conn->type) != NETCONN_UDP)) {
-+@@ -3342,6 +3416,9 @@
++@@ -3342,6 +3426,9 @@
 +         case SO_KEEPALIVE:
 + #if SO_REUSE
 +         case SO_REUSEADDR:
