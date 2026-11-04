@@ -27,10 +27,10 @@ Description: Per-core lwIP state files required by the main lwIP port patch.
 
 diff --git a/include/lwip_percore.h b/include/lwip_percore.h
 new file mode 100644
-index 0000000..ad76837
+index 0000000..eaedcd8
 --- /dev/null
 +++ b/include/lwip_percore.h
-@@ -0,0 +1,209 @@
+@@ -0,0 +1,233 @@
 +/* SPDX-License-Identifier: BSD-3-Clause */
 +/*
 + * Per-core stack state for lwIP in NO_SYS mode.
@@ -96,11 +96,23 @@ index 0000000..ad76837
 +
 +UK_CTASSERT(LWIP_CORE_MAX > 0);
 +
++/*
++ * The SNMP mib code walks the global udp_pcbs list. Per-core mode moves
++ * that list into per-core state, so the code cannot compile against it.
++ * This port keeps LWIP_SNMP off everywhere. Fail loudly if a
++ * configuration turns it on. Ticket 7582e2ea37.
++ */
++#if LWIP_PERCORE && LWIP_SNMP
++#error "lwIP per-core mode does not support LWIP_SNMP"
++#endif
++
 +struct tcp_pcb;
 +struct tcp_pcb_listen;
 +struct memp;
 +struct lwip_select_cb;
 +struct etharp_q_entry;
++struct udp_pcb;
++struct raw_pcb;
 +
 +#ifndef TCP_LISTEN_PCBS_T_DEFINED
 +#define TCP_LISTEN_PCBS_T_DEFINED
@@ -144,6 +156,18 @@ index 0000000..ad76837
 +	struct sys_timeo *next_timeout;
 +	u32_t current_timeout_due_time;
 +	int tcpip_tcp_timer_active;
++
++	/* TCP source port and ISS allocation. Each core keeps its own
++	 * counter, so two cores cannot pick the same local port.
++	 * Ticket 7582e2ea37. */
++	u16_t tcp_port;
++	u32_t tcp_iss;
++
++	/* UDP source port, UDP pcb list base, and RAW pcb list base.
++	 * Same reason as above. Ticket 7582e2ea37. */
++	u16_t udp_port;
++	struct udp_pcb *udp_pcbs;
++	struct raw_pcb *raw_pcbs;
 +
 +	/* Memory pool free list heads */
 +	struct memp *memp_tabs[LWIP_MEMP_MAX];
@@ -438,10 +462,10 @@ index 0000000..88dd298
 + extern "C" {
 diff --git a/patches/0016-per-core-stack-state.patch b/patches/0016-per-core-stack-state.patch
 new file mode 100644
-index 0000000..7f0d048
+index 0000000..b3a7f2c
 --- /dev/null
 +++ b/patches/0016-per-core-stack-state.patch
-@@ -0,0 +1,509 @@
+@@ -0,0 +1,716 @@
 +--- a/src/include/lwip/priv/tcp_priv.h
 ++++ b/src/include/lwip/priv/tcp_priv.h
 +@@ -323,6 +323,17 @@
@@ -478,8 +502,20 @@ index 0000000..7f0d048
 +    1) Every TCP PCB that is not CLOSED is in one of the lists.
 +--- a/src/core/tcp.c
 ++++ b/src/core/tcp.c
-+@@ -159,7 +159,9 @@
++@@ -156,10 +156,21 @@
++ };
++ 
++ /* last local TCP port */
+++#if LWIP_PERCORE
+++/* One counter per core. tcp_new_port() allocates inside the core's own
+++ * slice of the range, so two cores cannot pick the same local port.
+++ * Ticket 7582e2ea37. */
+++#include "lwip_percore.h"
+++#define tcp_port (lwip_get_core_state()->tcp_port)
+++UK_CTASSERT((TCP_LOCAL_PORT_RANGE_END - TCP_LOCAL_PORT_RANGE_START) >= LWIP_CORE_MAX);
+++#else
 + static u16_t tcp_port = TCP_LOCAL_PORT_RANGE_START;
+++#endif
 + 
 + /* Incremented every coarse grained timer shot (typically every 500 ms). */
 ++#if !LWIP_PERCORE
@@ -488,7 +524,7 @@ index 0000000..7f0d048
 + static const u8_t tcp_backoff[13] =
 + { 1, 2, 3, 4, 5, 6, 7, 7, 7, 7, 7, 7, 7};
 + /* Times per slowtmr hits */
-+@@ -167,6 +169,7 @@
++@@ -167,6 +178,7 @@
 + 
 + /* The TCP PCB lists. */
 + 
@@ -496,7 +532,7 @@ index 0000000..7f0d048
 + /** List of all TCP PCBs bound but not yet (connected || listening) */
 + struct tcp_pcb *tcp_bound_pcbs;
 + /** List of all TCP PCBs in LISTEN state */
-+@@ -187,6 +190,10 @@
++@@ -187,6 +199,10 @@
 + /** Timer counter to handle calling slow-timer from tcp_tmr() */
 + static u8_t tcp_timer;
 + static u8_t tcp_timer_ctr;
@@ -507,6 +543,67 @@ index 0000000..7f0d048
 + static u16_t tcp_new_port(void);
 + 
 + static err_t tcp_close_shutdown_fin(struct tcp_pcb *pcb);
++@@ -1016,10 +1032,30 @@
++   struct tcp_pcb *pcb;
++ 
++ again:
+++#if LWIP_PERCORE
+++  {
+++    u32_t slice = (u32_t)(TCP_LOCAL_PORT_RANGE_END -
+++                          TCP_LOCAL_PORT_RANGE_START) / LWIP_CORE_MAX;
+++    u16_t base = (u16_t)(TCP_LOCAL_PORT_RANGE_START +
+++                         lwip_current_core_id() * slice);
+++    u16_t end = (u16_t)(base + slice);
+++
+++    /* Seed the counter once, inside this core's slice. tcp_init() may
+++     * have stored a value outside the slice. */
+++    if (tcp_port < base || tcp_port >= end) {
+++      tcp_port = (u16_t)(base + (LWIP_RAND() % slice));
+++    }
+++    tcp_port++;
+++    if (tcp_port >= end) {
+++      tcp_port = base;
+++    }
+++  }
+++#else
++   tcp_port++;
++   if (tcp_port == TCP_LOCAL_PORT_RANGE_END) {
++     tcp_port = TCP_LOCAL_PORT_RANGE_START;
++   }
+++#endif
++   /* Check all PCB lists. */
++   for (i = 0; i < NUM_TCP_PCB_LISTS; i++) {
++     for (pcb = *tcp_pcb_lists[i]; pcb != NULL; pcb = pcb->next) {
++@@ -2222,6 +2258,21 @@
++   LWIP_ASSERT("tcp_next_iss: invalid pcb", pcb != NULL);
++   return LWIP_HOOK_TCP_ISN(&pcb->local_ip, pcb->local_port, &pcb->remote_ip, pcb->remote_port);
++ #else /* LWIP_HOOK_TCP_ISN */
+++#if LWIP_PERCORE
+++  u32_t *iss = &lwip_get_core_state()->tcp_iss;
+++
+++  LWIP_ASSERT("tcp_next_iss: invalid pcb", pcb != NULL);
+++  LWIP_UNUSED_ARG(pcb);
+++
+++  if (*iss == 0) {
+++    /* First call on this core. Each core starts at a different point in
+++     * the sequence space, so two cores never share an ISS stream.
+++     * Ticket 7582e2ea37. */
+++    *iss = 6510u + 0x9e3779b9u * (u32_t)(lwip_current_core_id() + 1);
+++  }
+++  *iss += tcp_ticks;       /* XXX */
+++  return *iss;
+++#else
++   static u32_t iss = 6510;
++ 
++   LWIP_ASSERT("tcp_next_iss: invalid pcb", pcb != NULL);
++@@ -2229,6 +2280,7 @@
++ 
++   iss += tcp_ticks;       /* XXX */
++   return iss;
+++#endif /* LWIP_PERCORE */
++ #endif /* LWIP_HOOK_TCP_ISN */
++ }
++ 
 +--- a/src/core/tcp_in.c
 ++++ b/src/core/tcp_in.c
 +@@ -85,7 +85,9 @@
@@ -951,6 +1048,140 @@ index 0000000..7f0d048
 + #endif /* SO_REUSE */
 +           if ((optname == SO_BROADCAST) &&
 +               (NETCONNTYPE_GROUP(sock->conn->type) != NETCONN_UDP)) {
++--- a/src/core/udp.c
+++++ b/src/core/udp.c
++@@ -74,11 +74,22 @@
++ #endif
++ 
++ /* last local UDP port */
+++#if LWIP_PERCORE
+++/* One counter and one pcb list base per core. udp_new_port() allocates
+++ * inside the core's own slice of the range. The list base is private
+++ * because every walker on this port is a same-core caller: udp_input,
+++ * udp_connect/udp_bind/udp_disconnect, the per-core timers, and the
+++ * per-core memp and mem stats. Ticket 7582e2ea37. */
+++#include "lwip_percore.h"
+++#define udp_port  (lwip_get_core_state()->udp_port)
+++#define udp_pcbs  (lwip_get_core_state()->udp_pcbs)
+++#else
++ static u16_t udp_port = UDP_LOCAL_PORT_RANGE_START;
++ 
++ /* The list of UDP PCBs */
++ /* exported in udp.h (was static) */
++ struct udp_pcb *udp_pcbs;
+++#endif
++ 
++ /**
++  * Initialize this module.
++@@ -103,9 +114,29 @@
++   struct udp_pcb *pcb;
++ 
++ again:
+++#if LWIP_PERCORE
+++  {
+++    u32_t slice = (u32_t)(UDP_LOCAL_PORT_RANGE_END -
+++                          UDP_LOCAL_PORT_RANGE_START) / LWIP_CORE_MAX;
+++    u16_t base = (u16_t)(UDP_LOCAL_PORT_RANGE_START +
+++                         lwip_current_core_id() * slice);
+++    u16_t end = (u16_t)(base + slice);
+++
+++    /* Seed the counter once, inside this core's slice. udp_init() may
+++     * have stored a value outside the slice. */
+++    if (udp_port < base || udp_port >= end) {
+++      udp_port = (u16_t)(base + (LWIP_RAND() % slice));
+++    }
+++    udp_port++;
+++    if (udp_port >= end) {
+++      udp_port = base;
+++    }
+++  }
+++#else
++   if (udp_port++ == UDP_LOCAL_PORT_RANGE_END) {
++     udp_port = UDP_LOCAL_PORT_RANGE_START;
++   }
+++#endif
++   /* Check all PCBs. */
++   for (pcb = udp_pcbs; pcb != NULL; pcb = pcb->next) {
++     if (pcb->local_port == udp_port) {
++--- a/src/core/raw.c
+++++ b/src/core/raw.c
++@@ -63,7 +63,16 @@
++ #include <string.h>
++ 
++ /** The list of RAW PCBs */
+++#if LWIP_PERCORE
+++/* Per-core list base. Every walker in raw.c is a same-core caller:
+++ * raw_input, raw_new/bind/connect/disconnect, and raw_remove. The raw
+++ * module has no port allocator, so it needs no port slice.
+++ * Ticket 7582e2ea37. */
+++#include "lwip_percore.h"
+++#define raw_pcbs  (lwip_get_core_state()->raw_pcbs)
+++#else
++ static struct raw_pcb *raw_pcbs;
+++#endif
++ 
++ static u8_t
++ raw_input_local_match(struct raw_pcb *pcb, u8_t broadcast)
++--- a/src/core/netif.c
+++++ b/src/core/netif.c
++@@ -74,6 +74,21 @@
++ 
++ #include "netif/ethernet.h"
++ 
+++#if LWIP_PERCORE
+++/*
+++ * The netif list is global to all cores. This port keeps it that way on
+++ * purpose. Management code owns it: the app adds and removes netifs on
+++ * the boot core before it starts worker cores, and the periodic etharp
+++ * timer runs on core 0 only. The three mutators below assert that
+++ * contract. Full per-core netif ownership is a redesign, tracked on
+++ * ticket 7582e2ea37.
+++ */
+++#include <uk/assert.h>
+++#define NETIF_BOOTSIDE_ASSERT() UK_ASSERT(lwip_current_core_id() == 0)
+++#else /* !LWIP_PERCORE */
+++#define NETIF_BOOTSIDE_ASSERT()
+++#endif /* !LWIP_PERCORE */
+++
++ #if LWIP_AUTOIP
++ #include "lwip/autoip.h"
++ #endif /* LWIP_AUTOIP */
++@@ -284,6 +299,7 @@
++ #endif
++ 
++   LWIP_ASSERT_CORE_LOCKED();
+++  NETIF_BOOTSIDE_ASSERT();
++ 
++ #if LWIP_SINGLE_NETIF
++   if (netif_default != NULL) {
++@@ -744,6 +760,7 @@
++ #endif
++ 
++   LWIP_ASSERT_CORE_LOCKED();
+++  NETIF_BOOTSIDE_ASSERT();
++ 
++   if (netif == NULL) {
++     return;
++@@ -825,6 +842,7 @@
++ netif_set_default(struct netif *netif)
++ {
++   LWIP_ASSERT_CORE_LOCKED();
+++  NETIF_BOOTSIDE_ASSERT();
++ 
++   if (netif == NULL) {
++     /* remove default route */
++--- a/src/include/lwip/udp.h
+++++ b/src/include/lwip/udp.h
++@@ -112,7 +112,9 @@
++   void *recv_arg;
++ };
++ /* udp_pcbs export for external reference (e.g. SNMP agent) */
+++#if !LWIP_PERCORE
++ extern struct udp_pcb *udp_pcbs;
+++#endif
++ 
++ /* The following functions is the application layer interface to the
++    UDP code. */
 diff --git a/percore.c b/percore.c
 new file mode 100644
 index 0000000..f34e5aa
