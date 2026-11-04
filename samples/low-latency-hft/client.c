@@ -53,10 +53,14 @@
  *
  * MAX_RATE_PPS: one packet per nanosecond is the fastest real rate.
  * A larger value only makes the computed send interval 0.
+ *
+ * MAX_CORE_ID: the highest CPU id the glibc cpuset type holds. A
+ * larger id makes CPU_SET write past the end of that type.
  */
 #define MAX_PROBE_COUNT 10000000ULL
 #define MAX_PKT_LEN 65507U
 #define MAX_RATE_PPS 1000000000ULL
+#define MAX_CORE_ID 1023U
 
 struct __attribute__((packed)) probe_pkt {
 	uint64_t seq;
@@ -145,14 +149,18 @@ int main(int argc, char *argv[])
 		case 's':
 			server_ip = optarg;
 			break;
-		case 'p':
-			port = atoi(optarg);
-			if (port <= 0 || port > 65535) {
-				fprintf(stderr, "Error: Invalid port %s\n",
+		case 'p': {
+			uint64_t p;
+
+			if (ukarg_u64(optarg, 1, 65535, &p) != 0) {
+				fprintf(stderr,
+					"Error: Port must be 1..65535: '%s'\n",
 					optarg);
 				return EXIT_FAILURE;
 			}
+			port = (int)p;
 			break;
+		}
 		case 'n': {
 			uint64_t probes;
 
@@ -197,9 +205,18 @@ int main(int argc, char *argv[])
 			rate_pps = rate;
 			break;
 		}
-		case 'c':
-			pin_core = atoi(optarg);
+		case 'c': {
+			uint64_t core;
+
+			if (ukarg_u64(optarg, 0, MAX_CORE_ID, &core) != 0) {
+				fprintf(stderr,
+					"Error: Core id must be 0..%u: '%s'\n",
+					MAX_CORE_ID, optarg);
+				return EXIT_FAILURE;
+			}
+			pin_core = (int)core;
 			break;
+		}
 		case 'h':
 			print_usage(argv[0]);
 			return EXIT_SUCCESS;

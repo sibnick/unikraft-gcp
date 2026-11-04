@@ -39,6 +39,8 @@
 #include <uk/netdev.h>
 #include <uk/plat/time.h>
 
+#include "../common/ukarg.h"
+
 #define rss_htons(x)	((uint16_t)__builtin_bswap16((uint16_t)(x)))
 #define rss_ntohs(x)	rss_htons(x)
 #define rss_htonl(x)	((uint32_t)__builtin_bswap32((uint32_t)(x)))
@@ -737,7 +739,14 @@ int main(int argc, char *argv[])
 	ctx.pkts = RSS_PKTS_DEFAULT;
 	ctx.port = RSS_PORT_DEFAULT;
 
+	/* Each number goes through ukarg_u64 with its own range. The
+	 * old cast to uint16_t hid a value above the array bound: 65544
+	 * became 8 and then indexed the per-queue arrays past the end
+	 * when the device reported a larger maximum. Ticket 5d4890b96e.
+	 */
 	for (i = 1; i < argc; i++) {
+		uint64_t num;
+
 		if (strncmp(argv[i], "role=", 5) == 0)
 			role = argv[i] + 5;
 		else if (strncmp(argv[i], "peer=", 5) == 0)
@@ -748,14 +757,38 @@ int main(int argc, char *argv[])
 			ip_param = argv[i] + 10;
 		else if (strncmp(argv[i], "gw=", 3) == 0)
 			gw_param = argv[i] + 3;
-		else if (strncmp(argv[i], "queues=", 7) == 0)
-			ctx.queues = (uint16_t)atoi(argv[i] + 7);
-		else if (strncmp(argv[i], "flows=", 6) == 0)
-			ctx.flows = (uint16_t)atoi(argv[i] + 6);
-		else if (strncmp(argv[i], "pkts=", 5) == 0)
-			ctx.pkts = (uint16_t)atoi(argv[i] + 5);
-		else if (strncmp(argv[i], "port=", 5) == 0)
-			ctx.port = (uint16_t)atoi(argv[i] + 5);
+		else if (strncmp(argv[i], "queues=", 7) == 0) {
+			if (ukarg_u64(argv[i] + 7, 1, RSS_MAX_QUEUES,
+				      &num) != 0) {
+				printf("GATE_FAIL: bad queues=%s need 1..%u\n",
+				       argv[i] + 7, RSS_MAX_QUEUES);
+				return 1;
+			}
+			ctx.queues = (uint16_t)num;
+		} else if (strncmp(argv[i], "flows=", 6) == 0) {
+			if (ukarg_u64(argv[i] + 6, 1, RSS_MAX_FLOWS,
+				      &num) != 0) {
+				printf("GATE_FAIL: bad flows=%s need 1..%u\n",
+				       argv[i] + 6, RSS_MAX_FLOWS);
+				return 1;
+			}
+			ctx.flows = (uint16_t)num;
+		} else if (strncmp(argv[i], "pkts=", 5) == 0) {
+			if (ukarg_u64(argv[i] + 5, 1, RSS_MAX_PKTS,
+				      &num) != 0) {
+				printf("GATE_FAIL: bad pkts=%s need 1..%u\n",
+				       argv[i] + 5, RSS_MAX_PKTS);
+				return 1;
+			}
+			ctx.pkts = (uint16_t)num;
+		} else if (strncmp(argv[i], "port=", 5) == 0) {
+			if (ukarg_u64(argv[i] + 5, 1, 65535, &num) != 0) {
+				printf("GATE_FAIL: bad port=%s need 1..65535\n",
+				       argv[i] + 5);
+				return 1;
+			}
+			ctx.port = (uint16_t)num;
+		}
 	}
 
 	if (ctx.queues == 0U || ctx.queues > RSS_MAX_QUEUES ||
