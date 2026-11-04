@@ -5,12 +5,14 @@
 # top are set on source. Dependencies: coreutils, gawk, and fossil
 # for the evidence store step.
 #
-# Sourced by: gcp_run_a1.sh gcp_run_a2.sh gcp_run_a3.sh gcp_run_b1.sh
-# gcp_run_b2.sh gcp_run_b3.sh gcp_run_c1.sh gcp_run_c2.sh
-# gcp_build_image.sh gcp_teardown.sh
+# Sourced by: gcp_ab_report.sh gcp_build_image.sh gcp_run_a1.sh
+# gcp_run_a2.sh gcp_run_a3.sh gcp_run_b1.sh gcp_run_b2.sh
+# gcp_run_b3.sh gcp_run_c1.sh gcp_run_c2.sh gcp_run_mc.sh
+# gcp_run_nginx.sh gcp_run_nginx_gve.sh gcp_run_rss.sh
+# gcp_teardown.sh
 # Tickets: 1c76a66b26 4a7a2ca6f5 e3effabf78 4347c2a8e6 c16353731a
 # 06ea1706a7 5e6a2acd8a 74936642ce cf185ab6fd afc0a00b06 3a59523e76
-# 0bc13135d7 eec304d8cf 4c76b4d84d a5874d85fe
+# 0bc13135d7 eec304d8cf 4c76b4d84d a5874d85fe 005b1e7772
 
 # Directory of this file, the path of the teardown script, and the
 # root of this Fossil checkout. The evidence store step needs the
@@ -163,14 +165,75 @@ ukg_zone_list() {
     echo "${zones}" | tr -s '[:space:]' '\n' | awk 'NF && !seen[$0]++'
 }
 
-# Print a fresh private path for a serial console log file.
-# Predictable /tmp paths can be planted symlinks. mktemp refuses to
-# follow them. Override the base directory with UKG_LOG_DIR.
+# Print the private base directory for run files: serial console logs
+# and rendered guest startup scripts. The default is per user, under
+# ${XDG_STATE_HOME:-$HOME/.local/state}/ukg. Override it with
+# UKG_LOG_DIR. The helper creates the directory with mode 700, then
+# checks owner and mode before it prints the path. On a shared host,
+# another user must not read a serial log or plant a startup script.
+# The helper exits 1 when the directory exists with a foreign owner
+# or with group or other access. Ticket 005b1e7772.
+ukg_log_dir() {
+    local dir="${UKG_LOG_DIR:-}"
+    if [ -z "${dir}" ]; then
+        if [ -n "${XDG_STATE_HOME:-}" ]; then
+            dir="${XDG_STATE_HOME}/ukg"
+        elif [ -n "${HOME:-}" ]; then
+            dir="${HOME}/.local/state/ukg"
+        else
+            echo "[ERROR] Set UKG_LOG_DIR or HOME to pick a private log directory." >&2
+            exit 1
+        fi
+    fi
+    # SC2174: with -p, -m applies to the deepest directory only. That
+    # is the intended scope. Parent directories sit under the user's
+    # own state home, and the mode check below verifies the leaf
+    # whether it was just created or already existed.
+    # shellcheck disable=SC2174
+    if ! mkdir -m 700 -p "${dir}" 2>/dev/null; then
+        echo "[ERROR] Cannot create the log directory '${dir}'." >&2
+        exit 1
+    fi
+    local owner mode
+    owner="$(stat -c '%u' "${dir}" 2>/dev/null)" || {
+        echo "[ERROR] Log path '${dir}' is not a usable directory." >&2
+        exit 1
+    }
+    mode="$(stat -c '%a' "${dir}")"
+    if [ "${owner}" != "$(id -u)" ]; then
+        echo "[ERROR] Log directory '${dir}' belongs to another user." >&2
+        exit 1
+    fi
+    if [ "$((8#${mode} & 8#077))" -ne 0 ]; then
+        echo "[ERROR] Log directory '${dir}' mode ${mode} grants group or other access." >&2
+        echo "[ERROR] Run chmod 700 '${dir}', or set UKG_LOG_DIR." >&2
+        exit 1
+    fi
+    printf '%s\n' "${dir}"
+}
+
+# Print a fresh private path for a serial console log file. The base
+# directory comes from ukg_log_dir, so the path is unpredictable and
+# other users cannot reach it. mktemp also refuses to follow planted
+# symlinks. Ticket 005b1e7772.
 # Arg $1: name prefix, usually the run id.
 ukg_mk_serial_log() {
-    local dir="${UKG_LOG_DIR:-/tmp/opencode}"
-    mkdir -p "${dir}"
+    local dir
+    dir="$(ukg_log_dir)"
     mktemp "${dir}/${1}-serial-XXXXXX.log"
+}
+
+# Print a fresh private path for a rendered guest startup script.
+# Startup scripts can carry project and instance data, so they share
+# the private base directory with the serial logs. One helper
+# replaces the duplicated LOG_DIR blocks in the run scripts. Ticket
+# 005b1e7772.
+# Arg $1: name prefix, usually the run id. Arg $2: role word, for
+# example cli or srv.
+ukg_mk_startup_script() {
+    local dir
+    dir="$(ukg_log_dir)"
+    mktemp "${dir}/${1}-${2}-startup-XXXXXX.sh"
 }
 
 # Install the teardown trap. Call it before the first resource create.

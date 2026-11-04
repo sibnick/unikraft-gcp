@@ -74,12 +74,11 @@ COMBINED_LOG="$(ukg_mk_serial_log "${UKG_RUN}")"
 
 # Guest startup scripts, rendered below and passed through instance
 # metadata. Placeholders keep them readable as literal templates.
-LOG_DIR="${UKG_LOG_DIR:-/tmp/opencode}"
-mkdir -p "${LOG_DIR}"
-CLI_SCRIPT="$(mktemp "${LOG_DIR}/${UKG_RUN}-cli-startup-XXXXXX.sh")"
+# The helper places them in the private per-user log directory.
+CLI_SCRIPT="$(ukg_mk_startup_script "${UKG_RUN}" cli)"
 SRV_SCRIPT=""
 if [ "${UKG_TARGET}" = "linux" ]; then
-    SRV_SCRIPT="$(mktemp "${LOG_DIR}/${UKG_RUN}-srv-startup-XXXXXX.sh")"
+    SRV_SCRIPT="$(ukg_mk_startup_script "${UKG_RUN}" srv)"
 fi
 
 # Evidence contract wiring, same as the B3 script.
