@@ -650,10 +650,18 @@ index b4f7d55..84e53bb 100644
  }
  
 diff --git a/lib/ukallocbbuddy/bbuddy.c b/lib/ukallocbbuddy/bbuddy.c
-index 3e39480..8516782 100644
+index 3e39480..cb5c975 100644
 --- a/lib/ukallocbbuddy/bbuddy.c
 +++ b/lib/ukallocbbuddy/bbuddy.c
-@@ -82,8 +82,31 @@ struct uk_bbpalloc {
+@@ -50,6 +50,7 @@
+ #include <uk/arch/limits.h>
+ #include <uk/atomic.h>
+ #include <uk/bitops/bitscan.h>
++#include <uk/lcpu.h>
+ #include <uk/print.h>
+ #include <uk/assert.h>
+ #include <uk/list.h>
+@@ -82,8 +83,42 @@ struct uk_bbpalloc {
  	unsigned long nr_free_pages;
  	struct uk_hlist_head free_head[FREELIST_SIZE];
  	struct uk_bbpalloc_memr *memr_head;
@@ -665,27 +673,38 @@ index 3e39480..8516782 100644
 +	unsigned int lock;
  };
  
-+static inline void bbuddy_lock(struct uk_bbpalloc *b)
++/*
++ * Take the allocator lock with interrupts off. The lock word guards
++ * the free lists of a shared instance. Turning interrupts off covers
++ * every instance: a handler on the same core could otherwise allocate
++ * or free while the holder is mid-update. The return value carries the
++ * saved interrupt flags to the matching unlock. [Ticket f9d24435b8]
++ */
++static inline unsigned long bbuddy_lock(struct uk_bbpalloc *b)
 +{
++	unsigned long flags = uk_lcpu_save_irqf();
 +	unsigned int exp;
 +
-+	if (!b->shared)
-+		return;
-+	exp = 0;
-+	while (!uk_compare_exchange_n(&b->lock, &exp, 1u))
++	if (b->shared) {
 +		exp = 0;
++		while (!uk_compare_exchange_n(&b->lock, &exp, 1u))
++			exp = 0;
++	}
++
++	return flags;
 +}
 +
-+static inline void bbuddy_unlock(struct uk_bbpalloc *b)
++static inline void bbuddy_unlock(struct uk_bbpalloc *b, unsigned long flags)
 +{
 +	if (b->shared)
 +		uk_exchange_n(&b->lock, 0u);
++	uk_lcpu_restore_irqf(flags);
 +}
 +
  #if CONFIG_LIBUKALLOCBBUDDY_FREELIST_SANITY
  /* Provide sanity checking of freelists, walking their length and checking
   * for consistency. Useful when suspecting memory corruption.
-@@ -356,7 +379,7 @@ static inline void bbuddy_trim(struct uk_bbpalloc *b, struct chunk_head *ch,
+@@ -356,7 +391,7 @@ static inline void bbuddy_trim(struct uk_bbpalloc *b, struct chunk_head *ch,
  	}
  }
  
@@ -694,25 +713,26 @@ index 3e39480..8516782 100644
  {
  	struct uk_bbpalloc *const b = (struct uk_bbpalloc *)&a->priv;
  	struct chunk_head *alloc_ch;
-@@ -400,6 +423,17 @@ err_nomem:
+@@ -400,6 +435,18 @@ err_nomem:
  	return NULL;
  }
  
 +static void *bbuddy_palloc(struct uk_alloc *a, unsigned long num_pages)
 +{
 +	struct uk_bbpalloc *const b = (struct uk_bbpalloc *)&a->priv;
++	unsigned long flags;
 +	void *obj;
 +
-+	bbuddy_lock(b);
++	flags = bbuddy_lock(b);
 +	obj = bbuddy_palloc_nolock(a, num_pages);
-+	bbuddy_unlock(b);
++	bbuddy_unlock(b, flags);
 +	return obj;
 +}
 +
  /**
   * INTERNAL. Maximally merge chunk `*chp` of order `ord` with any free buddies,
   * updating its value along the way.
-@@ -460,7 +494,8 @@ static inline size_t bbuddy_merge(struct uk_bbpalloc *b,
+@@ -460,7 +507,8 @@ static inline size_t bbuddy_merge(struct uk_bbpalloc *b,
  	return ord;
  }
  
@@ -722,7 +742,7 @@ index 3e39480..8516782 100644
  {
  	struct uk_bbpalloc *const b = (struct uk_bbpalloc *)&a->priv;
  	char *base = obj;
-@@ -505,6 +540,16 @@ static void bbuddy_pfree(struct uk_alloc *a, void *obj, unsigned long num_pages)
+@@ -505,6 +553,17 @@ static void bbuddy_pfree(struct uk_alloc *a, void *obj, unsigned long num_pages)
  	freelist_sanitycheck(b->free_head);
  }
  
@@ -730,16 +750,17 @@ index 3e39480..8516782 100644
 +			unsigned long num_pages)
 +{
 +	struct uk_bbpalloc *const b = (struct uk_bbpalloc *)&a->priv;
++	unsigned long flags;
 +
-+	bbuddy_lock(b);
++	flags = bbuddy_lock(b);
 +	bbuddy_pfree_nolock(a, obj, num_pages);
-+	bbuddy_unlock(b);
++	bbuddy_unlock(b, flags);
 +}
 +
  static long bbuddy_pmaxalloc(struct uk_alloc *a)
  {
  	struct uk_bbpalloc *b;
-@@ -535,7 +580,7 @@ static long bbuddy_pavailmem(struct uk_alloc *a)
+@@ -535,7 +594,7 @@ static long bbuddy_pavailmem(struct uk_alloc *a)
  	return (long) b->nr_free_pages;
  }
  
@@ -748,7 +769,7 @@ index 3e39480..8516782 100644
  {
  	struct uk_bbpalloc *b;
  	struct uk_bbpalloc_memr *memr;
-@@ -633,7 +678,20 @@ static int bbuddy_addmem(struct uk_alloc *a, void *base, size_t len)
+@@ -633,7 +692,21 @@ static int bbuddy_addmem(struct uk_alloc *a, void *base, size_t len)
  	return 0;
  }
  
@@ -756,12 +777,13 @@ index 3e39480..8516782 100644
 +static int bbuddy_addmem(struct uk_alloc *a, void *base, size_t len)
 +{
 +	struct uk_bbpalloc *b;
++	unsigned long flags;
 +	int ret;
 +
 +	b = (struct uk_bbpalloc *)&a->priv;
-+	bbuddy_lock(b);
++	flags = bbuddy_lock(b);
 +	ret = bbuddy_addmem_nolock(a, base, len);
-+	bbuddy_unlock(b);
++	bbuddy_unlock(b, flags);
 +	return ret;
 +}
 +
@@ -770,7 +792,7 @@ index 3e39480..8516782 100644
  {
  	struct uk_alloc *a;
  	struct uk_bbpalloc *b;
-@@ -665,6 +723,8 @@ struct uk_alloc *uk_allocbbuddy_init(void *base, size_t len)
+@@ -665,6 +738,8 @@ struct uk_alloc *uk_allocbbuddy_init(void *base, size_t len)
  	for (i = 0; i < FREELIST_SIZE; i++)
  		UK_INIT_HLIST_HEAD(&b->free_head[i]);
  	b->memr_head = NULL;
@@ -779,7 +801,7 @@ index 3e39480..8516782 100644
  
  	/* initialize and register allocator interface */
  	uk_alloc_init_palloc(a, bbuddy_palloc, bbuddy_pfree,
-@@ -678,3 +738,13 @@ struct uk_alloc *uk_allocbbuddy_init(void *base, size_t len)
+@@ -678,3 +753,13 @@ struct uk_alloc *uk_allocbbuddy_init(void *base, size_t len)
  
  	return a;
  }
@@ -1098,7 +1120,7 @@ index 8e78944..591ae7b 100644
  }
  #endif
 diff --git a/lib/ukconsole/console.c b/lib/ukconsole/console.c
-index 9c06197..743e6c0 100644
+index 9c06197..d6c227f 100644
 --- a/lib/ukconsole/console.c
 +++ b/lib/ukconsole/console.c
 @@ -6,6 +6,7 @@
@@ -1109,7 +1131,7 @@ index 9c06197..743e6c0 100644
  #include <uk/list.h>
  #include <uk/console.h>
  #include <uk/console/driver.h>
-@@ -39,6 +40,18 @@ __u16 uk_console_count(void)
+@@ -39,9 +40,23 @@ __u16 uk_console_count(void)
  	return uk_console_device_count;
  }
  
@@ -1120,18 +1142,24 @@ index 9c06197..743e6c0 100644
 + * messages interleave byte for byte, and the run scripts cannot read
 + * their gate markers or a crash dump. [Ticket 3dc1f3f6b6]
 + *
-+ * Caveat: uk_printk from an interrupt handler on a core that already
-+ * holds this lock deadlocks. Handlers must not print.
++ * The lock is taken with interrupts off. A handler that prints on a core
++ * that already holds the lock would otherwise spin forever. [Ticket
++ * f9d24435b8]
 + */
 +static __spinlock uk_console_out_lock = UKARCH_SPINLOCK_INITIALIZER();
 +
  __ssz uk_console_out(const char *buf, __sz len)
  {
  	struct uk_console *dev = __NULL;
-@@ -49,12 +62,16 @@ __ssz uk_console_out(const char *buf, __sz len)
++	unsigned long flags;
+ 
+ 	if (unlikely(!len))
+ 		return 0;
+@@ -49,15 +64,46 @@ __ssz uk_console_out(const char *buf, __sz len)
  	if (unlikely(!buf))
  		return -EINVAL;
  
++	flags = uk_lcpu_save_irqf();
 +	ukarch_spin_lock(&uk_console_out_lock);
 +
  	/* Output to all STDOUT devices */
@@ -1141,23 +1169,89 @@ index 9c06197..743e6c0 100644
  	}
  
 +	ukarch_spin_unlock(&uk_console_out_lock);
++	uk_lcpu_restore_irqf(flags);
 +
  	return len;
  }
  
++/*
++ * Break the console lock when a crash starts. Only the core that performs
++ * the crash dump calls this, before it prints. The function tries the lock
++ * with a short bound. If the holder does not release in time, the function
++ * assumes the holder died with the lock and forces it open. The crash dump
++ * then reaches the serial port instead of hanging silently. A live holder
++ * finishes its write and releases. Its release is one store, so it only
++ * unlocks what the crash core took. [Ticket f9d24435b8]
++ */
++#define UK_CONSOLE_BREAK_TRIES 100000u
++
++void uk_console_break_lock(void)
++{
++	unsigned int tries;
++
++	for (tries = 0; tries < UK_CONSOLE_BREAK_TRIES; tries++) {
++		if (ukarch_spin_trylock(&uk_console_out_lock)) {
++			ukarch_spin_unlock(&uk_console_out_lock);
++			return;
++		}
++		uk_arch_spinwait();
++	}
++	ukarch_spin_unlock(&uk_console_out_lock);
++}
++
+ __ssz uk_console_in(char *buf, __sz len)
+ {
+ 	struct uk_console *dev = __NULL;
+diff --git a/lib/ukconsole/exportsyms.uk b/lib/ukconsole/exportsyms.uk
+index f21cdcf..d659262 100644
+--- a/lib/ukconsole/exportsyms.uk
++++ b/lib/ukconsole/exportsyms.uk
+@@ -2,6 +2,7 @@ uk_console_get
+ uk_console_out
+ uk_console_in
+ uk_console_out_direct
++uk_console_break_lock
+ uk_console_in_direct
+ uk_console_count
+ uk_console_register
+diff --git a/lib/ukconsole/include/uk/console.h b/lib/ukconsole/include/uk/console.h
+index 9b1d8c9..f606ccb 100644
+--- a/lib/ukconsole/include/uk/console.h
++++ b/lib/ukconsole/include/uk/console.h
+@@ -55,6 +55,16 @@ __u16 uk_console_count(void);
+  */
+ __ssz uk_console_out(const char *buf, __sz len);
+ 
++/**
++ * Break the console write lock when a crash starts.
++ *
++ * Only the core that performs the crash dump calls this, before it
++ * prints. The function tries the lock with a short bound and forces it
++ * open if the holder does not release. This keeps the crash dump moving
++ * when a core died holding the lock.
++ */
++void uk_console_break_lock(void);
++
+ /**
+  * Read bytes from the STDIN console device(s).
+  *
 diff --git a/lib/ukdebug/crash.c b/lib/ukdebug/crash.c
-index 39757f3..2ea8c0d 100644
+index 39757f3..43a4372 100644
 --- a/lib/ukdebug/crash.c
 +++ b/lib/ukdebug/crash.c
-@@ -9,6 +9,7 @@
+@@ -9,7 +9,11 @@
  #include <stddef.h>
  
  #include <uk/config.h>
 +#include <uk/atomic.h>
  #include <uk/crash.h>
++#if defined(CONFIG_LIBUKCONSOLE) && CONFIG_LIBUKCONSOLE
++#include <uk/console.h>
++#endif /* CONFIG_LIBUKCONSOLE */
  #include <uk/essentials.h>
  #include <uk/event.h>
-@@ -86,10 +87,10 @@ __noreturn void _uk_crash(struct uk_lcpu_regs *regs,
+ #include <uk/lcpu.h>
+@@ -86,10 +90,10 @@ __noreturn void _uk_crash(struct uk_lcpu_regs *regs,
  			  struct uk_crash_descr *descr)
  {
  	struct uk_crash_event_param param;
@@ -1170,7 +1264,7 @@ index 39757f3..2ea8c0d 100644
  
  	UK_ASSERT(regs);
  	UK_ASSERT(descr);
-@@ -98,18 +99,27 @@ __noreturn void _uk_crash(struct uk_lcpu_regs *regs,
+@@ -98,18 +102,38 @@ __noreturn void _uk_crash(struct uk_lcpu_regs *regs,
  	uk_preempt_disable();
  	uk_lcpu_except_push_nested();
  
@@ -1201,6 +1295,17 @@ index 39757f3..2ea8c0d 100644
  	}
 -#endif /* HAVE_SMP */
 +#endif /* CONFIG_HAVE_SMP */
++
++#if defined(CONFIG_LIBUKCONSOLE) && CONFIG_LIBUKCONSOLE
++	/*
++	 * A core can crash while it holds the console lock. That
++	 * includes a fault inside uk_console_out itself. Break the
++	 * lock so this dump reaches the serial port. Without this the
++	 * dump spins on the lock and the gate log never shows the
++	 * failure. [Ticket f9d24435b8]
++	 */
++	uk_console_break_lock();
++#endif /* CONFIG_LIBUKCONSOLE */
  
  #if CONFIG_LIBUKDEBUG_CRASH_SCREEN
  	crash_printk("Unikraft Crash - " STRINGIFY(UK_CODENAME)
@@ -1300,362 +1405,6 @@ index d6af82d..601ad46 100644
  LIBKVMPLAT_SRCS-$(CONFIG_ARCH_X86_64) += $(LIBKVMPLAT_BASE)/x86/tscclock.c
  LIBKVMPLAT_SRCS-$(CONFIG_ARCH_X86_64) += $(LIBKVMPLAT_BASE)/x86/time.c
  
-diff --git a/plat/kvm/x86/lcpu.c b/plat/kvm/x86/lcpu.c
-new file mode 100644
-index 0000000..14cda71
---- /dev/null
-+++ b/plat/kvm/x86/lcpu.c
-@@ -0,0 +1,350 @@
-+/* SPDX-License-Identifier: BSD-3-Clause */
-+/*
-+ * KVM x86_64 platform: secondary CPU (AP) bring-up.
-+ *
-+ * Secondary cores enter the 16-bit real-mode trampoline in lcpu_start.S.
-+ * That code is part of the image, which is linked at 1 MiB, but the
-+ * trampoline must sit in the first 1 MiB of physical memory. A copy of it
-+ * is placed in a fixed hole below 1 MiB and its internal references are
-+ * fixed up before any AP is started.
-+ *
-+ * APs are started with the standard x86 INIT/SIPI sequence through the
-+ * local APIC. The mode (xapic MMIO or x2apic MSR) is detected at boot
-+ * from the APIC base MSR.
-+ *
-+ * Based on the native platform lcpu_pm.c (same start16 relocation logic).
-+ */
-+
-+#include <uk/arch/util.h>
-+#include <uk/arch/x86_64.h>
-+#include <uk/essentials.h>
-+#include <uk/print.h>
-+#include <uk/lcpu/pm.h>
-+#include <uk/pcpuvar.h>
-+#include <uk/prio.h>
-+
-+#if CONFIG_LIBUKBOOT
-+#include <uk/boot/earlytab.h>
-+#include <uk/plat/common/bootinfo.h>
-+#include <uk/plat/common/memory.h>
-+#include <string.h>
-+#endif /* CONFIG_LIBUKBOOT */
-+
-+#include <x86/delay.h>
-+
-+#if CONFIG_HAVE_SMP
-+static inline void x2apic_send_sipi(__vaddr_t addr, int dest)
-+{
-+	__u32 eax;
-+
-+	UK_ASSERT((addr &
-+		   (UK_ARCH_X86_64_APIC_ICR_VECTOR_MASK << __PAGE_SHIFT)) == addr);
-+
-+	eax = UK_ARCH_X86_64_APIC_ICR_TRIGGER_LEVEL |
-+	      UK_ARCH_X86_64_APIC_ICR_LEVEL_ASSERT |
-+	      UK_ARCH_X86_64_APIC_ICR_DESTMODE_PHYSICAL |
-+	      UK_ARCH_X86_64_APIC_ICR_DMODE_SUP |
-+	      (addr >> __PAGE_SHIFT);
-+
-+	uk_arch_x86_64_wrmsr(UK_ARCH_X86_64_APIC_MSR_ICR, eax, dest);
-+}
-+
-+static inline void x2apic_send_iipi(int dest)
-+{
-+	__u32 eax;
-+
-+	eax = UK_ARCH_X86_64_APIC_ICR_TRIGGER_LEVEL |
-+	      UK_ARCH_X86_64_APIC_ICR_LEVEL_ASSERT |
-+	      UK_ARCH_X86_64_APIC_ICR_DESTMODE_PHYSICAL |
-+	      UK_ARCH_X86_64_APIC_ICR_DMODE_INIT;
-+
-+	uk_arch_x86_64_wrmsr(UK_ARCH_X86_64_APIC_MSR_ICR, eax, dest);
-+}
-+
-+/* Deassert only supported on Pentium and P6 familiy processors */
-+#define x2apic_send_iipi_deassert() {}
-+
-+/*
-+ * The BSP may run with either the xapic (MMIO) or the x2apic (MSR) local
-+ * APIC mode enabled, depending on the boot protocol and the hypervisor.
-+ * Detect the active mode at boot and dispatch IPIs to it.
-+ */
-+static int apic_mode; /* 0 = xapic, 1 = x2apic */
-+static __u64 apic_mmio_base;
-+
-+static int apic_mode_detect(void)
-+{
-+	__u32 lo = 0, hi = 0;
-+
-+	uk_arch_x86_64_rdmsr(0x01B, &lo, &hi);
-+
-+	if (unlikely(!(lo & (1u << 11))))
-+		return -ENODEV;
-+
-+	if (lo & (1u << 10))
-+		uk_pr_err("kvm: x2APIC (EXTD) set in APIC base MSR; forcing xAPIC mode\n");
-+
-+	apic_mode = 0;
-+	apic_mmio_base = (((__u64)hi << 32) | (__u64)lo) & 0xFFFFF000UL;
-+	if (unlikely(!apic_mmio_base))
-+		apic_mmio_base = 0xFEE00000UL;
-+	return 0;
-+}
-+
-+static inline void xapic_write_icr(__u32 lo, __u64 dest)
-+{
-+	volatile __u32 *icr_hi = (volatile __u32 *)(apic_mmio_base + 0x310);
-+	volatile __u32 *icr_lo = (volatile __u32 *)(apic_mmio_base + 0x300);
-+
-+	while (*icr_lo & (1u << 12))
-+		uk_arch_x86_64_spinwait();
-+
-+	*icr_hi = ((__u32)dest) << 24;
-+	*icr_lo = lo;
-+
-+	while (*icr_lo & (1u << 12))
-+		uk_arch_x86_64_spinwait();
-+}
-+
-+static int apic_send_sipi(__u64 addr, __u64 dest)
-+{
-+	if (apic_mode) {
-+		x2apic_send_sipi(addr, (int)dest);
-+		return 0;
-+	}
-+
-+	__u32 eax = UK_ARCH_X86_64_APIC_ICR_TRIGGER_EDGE |
-+		    UK_ARCH_X86_64_APIC_ICR_LEVEL_ASSERT |
-+		    UK_ARCH_X86_64_APIC_ICR_DESTMODE_PHYSICAL |
-+		    UK_ARCH_X86_64_APIC_ICR_DMODE_SUP |
-+		    ((addr >> __PAGE_SHIFT) & UK_ARCH_X86_64_APIC_ICR_VECTOR_MASK);
-+
-+	xapic_write_icr(eax, dest);
-+	return 0;
-+}
-+
-+static int apic_send_iipi(__u64 dest)
-+{
-+	if (apic_mode) {
-+		x2apic_send_iipi((int)dest);
-+		return 0;
-+	}
-+
-+	__u32 eax = UK_ARCH_X86_64_APIC_ICR_TRIGGER_LEVEL |
-+		    UK_ARCH_X86_64_APIC_ICR_LEVEL_ASSERT |
-+		    UK_ARCH_X86_64_APIC_ICR_DESTMODE_PHYSICAL |
-+		    UK_ARCH_X86_64_APIC_ICR_DMODE_INIT;
-+
-+	xapic_write_icr(eax, dest);
-+	return 0;
-+}
-+
-+#define apic_send_iipi_deassert() do {} while (0)
-+
-+/* Secondary cores start in 16-bit real-mode and we have to provide the
-+ * corresponding boot code somewhere in the first 1 MiB. We copy the trampoline
-+ * code to the target address during MP initialization.
-+ */
-+extern void *x86_start16_begin[];
-+extern void *x86_start16_end[];
-+extern __uptr uk_plat_native_x86_64_start16_addr; /* target address */
-+
-+#define UK_ARCH_START16_SIZE						\
-+	((__uptr)x86_start16_end - (__uptr)x86_start16_begin)
-+
-+#define START16_MOV_SYM(sym, sz)					\
-+	sym##_imm##sz##_start16
-+
-+#define START16_DATA_SYM(sym, sz)					\
-+	sym##_data##sz##_start16
-+
-+#define IMPORT_START16_SYM(sym, sz, type)				\
-+	extern void *sym[];						\
-+	extern void *START16_##type##_SYM(sym, sz)[]
-+
-+#define START16_MOV_OFF(sym, sz)					\
-+	((void *)START16_MOV_SYM(sym, sz) -				\
-+	(void *)x86_start16_begin)
-+
-+#define START16_DATA_OFF(sym, sz)					\
-+	((void *)START16_DATA_SYM(sym, sz) -				\
-+	(void *)x86_start16_begin)
-+
-+IMPORT_START16_SYM(gdt32_ptr, 2, MOV);
-+IMPORT_START16_SYM(gdt32, 4, DATA);
-+IMPORT_START16_SYM(lcpu_start16, 2, MOV);
-+IMPORT_START16_SYM(jump_to32, 2, MOV);
-+IMPORT_START16_SYM(lcpu_start32, 4, MOV);
-+
-+#define START16_RELOC_ENTRY(sym, sz, type)				\
-+	{								\
-+		.r_mem_off = START16_##type##_OFF(sym, sz),		\
-+		.r_addr = (void *)(sym) - (void *)x86_start16_begin,	\
-+		.r_sz = (sz),						\
-+	}
-+
-+static void apply_start16_reloc(__u64 baddr, __u64 r_mem_off,
-+				__u64 r_addr, __u32 r_sz)
-+{
-+	switch (r_sz) {
-+	case 2:
-+		*(__u16 *)((__u8 *)baddr + r_mem_off) = (__u16)(baddr + r_addr);
-+		break;
-+	case 4:
-+		*(__u32 *)((__u8 *)baddr + r_mem_off) = (__u32)(baddr + r_addr);
-+		break;
-+	}
-+}
-+
-+static void start16_reloc_mp_init(void)
-+{
-+	struct {
-+		__u64 r_mem_off;
-+		__u64 r_addr;
-+		__u32 r_sz;
-+	} x86_start16_relocs[] = {
-+		START16_RELOC_ENTRY(lcpu_start16, 2, MOV),
-+		START16_RELOC_ENTRY(gdt32_ptr, 2, MOV),
-+		START16_RELOC_ENTRY(gdt32, 4, DATA),
-+		START16_RELOC_ENTRY(jump_to32, 2, MOV),
-+		START16_RELOC_ENTRY(lcpu_start32, 4, MOV),
-+	};
-+	__sz i;
-+
-+	for (i = 0; i < ARRAY_SIZE(x86_start16_relocs); i++)
-+		apply_start16_reloc((__u64)uk_plat_native_x86_64_start16_addr,
-+				    x86_start16_relocs[i].r_mem_off,
-+				    x86_start16_relocs[i].r_addr,
-+				    x86_start16_relocs[i].r_sz);
-+
-+	/* Unlike the other entries, lcpu_start32 must stay the same
-+	 * as it is not part of the start16 section.
-+	 */
-+	apply_start16_reloc((__u64)uk_plat_native_x86_64_start16_addr,
-+			    START16_MOV_OFF(lcpu_start32, 4),
-+			    (__u64)lcpu_start32 -
-+			    (__u64)uk_plat_native_x86_64_start16_addr, 4);
-+}
-+
-+#if CONFIG_LIBUKBOOT
-+static int boot_memregion_alloc_sipi_vect(struct ukplat_bootinfo *bi __unused)
-+{
-+#define X86_VIDEO_MEM_START	0xA0000UL
-+	__sz len;
-+
-+	len = (__sz)((__uptr)x86_start16_end - (__uptr)x86_start16_begin);
-+	len = UK_PAGING_PAGE_ALIGN_UP(len);
-+	uk_plat_native_x86_64_start16_addr = (__uptr)ukplat_memregion_alloc(len,
-+							  UKPLAT_MEMRT_RESERVED,
-+							  UKPLAT_MEMRF_READ  |
-+							  UKPLAT_MEMRF_WRITE);
-+	if (unlikely(!uk_plat_native_x86_64_start16_addr ||
-+		     uk_plat_native_x86_64_start16_addr >= X86_VIDEO_MEM_START))
-+		return -ENOMEM;
-+
-+	/* Copy AP startup code to target address in first 1MiB */
-+	UK_ASSERT(uk_plat_native_x86_64_start16_addr < 0x100000);
-+	memcpy((void *)uk_plat_native_x86_64_start16_addr, &x86_start16_begin,
-+	       UK_ARCH_START16_SIZE);
-+
-+	start16_reloc_mp_init();
-+
-+	uk_pr_info("Copied AP 16-bit boot code to 0x%"__PRIvaddr" (SIPI vector 0x%02lx)\n",
-+		   uk_plat_native_x86_64_start16_addr,
-+		   (unsigned long)(uk_plat_native_x86_64_start16_addr >> 12));
-+
-+	return 0;
-+}
-+#endif /* CONFIG_LIBUKBOOT */
-+
-+static int kvm_x86_lcpu_start(__u64 idx)
-+{
-+	/* Send INIT IPI */
-+	apic_send_iipi(uk_pcpuvar_lval(idx, uk_pcpuvar_cpu_id));
-+
-+	/* Deassert */
-+	apic_send_iipi_deassert();
-+
-+	return 0;
-+}
-+
-+#if CONFIG_HAVE_CPU_MULTI_PHASE_STARTUP
-+static int kvm_x86_lcpu_post_start(const __u64 lcpuidx[], unsigned int *num)
-+{
-+	__u64 id, this_cpu_id = uk_pcpuvar_current_get(uk_pcpuvar_cpu_id);
-+	unsigned int i, j;
-+
-+	/* wait 10 msec (according to Intel manual 8.4.4.1) */
-+	mdelay(10);
-+
-+	for (i = 0; i < *num; i++) {
-+		id = uk_pcpuvar_lval(lcpuidx[i], uk_pcpuvar_cpu_id);
-+		if (id == this_cpu_id)
-+			continue;
-+
-+		for (j = 0; j < 2; j++) {
-+			/* Send STARTUP IPI */
-+			apic_send_sipi(uk_plat_native_x86_64_start16_addr, id);
-+
-+			/* wait 200 usec (according to Intel manual 8.4.4.1) */
-+			udelay(200);
-+		}
-+	}
-+
-+	return 0;
-+}
-+#endif /* CONFIG_HAVE_CPU_MULTI_PHASE_STARTUP */
-+#endif /* CONFIG_HAVE_SMP */
-+
-+static void kvm_x86_lcpu_halt(void)
-+{
-+	uk_arch_x86_64_halt();
-+}
-+
-+static void kvm_x86_lcpu_halt_irq(void)
-+{
-+	/*
-+	 * We have to be careful when enabling interrupts before entering a
-+	 * halt state. If we want to wait for an interrupt (e.g., a timer)
-+	 * the interrupt may fire in the short window between sti and hlt and
-+	 * we are going to halt forever. As sti only enables interrupts after
-+	 * the following instruction, we can avoid the race condition by
-+	 * ensuring that hlt immediately follows sti. There must be no
-+	 * instruction in between.
-+	 */
-+	asm volatile (
-+		"sti\n\t"
-+		"hlt\n\t"
-+		"cli\n\t"
-+		:
-+		:
-+		: "memory"
-+	);
-+}
-+
-+static const struct uk_lcpu_pm_ops kvm_x86_pm_ops = {
-+#if CONFIG_HAVE_SMP
-+	.start = kvm_x86_lcpu_start,
-+#if CONFIG_HAVE_CPU_MULTI_PHASE_STARTUP
-+	.post_start = kvm_x86_lcpu_post_start,
-+#endif /* CONFIG_HAVE_CPU_MULTI_PHASE_STARTUP */
-+#endif /* CONFIG_HAVE_SMP */
-+	.halt = kvm_x86_lcpu_halt,
-+	.halt_irq = kvm_x86_lcpu_halt_irq,
-+};
-+
-+__isr static
-+int kvm_x86_lcpu_pm_ops_register(struct ukplat_bootinfo *bi __unused)
-+{
-+#if CONFIG_LIBUKBOOT
-+	if (boot_memregion_alloc_sipi_vect(bi) < 0)
-+		uk_pr_warn("kvm: failed to allocate SIPI vector trampoline\n");
-+#endif
-+#if CONFIG_HAVE_SMP
-+	if (apic_mode_detect())
-+		uk_pr_warn("kvm: local APIC not ready; SMP start will fail\n");
-+#endif
-+	return uk_lcpu_pm_ops_register(&kvm_x86_pm_ops);
-+}
-+
-+UK_BOOT_EARLYTAB_ENTRY(kvm_x86_lcpu_pm_ops_register, UK_PRIO_EARLIEST);
 diff --git a/plat/kvm/x86/lcpu_start.S b/plat/kvm/x86/lcpu_start.S
 index 7506102..d2c9ee9 100644
 --- a/plat/kvm/x86/lcpu_start.S
