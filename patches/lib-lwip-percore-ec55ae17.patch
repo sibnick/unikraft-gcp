@@ -13,6 +13,12 @@ Description: Per-core lwIP state files required by the main lwIP port patch.
   Per-core mode with SMP but without CONFIG_LIBUKPCPUVAR fails at
   compile time. Ticket 9a44f9e225.
 
+  Memp hardening. A compile-time check ties MEMP_MAX to LWIP_MEMP_MAX.
+  A pool lookup miss no longer falls back to pool 0. Every core gets
+  an even private split, the remainder goes to a lock-guarded shared
+  reserve, and pools smaller than the core count live in that reserve
+  entirely. Ticket de29b056ef.
+
 diff --git a/include/lwip_percore.h b/include/lwip_percore.h
 new file mode 100644
 index 0000000..ad76837
@@ -426,10 +432,10 @@ index 0000000..88dd298
 + extern "C" {
 diff --git a/patches/0016-per-core-stack-state.patch b/patches/0016-per-core-stack-state.patch
 new file mode 100644
-index 0000000..56a790d
+index 0000000..7f0d048
 --- /dev/null
 +++ b/patches/0016-per-core-stack-state.patch
-@@ -0,0 +1,411 @@
+@@ -0,0 +1,509 @@
 +--- a/src/include/lwip/priv/tcp_priv.h
 ++++ b/src/include/lwip/priv/tcp_priv.h
 +@@ -323,6 +323,17 @@
@@ -568,12 +574,31 @@ index 0000000..56a790d
 +     the cache (even if this means removing an active entry or so). */
 +--- a/src/core/memp.c
 ++++ b/src/core/memp.c
-+@@ -75,6 +75,19 @@
++@@ -75,6 +75,52 @@
 + #include "lwip/ip6_frag.h"
 + #include "lwip/mld6.h"
 + 
 ++#if LWIP_PERCORE
 ++#include "lwip_percore.h"
+++#include <uk/arch/spinlock.h>
+++
+++/* cs->memp_tabs has one slot per pool type. A larger MEMP_MAX would
+++   write past the array. Fail at compile time. Ticket de29b056ef. */
+++UK_CTASSERT(MEMP_MAX <= LWIP_MEMP_MAX);
+++
+++/* Shared reserve per pool, guarded by a per-pool spinlock. A core
+++   with an empty private list takes from here. Pools smaller than the
+++   core count live here entirely, so no core starts with zero
+++   elements. Ticket de29b056ef. */
+++static struct memp *memp_shared[MEMP_MAX];
+++static __spinlock memp_shared_lock[MEMP_MAX] = {
+++  [0 ... MEMP_MAX - 1] = UKARCH_SPINLOCK_INITIALIZER()
+++};
+++static u8_t memp_shared_only[MEMP_MAX];
+++
+++/* Return the pool index, or MEMP_MAX when the desc is not a known
+++   pool. The old code returned 0 then, so a lookup miss silently used
+++   the wrong pool. Ticket de29b056ef. */
 ++static inline memp_t memp_get_pool_type(const struct memp_desc *desc)
 ++{
 ++  memp_t i;
@@ -581,14 +606,28 @@ index 0000000..56a790d
 ++    if (memp_pools[i] == desc)
 ++      return i;
 ++  }
-++  return 0;
+++  return MEMP_MAX;
+++}
+++
+++/* Pop one element from the shared reserve of one pool. */
+++static struct memp *
+++memp_shared_take(memp_t type)
+++{
+++  struct memp *m;
+++  ukarch_spin_lock(&memp_shared_lock[type]);
+++  m = memp_shared[type];
+++  if (m != NULL) {
+++    memp_shared[type] = m->next;
+++  }
+++  ukarch_spin_unlock(&memp_shared_lock[type]);
+++  return m;
 ++}
 ++#endif
 ++
 + #define LWIP_MEMPOOL(name,num,size,desc) LWIP_MEMPOOL_DECLARE(name,num,size,desc)
 + #include "lwip/priv/memp_std.h"
 + 
-+@@ -177,6 +190,34 @@
++@@ -177,6 +223,62 @@
 + #if MEMP_MEM_MALLOC
 +   LWIP_UNUSED_ARG(desc);
 + #else
@@ -602,14 +641,31 @@ index 0000000..56a790d
 ++                            + MEM_SANITY_REGION_AFTER_ALIGNED
 ++#endif
 ++                           );
-++  u16_t count_per_core = total / LWIP_CORE_MAX;
-++  u16_t rem = total % LWIP_CORE_MAX;
+++  u16_t count_per_core;
+++  u16_t rem;
+++
+++  /* A desc outside memp_pools is a caller bug. Stop with a clear
+++     message instead of writing to slot 0. Ticket de29b056ef. */
+++  UK_ASSERT(type < MEMP_MAX);
+++  if (unlikely(type >= MEMP_MAX)) {
+++    LWIP_DEBUGF(MEMP_DEBUG | LWIP_DBG_LEVEL_SERIOUS, ("memp_init_pool: unknown pool %s\n", desc->desc));
+++    return;
+++  }
+++
+++  /* A pool with fewer elements than cores cannot give every core a
+++     private element. Put the whole pool into the shared reserve for
+++     that case. Otherwise split evenly and keep the remainder in the
+++     reserve, so no element is lost. Ticket de29b056ef. */
+++  memp_shared_only[type] = (total < LWIP_CORE_MAX) ? 1 : 0;
+++  count_per_core = memp_shared_only[type] ? 0 : (u16_t)(total / LWIP_CORE_MAX);
+++  rem = (u16_t)(total - count_per_core * LWIP_CORE_MAX);
+++
+++  memp_shared[type] = NULL;
 ++
 ++  for (c = 0; c < LWIP_CORE_MAX; c++) {
 ++    struct lwip_core_state *cs = lwip_get_core_state_by_id(c);
-++    u16_t n = count_per_core + (c < rem ? 1 : 0);
 ++    cs->memp_tabs[type] = NULL;
-++    for (i = 0; i < n; ++i) {
+++    for (i = 0; i < count_per_core; ++i) {
 ++      struct memp *m = (struct memp *)(void *)curr;
 ++      m->next = cs->memp_tabs[type];
 ++      cs->memp_tabs[type] = m;
@@ -619,11 +675,22 @@ index 0000000..56a790d
 ++      curr += elem_size;
 ++    }
 ++  }
+++  /* Elements the even split did not place go to the shared
+++     reserve. */
+++  for (i = 0; i < rem; ++i) {
+++    struct memp *m = (struct memp *)(void *)curr;
+++    m->next = memp_shared[type];
+++    memp_shared[type] = m;
+++#if MEMP_OVERFLOW_CHECK
+++    memp_overflow_init_element(m, desc);
+++#endif
+++    curr += elem_size;
+++  }
 ++#else
 +   int i;
 +   struct memp *memp;
 + 
-+@@ -204,6 +245,7 @@
++@@ -204,6 +306,7 @@
 + #endif
 +                                   );
 +   }
@@ -631,41 +698,75 @@ index 0000000..56a790d
 + #if MEMP_STATS
 +   desc->stats->avail = desc->num;
 + #endif /* MEMP_STATS */
-+@@ -250,7 +292,12 @@
++@@ -250,7 +353,28 @@
 +   struct memp *memp;
 +   SYS_ARCH_DECL_PROTECT(old_level);
 + 
 +-#if MEMP_MEM_MALLOC
 ++#if LWIP_PERCORE
 ++  memp_t type = memp_get_pool_type(desc);
-++  struct lwip_core_state *cs = lwip_get_core_state();
+++  struct lwip_core_state *cs;
+++
+++  /* Same guard as memp_init_pool: never touch slot 0 of the wrong
+++     pool. Ticket de29b056ef. */
+++  UK_ASSERT(type < MEMP_MAX);
+++  if (unlikely(type >= MEMP_MAX)) {
+++    LWIP_DEBUGF(MEMP_DEBUG | LWIP_DBG_LEVEL_SERIOUS, ("memp_malloc: unknown pool %s\n", desc->desc));
+++    return NULL;
+++  }
+++  cs = lwip_get_core_state();
 ++  SYS_ARCH_PROTECT(old_level);
 ++  memp = cs->memp_tabs[type];
+++  if (memp != NULL) {
+++    cs->memp_tabs[type] = memp->next;
+++  } else {
+++    /* Private list empty: take from the shared reserve before
+++       reporting an error. Ticket de29b056ef. */
+++    memp = memp_shared_take(type);
+++  }
 ++#elif MEMP_MEM_MALLOC
 +   memp = (struct memp *)mem_malloc(MEMP_SIZE + MEMP_ALIGN_SIZE(desc->size));
 +   SYS_ARCH_PROTECT(old_level);
 + #else /* MEMP_MEM_MALLOC */
-+@@ -265,7 +312,11 @@
++@@ -265,7 +389,10 @@
 +     memp_overflow_check_element(memp, desc);
 + #endif /* MEMP_OVERFLOW_CHECK */
 + 
-++#if LWIP_PERCORE
-++    cs->memp_tabs[type] = memp->next;
-++#else
+++#if !LWIP_PERCORE
+++    /* The per-core path already popped the element above. */
 +     *desc->tab = memp->next;
 ++#endif
 + #if MEMP_OVERFLOW_CHECK
 +     memp->next = NULL;
 + #endif /* MEMP_OVERFLOW_CHECK */
-+@@ -382,8 +433,15 @@
++@@ -382,8 +509,34 @@
 +   SYS_ARCH_UNPROTECT(old_level);
 +   mem_free(memp);
 + #else /* MEMP_MEM_MALLOC */
 ++#if LWIP_PERCORE
 ++  memp_t type = memp_get_pool_type(desc);
-++  struct lwip_core_state *cs = lwip_get_core_state();
-++  memp->next = cs->memp_tabs[type];
-++  cs->memp_tabs[type] = memp;
+++
+++  /* Same guard as memp_init_pool. Ticket de29b056ef. */
+++  UK_ASSERT(type < MEMP_MAX);
+++  if (unlikely(type >= MEMP_MAX)) {
+++    SYS_ARCH_UNPROTECT(old_level);
+++    LWIP_DEBUGF(MEMP_DEBUG | LWIP_DBG_LEVEL_SERIOUS, ("memp_free: unknown pool %s\n", desc->desc));
+++    return;
+++  }
+++  if (memp_shared_only[type]) {
+++    /* Whole pool is shared: return the element to the shared
+++       reserve so every core can reach it again. Ticket de29b056ef. */
+++    ukarch_spin_lock(&memp_shared_lock[type]);
+++    memp->next = memp_shared[type];
+++    memp_shared[type] = memp;
+++    ukarch_spin_unlock(&memp_shared_lock[type]);
+++  } else {
+++    /* Elements from the shared reserve join the private list of the
+++       freeing core. The pool total is conserved. */
+++    struct lwip_core_state *cs = lwip_get_core_state();
+++    memp->next = cs->memp_tabs[type];
+++    cs->memp_tabs[type] = memp;
+++  }
 ++#else
 +   memp->next = *desc->tab;
 +   *desc->tab = memp;
@@ -689,7 +790,8 @@ index 0000000..56a790d
 + 
 + #if LWIP_SOCKET_SELECT || LWIP_SOCKET_POLL
 + #if LWIP_TCPIP_CORE_LOCKING
-+@@ -278,7 +284,11 @@
++@@ -277,10 +283,14 @@
++ #define LWIP_SOCKET_SELECT_UNPROTECT(lev)     SYS_ARCH_UNPROTECT(lev)
 + /** This counter is increased from lwip_select when the list is changed
 +     and checked in select_check_waiters to see if it has changed. */
 ++#if !LWIP_PERCORE
@@ -701,7 +803,9 @@ index 0000000..56a790d
 + static struct lwip_select_cb *select_cb_list;
 ++#endif
 + #endif /* LWIP_SOCKET_SELECT || LWIP_SOCKET_POLL */
-+@@ -417,11 +425,24 @@
++ 
++ #define sock_set_errno(sk, e) do { \
++@@ -417,11 +427,24 @@
 + tryget_socket_unconn_nouse(int fd)
 + {
 +   int s = fd - LWIP_SOCKET_OFFSET;
@@ -727,7 +831,7 @@ index 0000000..56a790d
 + }
 + 
 + struct lwip_sock *
-+@@ -486,7 +507,11 @@
++@@ -486,7 +509,11 @@
 + {
 +   struct lwip_sock *sock = tryget_socket(fd);
 +   if (!sock) {
@@ -739,7 +843,7 @@ index 0000000..56a790d
 +       LWIP_DEBUGF(SOCKETS_DEBUG, ("get_socket(%d): invalid\n", fd));
 +     }
 +     set_errno(EBADF);
-+@@ -510,6 +535,37 @@
++@@ -510,6 +537,37 @@
 +   SYS_ARCH_DECL_PROTECT(lev);
 +   LWIP_UNUSED_ARG(accepted);
 + 
@@ -777,7 +881,7 @@ index 0000000..56a790d
 +   /* allocate a new socket identifier */
 +   for (i = 0; i < NUM_SOCKETS; ++i) {
 +     /* Protect socket array */
-+@@ -542,6 +598,7 @@
++@@ -542,6 +600,7 @@
 +     SYS_ARCH_UNPROTECT(lev);
 +   }
 +   return -1;
@@ -785,7 +889,7 @@ index 0000000..56a790d
 + }
 + 
 + /** Free a socket (under lock)
-+@@ -664,8 +721,13 @@
++@@ -664,8 +723,13 @@
 +     done_socket(sock);
 +     return -1;
 +   }
@@ -799,7 +903,7 @@ index 0000000..56a790d
 + 
 +   /* See event_callback: If data comes in right away after an accept, even
 +    * though the server task might not have created a new socket yet.
-+@@ -1742,7 +1804,11 @@
++@@ -1742,7 +1806,11 @@
 +     return -1;
 +   }
 +   conn->socket = i;
@@ -811,7 +915,7 @@ index 0000000..56a790d
 +   LWIP_DEBUGF(SOCKETS_DEBUG, ("%d\n", i));
 +   set_errno(0);
 +   return i;
-+@@ -2883,6 +2949,9 @@
++@@ -2883,6 +2951,9 @@
 +   case SO_KEEPALIVE:
 +     return SOF_KEEPALIVE;
 +   case SO_REUSEADDR:
@@ -821,7 +925,7 @@ index 0000000..56a790d
 +     return SOF_REUSEADDR;
 +   default:
 +     LWIP_ASSERT("Unknown socket option", 0);
-+@@ -2934,6 +3003,9 @@
++@@ -2934,6 +3005,9 @@
 +         case SO_KEEPALIVE:
 + #if SO_REUSE
 +         case SO_REUSEADDR:
@@ -831,7 +935,7 @@ index 0000000..56a790d
 + #endif /* SO_REUSE */
 +           if ((optname == SO_BROADCAST) &&
 +               (NETCONNTYPE_GROUP(sock->conn->type) != NETCONN_UDP)) {
-+@@ -3342,6 +3414,9 @@
++@@ -3342,6 +3416,9 @@
 +         case SO_KEEPALIVE:
 + #if SO_REUSE
 +         case SO_REUSEADDR:
