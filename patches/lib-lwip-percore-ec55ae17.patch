@@ -7,12 +7,18 @@ Description: Per-core lwIP state files required by the main lwIP port patch.
   byte-identical from Unikraft-ENA samples at lib-lwip ec55ae17.
   Ticket da7e090342.
 
+  Hardening on this pin. A core id at or above LWIP_CORE_MAX now stops
+  the kernel with a clear message instead of silently sharing core 0
+  state, and lwip_get_core_state_by_id() returns NULL for a bad id.
+  Per-core mode with SMP but without CONFIG_LIBUKPCPUVAR fails at
+  compile time. Ticket 9a44f9e225.
+
 diff --git a/include/lwip_percore.h b/include/lwip_percore.h
 new file mode 100644
-index 0000000..41951d3
+index 0000000..ad76837
 --- /dev/null
 +++ b/include/lwip_percore.h
-@@ -0,0 +1,170 @@
+@@ -0,0 +1,209 @@
 +/* SPDX-License-Identifier: BSD-3-Clause */
 +/*
 + * Per-core stack state for lwIP in NO_SYS mode.
@@ -64,6 +70,19 @@ index 0000000..41951d3
 +#ifndef LWIP_MEMP_MAX
 +#define LWIP_MEMP_MAX 32
 +#endif
++
++/*
++ * Per-core mode needs the per-CPU variable library. Without it,
++ * lwip_current_core_id() returns 0 on every core, so all cores share
++ * core 0 state. Fail at compile time instead.
++ * Ticket 9a44f9e225.
++ */
++#if LWIP_PERCORE && defined(CONFIG_HAVE_SMP) && \
++	(!defined(CONFIG_LIBUKPCPUVAR) || !CONFIG_LIBUKPCPUVAR)
++#error "lwIP per-core mode requires CONFIG_LIBUKPCPUVAR"
++#endif
++
++UK_CTASSERT(LWIP_CORE_MAX > 0);
 +
 +struct tcp_pcb;
 +struct tcp_pcb_listen;
@@ -133,6 +152,22 @@ index 0000000..41951d3
 +
 +extern struct lwip_core_state uk_lwip_core_states[LWIP_CORE_MAX];
 +
++/*
++ * A core id outside uk_lwip_core_states is a configuration error: the
++ * booting CPU count is above LWIP_CORE_MAX. Sharing core 0 state would
++ * corrupt the pcb lists and the memp pools. Report the core id and
++ * stop. Ticket 9a44f9e225.
++ */
++#if defined(__Unikraft__)
++void lwip_core_id_overflow(unsigned int id);
++#else
++static inline void lwip_core_id_overflow(unsigned int id)
++{
++	(void)id;
++	for (;;) { }
++}
++#endif
++
 +#if !defined(__Unikraft__)
 +extern __thread unsigned int lwip_test_core_id;
 +static inline void lwip_set_current_core_id(unsigned int id)
@@ -146,15 +181,19 @@ index 0000000..41951d3
 +#if defined(__Unikraft__)
 +#if defined(CONFIG_LIBUKPCPUVAR) && CONFIG_LIBUKPCPUVAR
 +	unsigned int id = (unsigned int)uk_pcpuvar_current_get(uk_pcpuvar_cpu_idx);
-+	if (unlikely(id >= LWIP_CORE_MAX))
-+		return 0;
++	if (unlikely(id >= LWIP_CORE_MAX)) {
++		lwip_core_id_overflow(id);
++		return 0; /* not reached: the call above stops the core */
++	}
 +	return id;
 +#else
 +	return 0;
 +#endif
 +#else
-+	if (lwip_test_core_id >= LWIP_CORE_MAX)
-+		return 0;
++	if (unlikely(lwip_test_core_id >= LWIP_CORE_MAX)) {
++		lwip_core_id_overflow(lwip_test_core_id);
++		return 0; /* not reached: the call above stops the core */
++	}
 +	return lwip_test_core_id;
 +#endif
 +}
@@ -164,10 +203,16 @@ index 0000000..41951d3
 +	return &uk_lwip_core_states[lwip_current_core_id()];
 +}
 +
++/*
++ * Return the state of one core, or NULL when the id is outside the
++ * table. Earlier code returned core 0 state instead. That let a bad
++ * core id read and write another core's data with no lock. Callers
++ * must check for NULL. Ticket 9a44f9e225.
++ */
 +static inline struct lwip_core_state *lwip_get_core_state_by_id(unsigned int core_id)
 +{
 +	if (unlikely(core_id >= LWIP_CORE_MAX))
-+		return &uk_lwip_core_states[0];
++		return NULL;
 +	return &uk_lwip_core_states[core_id];
 +}
 +
@@ -798,10 +843,10 @@ index 0000000..56a790d
 +               (NETCONNTYPE_GROUP(sock->conn->type) != NETCONN_UDP)) {
 diff --git a/percore.c b/percore.c
 new file mode 100644
-index 0000000..f25e847
+index 0000000..f34e5aa
 --- /dev/null
 +++ b/percore.c
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,68 @@
 +/* SPDX-License-Identifier: BSD-3-Clause */
 +/*
 + * Per-core state storage and initialization for lwIP in NO_SYS mode.
@@ -809,9 +854,36 @@ index 0000000..f25e847
 +
 +#include <uk/config.h>
 +#include <string.h>
++#include <uk/assert.h>
++#include <uk/print.h>
 +#include "lwip_percore.h"
 +
 +struct lwip_core_state uk_lwip_core_states[LWIP_CORE_MAX];
++
++#if defined(__Unikraft__) && defined(CONFIG_UKPLAT_CPU_MAXCOUNT)
++/*
++ * The platform numbers CPUs below CONFIG_UKPLAT_CPU_MAXCOUNT. The
++ * state table must cover every slot the platform can hand out, or a
++ * valid CPU id would fall outside uk_lwip_core_states.
++ * Ticket 9a44f9e225.
++ */
++UK_CTASSERT(LWIP_CORE_MAX >= CONFIG_UKPLAT_CPU_MAXCOUNT);
++#endif
++
++/*
++ * A core reached lwIP with an id above LWIP_CORE_MAX. Continuing here
++ * would let the core use core 0 state while core 0 runs at the same
++ * time. Stop the machine instead: the next line names the bad id and
++ * the fix. Ticket 9a44f9e225.
++ */
++void lwip_core_id_overflow(unsigned int id)
++{
++	uk_pr_crit("lwip: core id %u above LWIP_CORE_MAX %u: boot with at most %u CPUs or raise CONFIG_UKPLAT_CPU_MAXCOUNT\n",
++		   id, (unsigned int)LWIP_CORE_MAX,
++		   (unsigned int)LWIP_CORE_MAX);
++	UK_ASSERT(0);
++	for (;;) { }
++}
 +
 +#if !defined(__Unikraft__)
 +__thread unsigned int lwip_test_core_id = 0;
@@ -839,4 +911,7 @@ index 0000000..f25e847
 +
 +	for (i = 0; i < LWIP_CORE_MAX; i++)
 +		lwip_core_state_init(i);
++
++	uk_pr_info("lwip: per-core state ready (%u core slots)\n",
++		   (unsigned int)LWIP_CORE_MAX);
 +}
