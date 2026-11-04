@@ -650,7 +650,7 @@ index b4f7d55..84e53bb 100644
  }
  
 diff --git a/lib/ukallocbbuddy/bbuddy.c b/lib/ukallocbbuddy/bbuddy.c
-index 3e39480..cb5c975 100644
+index 3e39480..43ad882 100644
 --- a/lib/ukallocbbuddy/bbuddy.c
 +++ b/lib/ukallocbbuddy/bbuddy.c
 @@ -50,6 +50,7 @@
@@ -661,50 +661,47 @@ index 3e39480..cb5c975 100644
  #include <uk/print.h>
  #include <uk/assert.h>
  #include <uk/list.h>
-@@ -82,8 +83,42 @@ struct uk_bbpalloc {
+@@ -82,8 +83,39 @@ struct uk_bbpalloc {
  	unsigned long nr_free_pages;
  	struct uk_hlist_head free_head[FREELIST_SIZE];
  	struct uk_bbpalloc_memr *memr_head;
-+	/* Set for an allocator shared between cores. The default heap is
-+	 * used by every core (posix-socket, posix-poll, lwIP mailboxes).
-+	 * bbuddy is not thread-safe without this guard: concurrent
-+	 * malloc/free corrupts the free lists. [Ticket d4c2a6bd2a] */
-+	unsigned int shared;
++	/* Guards the free lists. Every instance takes this lock, with
++	 * interrupts off, on every operation. The default heap is used
++	 * by every core. A per-core heap can also receive a cross-core
++	 * free: for example, one core frees a netbuf that another core
++	 * allocated. Without the lock, such use corrupts the free
++	 * lists. [Ticket d4c2a6bd2a, 5bec1639dc] */
 +	unsigned int lock;
  };
  
 +/*
 + * Take the allocator lock with interrupts off. The lock word guards
-+ * the free lists of a shared instance. Turning interrupts off covers
-+ * every instance: a handler on the same core could otherwise allocate
-+ * or free while the holder is mid-update. The return value carries the
-+ * saved interrupt flags to the matching unlock. [Ticket f9d24435b8]
++ * the free lists. Turning interrupts off stops an interrupt handler
++ * on the lock holder from allocating or freeing on the same core. The
++ * return value carries the saved interrupt flags to the matching
++ * unlock. [Ticket f9d24435b8]
 + */
 +static inline unsigned long bbuddy_lock(struct uk_bbpalloc *b)
 +{
 +	unsigned long flags = uk_lcpu_save_irqf();
-+	unsigned int exp;
++	unsigned int exp = 0;
 +
-+	if (b->shared) {
++	while (!uk_compare_exchange_n(&b->lock, &exp, 1u))
 +		exp = 0;
-+		while (!uk_compare_exchange_n(&b->lock, &exp, 1u))
-+			exp = 0;
-+	}
 +
 +	return flags;
 +}
 +
 +static inline void bbuddy_unlock(struct uk_bbpalloc *b, unsigned long flags)
 +{
-+	if (b->shared)
-+		uk_exchange_n(&b->lock, 0u);
++	uk_exchange_n(&b->lock, 0u);
 +	uk_lcpu_restore_irqf(flags);
 +}
 +
  #if CONFIG_LIBUKALLOCBBUDDY_FREELIST_SANITY
  /* Provide sanity checking of freelists, walking their length and checking
   * for consistency. Useful when suspecting memory corruption.
-@@ -356,7 +391,7 @@ static inline void bbuddy_trim(struct uk_bbpalloc *b, struct chunk_head *ch,
+@@ -356,7 +388,7 @@ static inline void bbuddy_trim(struct uk_bbpalloc *b, struct chunk_head *ch,
  	}
  }
  
@@ -713,7 +710,7 @@ index 3e39480..cb5c975 100644
  {
  	struct uk_bbpalloc *const b = (struct uk_bbpalloc *)&a->priv;
  	struct chunk_head *alloc_ch;
-@@ -400,6 +435,18 @@ err_nomem:
+@@ -400,6 +432,18 @@ err_nomem:
  	return NULL;
  }
  
@@ -732,7 +729,7 @@ index 3e39480..cb5c975 100644
  /**
   * INTERNAL. Maximally merge chunk `*chp` of order `ord` with any free buddies,
   * updating its value along the way.
-@@ -460,7 +507,8 @@ static inline size_t bbuddy_merge(struct uk_bbpalloc *b,
+@@ -460,7 +504,8 @@ static inline size_t bbuddy_merge(struct uk_bbpalloc *b,
  	return ord;
  }
  
@@ -742,10 +739,11 @@ index 3e39480..cb5c975 100644
  {
  	struct uk_bbpalloc *const b = (struct uk_bbpalloc *)&a->priv;
  	char *base = obj;
-@@ -505,6 +553,17 @@ static void bbuddy_pfree(struct uk_alloc *a, void *obj, unsigned long num_pages)
+@@ -505,7 +550,18 @@ static void bbuddy_pfree(struct uk_alloc *a, void *obj, unsigned long num_pages)
  	freelist_sanitycheck(b->free_head);
  }
  
+-static long bbuddy_pmaxalloc(struct uk_alloc *a)
 +static void bbuddy_pfree(struct uk_alloc *a, void *obj,
 +			unsigned long num_pages)
 +{
@@ -757,11 +755,47 @@ index 3e39480..cb5c975 100644
 +	bbuddy_unlock(b, flags);
 +}
 +
- static long bbuddy_pmaxalloc(struct uk_alloc *a)
++static long bbuddy_pmaxalloc_nolock(struct uk_alloc *a)
  {
  	struct uk_bbpalloc *b;
-@@ -535,7 +594,7 @@ static long bbuddy_pavailmem(struct uk_alloc *a)
- 	return (long) b->nr_free_pages;
+ 	size_t i, order;
+@@ -525,17 +581,41 @@ static long bbuddy_pmaxalloc(struct uk_alloc *a)
+ 	return (long) (1 << order);
+ }
+ 
++static long bbuddy_pmaxalloc(struct uk_alloc *a)
++{
++	struct uk_bbpalloc *const b = (struct uk_bbpalloc *)&a->priv;
++	unsigned long flags;
++	long ret;
++
++	/* The walk reads the free list heads. A concurrent alloc or
++	 * free updates them, so take the lock. [Ticket 5bec1639dc] */
++	flags = bbuddy_lock(b);
++	ret = bbuddy_pmaxalloc_nolock(a);
++	bbuddy_unlock(b, flags);
++
++	return ret;
++}
++
+ static long bbuddy_pavailmem(struct uk_alloc *a)
+ {
+ 	struct uk_bbpalloc *b;
++	unsigned long flags;
++	long ret;
+ 
+ 	UK_ASSERT(a != NULL);
+ 	b = (struct uk_bbpalloc *)&a->priv;
+ 
+-	return (long) b->nr_free_pages;
++	/* nr_free_pages moves with every alloc and free. Read it
++	 * under the lock so the answer cannot be a torn update.
++	 * [Ticket 5bec1639dc] */
++	flags = bbuddy_lock(b);
++	ret = (long) b->nr_free_pages;
++	bbuddy_unlock(b, flags);
++
++	return ret;
  }
  
 -static int bbuddy_addmem(struct uk_alloc *a, void *base, size_t len)
@@ -769,7 +803,7 @@ index 3e39480..cb5c975 100644
  {
  	struct uk_bbpalloc *b;
  	struct uk_bbpalloc_memr *memr;
-@@ -633,7 +692,21 @@ static int bbuddy_addmem(struct uk_alloc *a, void *base, size_t len)
+@@ -633,7 +713,20 @@ static int bbuddy_addmem(struct uk_alloc *a, void *base, size_t len)
  	return 0;
  }
  
@@ -787,33 +821,33 @@ index 3e39480..cb5c975 100644
 +	return ret;
 +}
 +
-+static struct uk_alloc *bbuddy_init(void *base, size_t len,
-+				   unsigned int shared)
++static struct uk_alloc *bbuddy_init(void *base, size_t len)
  {
  	struct uk_alloc *a;
  	struct uk_bbpalloc *b;
-@@ -665,6 +738,8 @@ struct uk_alloc *uk_allocbbuddy_init(void *base, size_t len)
+@@ -665,6 +758,7 @@ struct uk_alloc *uk_allocbbuddy_init(void *base, size_t len)
  	for (i = 0; i < FREELIST_SIZE; i++)
  		UK_INIT_HLIST_HEAD(&b->free_head[i]);
  	b->memr_head = NULL;
-+	b->shared = shared;
 +	b->lock = 0;
  
  	/* initialize and register allocator interface */
  	uk_alloc_init_palloc(a, bbuddy_palloc, bbuddy_pfree,
-@@ -678,3 +753,13 @@ struct uk_alloc *uk_allocbbuddy_init(void *base, size_t len)
+@@ -678,3 +772,15 @@ struct uk_alloc *uk_allocbbuddy_init(void *base, size_t len)
  
  	return a;
  }
 +
 +struct uk_alloc *uk_allocbbuddy_init(void *base, size_t len)
 +{
-+	return bbuddy_init(base, len, 0);
++	return bbuddy_init(base, len);
 +}
 +
 +struct uk_alloc *uk_allocbbuddy_init_shared(void *base, size_t len)
 +{
-+	return bbuddy_init(base, len, 1);
++	/* All instances lock now. Keep this entry point so existing
++	 * call sites keep building. [Ticket 5bec1639dc] */
++	return uk_allocbbuddy_init(base, len);
 +}
 diff --git a/lib/ukallocbbuddy/exportsyms.uk b/lib/ukallocbbuddy/exportsyms.uk
 index ee41a2a..6879548 100644
@@ -824,17 +858,18 @@ index ee41a2a..6879548 100644
 +uk_allocbbuddy_init_shared
  
 diff --git a/lib/ukallocbbuddy/include/uk/allocbbuddy.h b/lib/ukallocbbuddy/include/uk/allocbbuddy.h
-index 3d7558b..3f440a5 100644
+index 3d7558b..1dd97a7 100644
 --- a/lib/ukallocbbuddy/include/uk/allocbbuddy.h
 +++ b/lib/ukallocbbuddy/include/uk/allocbbuddy.h
-@@ -42,6 +42,13 @@ extern "C" {
+@@ -42,6 +42,14 @@ extern "C" {
  
  struct uk_alloc *uk_allocbbuddy_init(void *base, size_t len);
  
 +/*
-+ * Same as uk_allocbbuddy_init() but marks the instance as shared between
-+ * cores. All allocation operations take an internal spinlock. Use this for
-+ * an allocator that more than one core uses (for example the default heap).
++ * Same as uk_allocbbuddy_init(). Every bbuddy instance now takes an
++ * internal lock with interrupts off on every allocation operation, so
++ * an instance may serve several cores. Keep this entry point for
++ * source compatibility. [Ticket 5bec1639dc]
 + */
 +struct uk_alloc *uk_allocbbuddy_init_shared(void *base, size_t len);
 +
