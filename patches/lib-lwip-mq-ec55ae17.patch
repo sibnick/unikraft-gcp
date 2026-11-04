@@ -1,19 +1,73 @@
+diff --git a/include/lwipopts.h b/include/lwipopts.h
+index 0ec529a..8a9b94d 100644
+--- a/include/lwipopts.h
++++ b/include/lwipopts.h
+@@ -91,6 +91,21 @@ void sys_free(void *ptr);
+ #define DEFAULT_ACCEPTMBOX_SIZE (TCPIP_MBOX_SIZE)
+ #endif /* CONFIG_LWIP_NOTHREADS */
+ 
++/*
++ * Per-core memp pools are split across CPU cores (LWIP_CORE_MAX).
++ * lwip_init() calls sys_timeouts_init(), which registers every enabled
++ * cyclic timer on the boot core at once. The lwIP default
++ * MEMP_NUM_SYS_TIMEOUT sizes one global pool, so the per-core split can
++ * leave a core with too few slots. At boot that core then fails the first
++ * extra allocation and crashes: "pool MEMP_SYS_TIMEOUT is empty".
++ * Size the pool by the core count and add headroom for the cyclic timers
++ * plus on-demand TCP and DHCP timers. [Ticket 3dc1f3f6b6]
++ */
++#if defined(LWIP_PERCORE) && defined(CONFIG_UKPLAT_CPU_MAXCOUNT) && \
++    !defined(MEMP_NUM_SYS_TIMEOUT)
++#define MEMP_NUM_SYS_TIMEOUT (16 * CONFIG_UKPLAT_CPU_MAXCOUNT)
++#endif
++
+ /**
+  * Pbuf options
+  */
+diff --git a/include/netif/uknetdev.h b/include/netif/uknetdev.h
+index 9b452c0..f268b4a 100644
+--- a/include/netif/uknetdev.h
++++ b/include/netif/uknetdev.h
+@@ -57,8 +57,22 @@ err_t uknetdev_init(struct netif *nf);
+  */
+ void uknetdev_poll(struct netif *nf);
+ 
++/*
++ * Poll one receive queue of the uknetdev-backed interface. Returns the
++ * number of packets taken from the queue. uknetdev_poll() polls queue 0.
++ */
++unsigned int uknetdev_poll_queue(struct netif *nf, uint16_t queue_id);
++
+ #ifdef CONFIG_LWIP_NOTHREADS
+ void uknetdev_poll_all(void);
++
++/*
++ * Poll one receive queue of every uknetdev-backed interface. Returns the
++ * number of packets taken from the queue. uknetdev_poll_all() polls
++ * queue 0. In the per-core mode (LWIP_PERCORE) each core calls this for
++ * its own queue id.
++ */
++unsigned int uknetdev_poll_rxqueue(uint16_t queue_id);
+ #endif /* CONFIG_LWIP_NOTHREADS */
+ 
+ struct netif *uknetdev_addif(struct uk_netdev *n
 diff --git a/uknetdev.c b/uknetdev.c
-index c03c623..54d3cb0 100644
+index c03c623..02f8413 100644
 --- a/uknetdev.c
 +++ b/uknetdev.c
-@@ -55,6 +55,10 @@
+@@ -55,6 +55,11 @@
  
  #include <uk/essentials.h>
  
 +#if CONFIG_LWIP_NOTHREADS && LWIP_PERCORE
 +#include "lwip_percore.h"
++#include <uk/arch/spinlock.h>
 +#endif
 +
  /*
   * NOTE: We do not support ETH_PAD_SIZE with uknetdev.
   *       According to https://lwn.net/Articles/89597/, the gain of doing padding
-@@ -124,6 +128,14 @@ static inline int uk_netdev_link_state_get(struct uk_netdev *dev __maybe_unused)
+@@ -124,6 +129,27 @@ static inline int uk_netdev_link_state_get(struct uk_netdev *dev __maybe_unused)
  	return 1;
  }
  
@@ -25,10 +79,23 @@ index c03c623..54d3cb0 100644
 +static uint16_t uknetdev_nb_rxq = 1;
 +static uint16_t uknetdev_nb_txq = 1;
 +
++#if CONFIG_LWIP_NOTHREADS && LWIP_PERCORE
++/*
++ * Locks for TX queues shared between cores. A core sends on queue
++ * (core_id % uknetdev_nb_txq). When cores outnumber queues, several
++ * cores call uk_netdev_tx_one() on one queue at the same time, and
++ * that path is not thread safe. One lock per possible queue; static
++ * zero means unlocked. Ticket e59835d0e2.
++ */
++static __spinlock uknetdev_txq_lock[CONFIG_LIBUKNETDEV_MAXNBQUEUES];
++/* Set by uknetdev_init when cores can outnumber TX queues. */
++static int uknetdev_txq_shared;
++#endif
++
  static uint16_t netif_alloc_rxpkts(void *argp, struct uk_netbuf *nb[],
  				   uint16_t count)
  {
-@@ -135,7 +147,12 @@ static uint16_t netif_alloc_rxpkts(void *argp, struct uk_netbuf *nb[],
+@@ -135,7 +161,12 @@ static uint16_t netif_alloc_rxpkts(void *argp, struct uk_netbuf *nb[],
  	lwip_data = (struct lwip_netdev_data *) argp;
  
  	for (i = 0; i < count; ++i) {
@@ -42,7 +109,7 @@ index c03c623..54d3cb0 100644
  					  UKNETDEV_BUFLEN,
  					  lwip_data->dev_info.ioalign,
  					  lwip_data->dev_info.nb_encap_rx);
-@@ -163,7 +180,12 @@ static err_t uknetdev_output(struct netif *nf, struct pbuf *p)
+@@ -163,7 +194,12 @@ static err_t uknetdev_output(struct netif *nf, struct pbuf *p)
  	lwip_data = (struct lwip_netdev_data *) dev->scratch_pad;
  	UK_ASSERT(lwip_data);
  
@@ -56,7 +123,7 @@ index c03c623..54d3cb0 100644
  				 UKNETDEV_BUFLEN,
  				 lwip_data->dev_info.ioalign,
  				 lwip_data->dev_info.nb_encap_tx,
-@@ -192,10 +214,22 @@ static err_t uknetdev_output(struct netif *nf, struct pbuf *p)
+@@ -192,10 +228,30 @@ static err_t uknetdev_output(struct netif *nf, struct pbuf *p)
  	}
  	nb->len = p->tot_len;
  
@@ -72,18 +139,26 @@ index c03c623..54d3cb0 100644
 +#if CONFIG_LWIP_NOTHREADS && LWIP_PERCORE
 +		uint16_t txq = (uint16_t)lwip_current_core_id() %
 +			       uknetdev_nb_txq;
-+#else /* !CONFIG_LWIP_NOTHREADS || !LWIP_PERCORE */
-+		uint16_t txq = 0;
-+#endif /* !CONFIG_LWIP_NOTHREADS || !LWIP_PERCORE */
 +
++		/* Lock the queue while cores share it.
++		 * Ticket e59835d0e2. */
++		if (uknetdev_txq_shared)
++			ukarch_spin_lock(&uknetdev_txq_lock[txq]);
 +		do {
 +			ret = uk_netdev_tx_one(dev, txq, nb);
 +		} while (uk_netdev_status_notready(ret));
++		if (uknetdev_txq_shared)
++			ukarch_spin_unlock(&uknetdev_txq_lock[txq]);
++#else /* !CONFIG_LWIP_NOTHREADS || !LWIP_PERCORE */
++		do {
++			ret = uk_netdev_tx_one(dev, 0, nb);
++		} while (uk_netdev_status_notready(ret));
++#endif /* !CONFIG_LWIP_NOTHREADS || !LWIP_PERCORE */
 +	}
  	if (unlikely(ret < 0)) {
  		LWIP_DEBUGF(NETIF_DEBUG,
  			    ("%s: %c%c%u: Failed to send %"PRIu16" bytes\n",
-@@ -215,12 +249,17 @@ static err_t uknetdev_output(struct netif *nf, struct pbuf *p)
+@@ -215,12 +271,17 @@ static err_t uknetdev_output(struct netif *nf, struct pbuf *p)
  	return ERR_OK;
  }
  
@@ -103,7 +178,7 @@ index c03c623..54d3cb0 100644
  	err_t err;
  	int ret;
  
-@@ -231,7 +270,7 @@ static void uknetdev_input(struct uk_netdev *dev,
+@@ -231,7 +292,7 @@ static void uknetdev_input(struct uk_netdev *dev,
  	LWIP_DEBUGF(NETIF_DEBUG, ("%s: %c%c%u: Poll receive queue...\n",
  				  __func__, nf->name[0], nf->name[1], nf->num));
  	do {
@@ -112,7 +187,7 @@ index c03c623..54d3cb0 100644
  		LWIP_DEBUGF(NETIF_DEBUG,
  			    ("%s: %c%c%u: Input status %d (%c%c%c)\n",
  			     __func__, nf->name[0], nf->name[1], nf->num, ret,
-@@ -265,6 +304,8 @@ static void uknetdev_input(struct uk_netdev *dev,
+@@ -265,6 +326,8 @@ static void uknetdev_input(struct uk_netdev *dev,
  			     __func__, nf->name[0], nf->name[1], nf->num,
  			     nb->len));
  
@@ -121,14 +196,14 @@ index c03c623..54d3cb0 100644
  		/* Send packet to lwip */
  		p = lwip_netbuf_to_pbuf(nb);
  		p->payload = nb->data;
-@@ -307,8 +348,20 @@ static void uknetdev_input(struct uk_netdev *dev,
+@@ -307,7 +370,19 @@ static void uknetdev_input(struct uk_netdev *dev,
  			uk_netbuf_free_single(nb);
  		}
  	} while (uk_netdev_status_more(ret));
 +
 +	return npkts;
- }
- 
++}
++
 +#ifndef CONFIG_LWIP_NOTHREADS
 +/* RX queue callback (interrupt/dispatcher mode): ignores the count.
 + * Only referenced in threaded mode; the NO_SYS main loop polls. */
@@ -136,13 +211,12 @@ index c03c623..54d3cb0 100644
 +			   uint16_t queue_id, void *argp)
 +{
 +	(void)uknetdev_do_input(dev, queue_id, argp);
-+}
+ }
 +#endif /* !CONFIG_LWIP_NOTHREADS */
-+
+ 
  /*
   * TODO: We are not exporting any error states to the user. This is inline
-  * with what lwip provides for loopback and slipif interfaces. However, this
-@@ -316,9 +369,10 @@ static void uknetdev_input(struct uk_netdev *dev,
+@@ -316,9 +391,10 @@ static void uknetdev_input(struct uk_netdev *dev,
   * mainloop. Maybe we should revisit this interface when we add support for
   * netif removal in order to let API users re-initialize interfaces.
   */
@@ -154,7 +228,7 @@ index c03c623..54d3cb0 100644
  	int link_up;
  
  	UK_ASSERT(nf);
-@@ -333,13 +387,23 @@ void uknetdev_poll(struct netif *nf)
+@@ -333,13 +409,23 @@ void uknetdev_poll(struct netif *nf)
  	dev = netif_to_uknetdev(nf);
  	UK_ASSERT(dev);
  
@@ -179,7 +253,7 @@ index c03c623..54d3cb0 100644
  }
  
  #ifdef CONFIG_LWIP_NOTHREADS
-@@ -388,9 +452,10 @@ static void uknetdev_send_gratuitous_arp(struct netif *nf)
+@@ -388,9 +474,10 @@ static void uknetdev_send_gratuitous_arp(struct netif *nf)
  }
  #endif /* LWIP_IPV4 && LWIP_ARP */
  
@@ -191,7 +265,7 @@ index c03c623..54d3cb0 100644
  
  	/*
  	 * TODO: We are going through all netifs and check the interface name.
-@@ -401,14 +466,24 @@ void uknetdev_poll_all(void)
+@@ -401,14 +488,24 @@ void uknetdev_poll_all(void)
  	NETIF_FOREACH(nf) {
  		if (nf->name[0] == UKNETDEV_NETIF_NAME0
  		    && nf->name[1] == UKNETDEV_NETIF_NAME1) {
@@ -219,7 +293,7 @@ index c03c623..54d3cb0 100644
  }
  
  #else /* CONFIG_LWIP_NOTHREADS */
-@@ -577,12 +652,32 @@ err_t uknetdev_init(struct netif *nf)
+@@ -577,12 +674,46 @@ err_t uknetdev_init(struct netif *nf)
  		     lwip_data->dev_info.nb_encap_tx,
  		     lwip_data->dev_info.ioalign));
  
@@ -241,6 +315,20 @@ index c03c623..54d3cb0 100644
 +
 +		uknetdev_nb_rxq = (uint16_t)nbq;
 +		uknetdev_nb_txq = (uint16_t)nbq;
++#if CONFIG_LWIP_NOTHREADS && LWIP_PERCORE
++		/*
++		 * Worker cores are capped by LWIP_CORE_MAX, the platform
++		 * maximum. When that maximum is above the queue count,
++		 * cores may share a queue, so the tx path takes the
++		 * per-queue lock. Ticket e59835d0e2.
++		 */
++		uknetdev_txq_shared = (uknetdev_nb_txq < LWIP_CORE_MAX);
++		if (uknetdev_txq_shared)
++			uk_pr_warn("lwip: %u TX queues for up to %d cores:"
++				   " locking shared queues on tx\n",
++				   (unsigned int)uknetdev_nb_txq,
++				   LWIP_CORE_MAX);
++#endif
 +	}
 +
  	/*
@@ -255,7 +343,7 @@ index c03c623..54d3cb0 100644
  	dev_conf.lro = !!(lwip_data->dev_info.features & UK_NETDEV_F_LRO);
  	ret = uk_netdev_configure(dev, &dev_conf);
  	if (ret < 0) {
-@@ -593,50 +688,54 @@ err_t uknetdev_init(struct netif *nf)
+@@ -593,50 +724,54 @@ err_t uknetdev_init(struct netif *nf)
  		return ERR_IF;
  	}
  
@@ -346,56 +434,3 @@ index c03c623..54d3cb0 100644
  	}
  
  	/* Start interface */
-diff --git a/include/netif/uknetdev.h b/include/netif/uknetdev.h
-index 9b452c0..f268b4a 100644
---- a/include/netif/uknetdev.h
-+++ b/include/netif/uknetdev.h
-@@ -57,8 +57,22 @@ err_t uknetdev_init(struct netif *nf);
-  */
- void uknetdev_poll(struct netif *nf);
- 
-+/*
-+ * Poll one receive queue of the uknetdev-backed interface. Returns the
-+ * number of packets taken from the queue. uknetdev_poll() polls queue 0.
-+ */
-+unsigned int uknetdev_poll_queue(struct netif *nf, uint16_t queue_id);
-+
- #ifdef CONFIG_LWIP_NOTHREADS
- void uknetdev_poll_all(void);
-+
-+/*
-+ * Poll one receive queue of every uknetdev-backed interface. Returns the
-+ * number of packets taken from the queue. uknetdev_poll_all() polls
-+ * queue 0. In the per-core mode (LWIP_PERCORE) each core calls this for
-+ * its own queue id.
-+ */
-+unsigned int uknetdev_poll_rxqueue(uint16_t queue_id);
- #endif /* CONFIG_LWIP_NOTHREADS */
- 
- struct netif *uknetdev_addif(struct uk_netdev *n
-diff --git a/include/lwipopts.h b/include/lwipopts.h
-index 710c160..3300a7b 100644
---- a/include/lwipopts.h
-+++ b/include/lwipopts.h
-@@ -75,6 +75,21 @@ void sys_free(void *ptr);
- #define DEFAULT_ACCEPTMBOX_SIZE (TCPIP_MBOX_SIZE)
- #endif /* CONFIG_LWIP_NOTHREADS */
- 
-+/*
-+ * Per-core memp pools are split across CPU cores (LWIP_CORE_MAX).
-+ * lwip_init() calls sys_timeouts_init(), which registers every enabled
-+ * cyclic timer on the boot core at once. The lwIP default
-+ * MEMP_NUM_SYS_TIMEOUT sizes one global pool, so the per-core split can
-+ * leave a core with too few slots. At boot that core then fails the first
-+ * extra allocation and crashes: "pool MEMP_SYS_TIMEOUT is empty".
-+ * Size the pool by the core count and add headroom for the cyclic timers
-+ * plus on-demand TCP and DHCP timers. [Ticket 3dc1f3f6b6]
-+ */
-+#if defined(LWIP_PERCORE) && defined(CONFIG_UKPLAT_CPU_MAXCOUNT) && \
-+    !defined(MEMP_NUM_SYS_TIMEOUT)
-+#define MEMP_NUM_SYS_TIMEOUT (16 * CONFIG_UKPLAT_CPU_MAXCOUNT)
-+#endif
-+
- /**
-  * Pbuf options
-  */
