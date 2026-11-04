@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <uk/config.h>
 #include <uk/alloc.h>
+#include <uk/atomic.h>
 #include <uk/print.h>
 #include <uk/essentials.h>
 #include <uk/bus/pci.h>
@@ -176,7 +177,7 @@ struct uk_netdev_rx_queue {
 	/* MSI-X interrupt RX state (ticket eae6a73726) */
 	uint8_t intr_enabled;	/* rxq_intr_enable armed this queue */
 	uint32_t irq_db_idx;	/* BAR2 IRQ doorbell, checked at enable */
-	volatile uint32_t msix_events;	/* RX MSI-X events, ISR-owned */
+	uint32_t msix_events;	/* RX MSI-X events, ISR-owned, atomic */
 };
 
 struct gve_device {
@@ -249,8 +250,7 @@ struct gve_device {
 	volatile uint32_t *msix_table;	/* mapped table, or NULL */
 	uint16_t msix_irq_pool[GVE_MSIX_MAX_IRQS];
 	uint8_t msix_pool_cnt;
-	volatile uint32_t msix_events;	/* total RX MSI-X events, ISR-owned */
-	uint8_t msix_marker_done;	/* gate marker printed once */
+	uint8_t msix_marker_done;	/* gate marker printed once, atomic claim */
 };
 
 #define to_gvedev(ndev) \
@@ -1307,29 +1307,47 @@ static void gve_msix_configure(struct gve_device *gdev)
 }
 
 /*
- * MSI-X RX event for one queue. Runs in interrupt context. It hands
- * the event to the uknetdev callback: with CONFIG_LIBUKNETDEV_DISPAT
- * CHERTHREADS the semaphore wake moves the work to the dispatcher
- * thread, which drains the ring and re-arms through the empty recv.
+ * MSI-X RX event for one queue. Runs in interrupt context. The console
+ * write path takes a lock: if the interrupted thread holds that lock
+ * on the same CPU, printing from here deadlocks. So the handler only
+ * counts the event atomically and hands the event to the uknetdev
+ * callback. With CONFIG_LIBUKNETDEV_DISPATCHERTHREADS the semaphore
+ * wake moves the work to the dispatcher thread, which drains the ring
+ * through recv. gve_msix_report_events prints the counters and the
+ * gate marker there, in thread context. Ticket cc8e850241.
  */
 static int gve_msix_isr(void *arg)
 {
 	struct uk_netdev_rx_queue *rxq = arg;
 	struct gve_device *gdev = rxq->gdev;
-	uint32_t ev;
 
-	ev = ++rxq->msix_events;
-	gdev->msix_events++;
-	if (ev == 1U || (ev & (ev - 1U)) == 0U)
-		uk_pr_info("gve: RX MSI-X event q=%u events=%u\n", rxq->qid, ev);
-	if (!gdev->msix_marker_done) {
-		gdev->msix_marker_done = 1;
+	uk_add_fetch(&rxq->msix_events, 1U);
+	uk_netdev_drv_rx_event(&gdev->netdev, rxq->qid);
+	return 1;
+}
+
+/*
+ * Report MSI-X RX events from thread context. The first receive call
+ * that sees events on the queue prints the per-queue counter and the
+ * gate marker. Several RX queues can reach this point on several CPUs
+ * through their dispatcher threads, so the atomic exchange decides
+ * the one-shot print exactly once. Ticket cc8e850241.
+ */
+static void gve_msix_report_events(struct gve_device *gdev,
+				   struct uk_netdev_rx_queue *rxq)
+{
+	uint32_t ev = uk_load_n(&rxq->msix_events);
+	const uint8_t claimed = 1U;
+
+	if (!gve_msix_marker_due(ev, uk_load_n(&gdev->msix_marker_done)))
+		return;
+	if (uk_exchange_n(&gdev->msix_marker_done, claimed) == 0U) {
+		uk_pr_info("gve: RX MSI-X events q=%u events=%u\n",
+			   rxq->qid, ev);
 		printf("GATE_GVE_MSIX_PASS vector=%u q=%u\n",
 		       gdev->msix_irq_pool[rxq->ntfy_id] - 1U + 32U,
 		       rxq->qid);
 	}
-	uk_netdev_drv_rx_event(&gdev->netdev, rxq->qid);
-	return 1;
 }
 
 /*
@@ -2335,6 +2353,14 @@ static int gve_netdev_recv(struct uk_netdev *dev,
 
 	*pkt = NULL;
 	rx_db_idx = queue->db_idx;	/* validated at queue configure */
+
+	/*
+	 * A queue in interrupt mode reports its MSI-X counters here.
+	 * The receive call runs in thread context, so the console
+	 * write is safe. Ticket cc8e850241.
+	 */
+	if (queue->intr_enabled)
+		gve_msix_report_events(gdev, queue);
 
 	if (gdev->queue_format == GVE_DQO_RDA_FORMAT) {
 		struct gve_rx_compl_desc_dqo *cdesc =

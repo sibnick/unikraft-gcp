@@ -1159,6 +1159,19 @@ static inline uint32_t gve_ntfy_cap(uint32_t want, uint32_t counters)
 #define GVE_MSI_ADDR_LO			0xfee00000U
 
 /*
+ * Decide whether thread context must report MSI-X RX events. The ISR
+ * only counts events: printing from interrupt context can deadlock on
+ * the console lock (ticket cc8e850241). The receive path calls this
+ * helper with the per-queue event count and the marker flag. Return 1
+ * when events arrived and the gate marker has not printed yet. The
+ * caller then claims the one-shot print with an atomic exchange.
+ */
+static inline int gve_msix_marker_due(uint32_t events, uint8_t marker_done)
+{
+	return (events != 0U) && (marker_done == 0U);
+}
+
+/*
  * DQO IRQ doorbell values. The device masks a notification block when
  * it delivers an MSI-X event. Writing the enable bit to the block's
  * IRQ doorbell re-arms it. The NO_UPDATE code keeps the interrupt

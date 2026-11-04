@@ -2,8 +2,8 @@
 /*
  * Host unit tests for Google Virtual Ethernet (gVNIC) protocol structures,
  * Admin Queue command builders, GQI/DQO descriptor ring logic, TX free-slot
- * accounting, chain bound checks, RX tailroom decisions, and refill
- * doorbell thresholds.
+ * accounting, chain bound checks, RX tailroom decisions, refill doorbell
+ * thresholds, and the MSI-X marker decision.
  */
 
 #include <stdio.h>
@@ -846,6 +846,30 @@ static void test_itr_arm_value_dqo(void)
 	assert(gve_itr_arm_value_dqo(2U << 17) == GVE_ITR_ENABLE_BIT_DQO);
 }
 
+/*
+ * MSI-X gate-marker decision. The ISR only counts events now:
+ * printing from interrupt context can deadlock on the console lock.
+ * The receive path consults this helper before claiming the one-shot
+ * print. Ticket cc8e850241.
+ */
+static void test_msix_marker_due(void)
+{
+	/* No events yet: nothing to report. */
+	assert(!gve_msix_marker_due(0U, 0U));
+	/* Events and the marker not printed: report. */
+	assert(gve_msix_marker_due(1U, 0U));
+	assert(gve_msix_marker_due(4096U, 0U));
+	/* Marker already printed: stay quiet even with events. */
+	assert(!gve_msix_marker_due(1U, 1U));
+	assert(!gve_msix_marker_due(100U, 1U));
+	/* Zero events after the print: quiet. */
+	assert(!gve_msix_marker_due(0U, 1U));
+	/* Counters are plain uint32 event counts, so the helper must
+	   not treat a power-of-two count specially any more. */
+	assert(gve_msix_marker_due(2U, 0U));
+	assert(gve_msix_marker_due(1024U, 0U));
+}
+
 int main(void)
 {
 	test_adminq_configure_resources();
@@ -876,6 +900,7 @@ int main(void)
 	test_rss_lut_fill();
 	test_rss_key_fill();
 	test_itr_arm_value_dqo();
+	test_msix_marker_due();
 	printf("test_gve: all unit tests passed\n");
 	return 0;
 }
