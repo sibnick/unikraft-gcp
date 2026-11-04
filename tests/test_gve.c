@@ -3,8 +3,8 @@
  * Host unit tests for Google Virtual Ethernet (gVNIC) protocol structures,
  * Admin Queue command builders, GQI/DQO descriptor ring logic, TX free-slot
  * accounting, chain bound checks, RX tailroom decisions, refill doorbell
- * thresholds, the MSI-X marker decision, and the device DMA translation
- * checks.
+ * thresholds, the MSI-X marker decision and unwind flags, and the device
+ * DMA translation checks.
  */
 
 #include <stdio.h>
@@ -916,6 +916,50 @@ static void test_dma_translation(void)
 	assert(!gve_dma_pages_adjacent(0x1000ULL, 0x2800ULL));
 }
 
+/*
+ * MSI-X probe unwind flags. The reservation and the release must
+ * match: the pool stores irq + 1, and the control-word flag tracks
+ * the MSI-X enable bit. Ticket 0005e7ce7e.
+ */
+static void test_msix_unwind_flags(void)
+{
+	uint16_t pool[5];
+
+	memset(pool, 0, sizeof(pool));
+	/* Fresh probe: nothing taken, nothing to unwind. */
+	assert(gve_msix_unwind_flags(pool, 5U, 0) == 0U);
+
+	/* Enable bit written, no irq yet: the pool loop failed on the
+	   first allocation, so only the control word needs a clear. */
+	assert(gve_msix_unwind_flags(pool, 5U, 1) == GVE_MSIX_UNWIND_CTRL);
+
+	/* Full pool: free the irqs and clear the bit. Entries store
+	   irq + 1, so held entries hold at least one. */
+	pool[0] = 18U;	/* irq 17 */
+	pool[1] = 19U;
+	pool[2] = 20U;
+	pool[3] = 21U;
+	pool[4] = 22U;
+	assert(gve_msix_unwind_flags(pool, 5U, 1) ==
+	       (GVE_MSIX_UNWIND_IRQS | GVE_MSIX_UNWIND_CTRL));
+
+	/* Partial pool: the allocation stopped early. Both sides must
+	   still unwind: the held irqs and the enable bit. */
+	pool[4] = 0U;
+	assert(gve_msix_unwind_flags(pool, 5U, 1) ==
+	       (GVE_MSIX_UNWIND_IRQS | GVE_MSIX_UNWIND_CTRL));
+
+	/* After the teardown zeroes the pool and clears the control
+	   flag, a second unwind is a no-op. */
+	memset(pool, 0, sizeof(pool));
+	assert(gve_msix_unwind_flags(pool, 5U, 0) == 0U);
+
+	/* Held irqs alone: the irq flag is independent of the
+	   control-word state. */
+	pool[2] = 18U;
+	assert(gve_msix_unwind_flags(pool, 5U, 0) == GVE_MSIX_UNWIND_IRQS);
+}
+
 int main(void)
 {
 	test_adminq_configure_resources();
@@ -948,6 +992,7 @@ int main(void)
 	test_itr_arm_value_dqo();
 	test_msix_marker_due();
 	test_dma_translation();
+	test_msix_unwind_flags();
 	printf("test_gve: all unit tests passed\n");
 	return 0;
 }

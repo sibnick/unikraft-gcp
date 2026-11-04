@@ -1197,6 +1197,41 @@ static inline uint32_t gve_ntfy_cap(uint32_t want, uint32_t counters)
 #define GVE_MSI_ADDR_LO			0xfee00000U
 
 /*
+ * Unwind actions for the MSI-X probe error path (ticket 0005e7ce7e).
+ * An entry of the IRQ pool stores irq + 1, and 0 means the entry
+ * holds nothing. The enable bit lives in the MSI-X capability
+ * control word.
+ */
+#define GVE_MSIX_UNWIND_IRQS		(1U << 0)	/* free pool irqs */
+#define GVE_MSIX_UNWIND_CTRL		(1U << 1)	/* clear the enable bit */
+
+/*
+ * Decide what the MSI-X error path must unwind for one device
+ * state. The pool array records the held irqs, and ctrl_on says
+ * whether the probe wrote the MSI-X enable bit. The reservation
+ * path and the teardown path share these flags, so an early stop in
+ * the pool loop and the probe error path release exactly what the
+ * probe took. Return the flag set.
+ */
+static inline unsigned int gve_msix_unwind_flags(const uint16_t *pool,
+						 uint32_t pool_len,
+						 int ctrl_on)
+{
+	unsigned int flags = 0U;
+	uint32_t i;
+
+	for (i = 0; i < pool_len; i++) {
+		if (pool[i] != 0U) {
+			flags |= GVE_MSIX_UNWIND_IRQS;
+			break;
+		}
+	}
+	if (ctrl_on != 0)
+		flags |= GVE_MSIX_UNWIND_CTRL;
+	return flags;
+}
+
+/*
  * Decide whether thread context must report MSI-X RX events. The ISR
  * only counts events: printing from interrupt context can deadlock on
  * the console lock (ticket cc8e850241). The receive path calls this

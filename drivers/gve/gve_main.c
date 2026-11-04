@@ -244,6 +244,7 @@ struct gve_device {
 	int intr_want;			/* policy from gve.intr and APIC */
 	int msix_capable;		/* probe reserved the pool */
 	int msix_enabled;		/* table programmed by configure */
+	uint8_t msix_ctrl_on;		/* probe wrote the MSI-X enable bit */
 	uint32_t msix_cap_off;		/* capability offset in config space */
 	uint32_t msix_tbl_off;		/* table byte offset inside its BAR */
 	uint32_t msix_tbl_size;		/* vector count from the capability */
@@ -1215,7 +1216,10 @@ static int gve_netdev_probe(struct uk_netdev *dev)
  * Linux gve driver relies on in gve_napi_poll_dqo.
  */
 
-/* Message control word inside the capability, preserved across writes. */
+/* Message control word inside the capability, preserved across writes.
+ * The msix_ctrl_on flag tracks the enable bit so the error path can
+ * undo exactly what a write set. Ticket 0005e7ce7e.
+ */
 static void gve_msix_set_ctrl(struct gve_device *gdev, uint16_t set,
 			      uint16_t clear)
 {
@@ -1226,6 +1230,10 @@ static void gve_msix_set_ctrl(struct gve_device *gdev, uint16_t set,
 	cw = (uint32_t)((cw & ~clear) | set);
 	dword = (dword & 0xffffU) | (cw << 16);
 	uk_pci_write_config32(&pdev->addr, gdev->msix_cap_off, dword);
+	if ((set & GVE_MSIX_CTRL_ENABLE) != 0U)
+		gdev->msix_ctrl_on = 1;
+	if ((clear & GVE_MSIX_CTRL_ENABLE) != 0U)
+		gdev->msix_ctrl_on = 0;
 }
 
 static volatile uint32_t *gve_msix_entry(struct gve_device *gdev, uint32_t blk)
@@ -1270,6 +1278,40 @@ static int gve_msix_find_cap(struct pci_device *pdev, uint32_t *cap_off,
 		ptr = (idnext >> 8) & 0xffU;
 	}
 	return -ENODEV;
+}
+
+/*
+ * Undo the MSI-X probe setup symmetrically (ticket 0005e7ce7e). Free
+ * every irq the pool holds, then clear the MSI-X enable bit that
+ * gve_msix_set_ctrl wrote. The unwind flags helper picks the two
+ * steps from the device state, so an early stop in the pool loop and
+ * the probe error path release exactly what the reservation took.
+ * RX stays polled after this call. Safe when the probe set nothing
+ * up: the flags read zero and the call does nothing.
+ */
+static void gve_msix_teardown(struct gve_device *gdev)
+{
+	unsigned int flags;
+	uint32_t i;
+
+	flags = gve_msix_unwind_flags(gdev->msix_irq_pool, GVE_MSIX_MAX_IRQS,
+				      gdev->msix_ctrl_on);
+	if ((flags & GVE_MSIX_UNWIND_IRQS) != 0U) {
+		for (i = 0; i < GVE_MSIX_MAX_IRQS; i++) {
+			unsigned int irq;
+
+			if (gdev->msix_irq_pool[i] == 0U)
+				continue;
+			irq = gdev->msix_irq_pool[i] - 1U;
+			uk_intctlr_irq_free(&irq, 1);
+			gdev->msix_irq_pool[i] = 0U;
+		}
+	}
+	if ((flags & GVE_MSIX_UNWIND_CTRL) != 0U)
+		gve_msix_set_ctrl(gdev, 0U, GVE_MSIX_CTRL_ENABLE);
+	gdev->msix_pool_cnt = 0U;
+	gdev->msix_capable = 0;
+	gdev->msix_enabled = 0;
 }
 
 /*
@@ -1352,22 +1394,23 @@ static void gve_msix_probe_check(struct gve_device *gdev)
 	for (i = 0; i < worst_irqs; i++) {
 		for (;;) {
 			if (uk_intctlr_irq_alloc(&irq, 1) != 0) {
-				uint32_t j;
-
-				for (j = 0; j < got; j++) {
-					unsigned int old = gdev->msix_irq_pool[j] - 1U;
-
-					uk_intctlr_irq_free(&old, 1);
-					gdev->msix_irq_pool[j] = 0U;
-				}
+				/* Undo everything this call took:
+				 * pool irqs and the enable bit.
+				 * Ticket 0005e7ce7e.
+				 */
+				gve_msix_teardown(gdev);
 				uk_pr_info("gve: only %u of %u IRQs allocatable: RX stays polled\n",
 					   got, worst_irqs);
 				return;
 			}
 			/* Keep the platform static irqs (PIT 0, IPI 13
-			 * and 14, LAPIC timer 16) out of the pool. */
+			 * and 14, LAPIC timer 16) out of the pool.
+			 * Give each skipped irq back to the allocator
+			 * instead of dropping it. Ticket 0005e7ce7e.
+			 */
 			if (irq >= 17U)
 				break;
+			uk_intctlr_irq_free(&irq, 1);
 		}
 		gdev->msix_irq_pool[i] = (uint16_t)(irq + 1U);
 		got++;
@@ -3313,6 +3356,16 @@ err:
 	} else {
 		uk_pr_err("gve: probe aborted with a command possibly pending, leaking adminq, driver info, and descriptor buffers\n");
 	}
+	/*
+	 * Unwind in reverse order of the build. gve_msix_probe_check
+	 * may have enabled MSI-X and reserved the IRQ pool before the
+	 * registration failed. Release the pool and clear the enable
+	 * bit before freeing gdev, or the irqs stay claimed and the
+	 * device keeps MSI-X enabled with no driver. The call is a
+	 * no-op when the probe stopped before that point. Ticket
+	 * 0005e7ce7e.
+	 */
+	gve_msix_teardown(gdev);
 	if (mapped_bar1)
 		gve_unmap_bar(2);
 	if (mapped_bar2)
