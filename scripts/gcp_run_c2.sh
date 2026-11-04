@@ -51,6 +51,17 @@ CLIENT_MACHINE="${UKG_CLIENT_MACHINE:-e2-standard-2}"
 UBUNTU_FAMILY="${UKG_UBUNTU_FAMILY:-ubuntu-2404-lts-amd64}"
 UBUNTU_PROJECT="${UKG_UBUNTU_PROJECT:-ubuntu-os-cloud}"
 
+# Pinned guest package version for the compiler meta-package. The
+# Linux hft baseline must build with the same toolchain between runs,
+# so the server installs this exact version. The default is the
+# Ubuntu 24.04 LTS (noble) release version. Update it together with
+# UKG_UBUNTU_FAMILY, or pass a per-run override. The server prints
+# the installed build-essential and gcc versions to the serial log,
+# so the stored evidence names the real compiler. Acquire::Retries
+# keeps a flaky apt mirror from failing the gate after billable time.
+# Ticket 1a21e263ad.
+BUILD_ESSENTIAL_VERSION="${UKG_BUILD_ESSENTIAL_VERSION:-12.10ubuntu1}"
+
 # Smoke sizing. The full run overrides the probe count.
 HFT_PORT="${UKG_HFT_PORT:-9000}"
 HFT_PROBES="${UKG_HFT_PROBES:-20000}"
@@ -100,6 +111,7 @@ echo "Server:       ${SRV_NAME} (${SRV_IP})"
 echo "Client:       ${CLI_NAME} (${CLI_IP})"
 echo "Subnet:       ${SUBNET}"
 echo "Probe:        ${HFT_PROBES} synchronous UDP probes to port ${HFT_PORT}"
+echo "Packages:     build-essential=${BUILD_ESSENTIAL_VERSION}"
 echo "Logs:         ${SRV_LOG} ${CLI_LOG} ${COMBINED_LOG}"
 echo "=================================================="
 
@@ -289,14 +301,16 @@ if [ "${UKG_TARGET}" = "linux" ]; then
 exec > /dev/console 2>&1
 echo "C2SERVER linux hft baseline run=@@RUN@@"
 export DEBIAN_FRONTEND=noninteractive
-if ! apt-get update -qq; then
+if ! apt-get update -qq -o Acquire::Retries=5; then
     echo "GATE_LINUX_HFT_FAIL: apt-get update failed"
     exit 1
 fi
-if ! apt-get install -y -qq build-essential; then
-    echo "GATE_LINUX_HFT_FAIL: compiler install failed"
+if ! apt-get install -y -qq -o Acquire::Retries=5 "build-essential=@@BUILD_ESSENTIAL_VERSION@@"; then
+    echo "GATE_LINUX_HFT_FAIL: pinned build-essential=@@BUILD_ESSENTIAL_VERSION@@ install failed. Set UKG_BUILD_ESSENTIAL_VERSION to a version this image offers."
     exit 1
 fi
+dpkg-query -W -f='PKG build-essential ${Version}\n' build-essential
+dpkg-query -W -f='PKG gcc ${Version}\n' gcc
 cat > /root/server.c <<'UKG_SERVER_C'
 SRV_HEAD
         cat "${SERVER_C}"
@@ -321,6 +335,7 @@ SRV_FOOT
     sed -i \
         -e "s|@@RUN@@|${UKG_RUN}|g" \
         -e "s|@@PORT@@|${HFT_PORT}|g" \
+        -e "s|@@BUILD_ESSENTIAL_VERSION@@|${BUILD_ESSENTIAL_VERSION}|g" \
         "${SRV_SCRIPT}"
 fi
 

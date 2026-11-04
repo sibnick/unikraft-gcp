@@ -51,6 +51,17 @@ CLIENT_MACHINE="${UKG_CLIENT_MACHINE:-e2-standard-2}"
 UBUNTU_FAMILY="${UKG_UBUNTU_FAMILY:-ubuntu-2404-lts-amd64}"
 UBUNTU_PROJECT="${UKG_UBUNTU_PROJECT:-ubuntu-os-cloud}"
 
+# Pinned guest package versions. The A/B baseline must not drift
+# between runs, so the startup scripts install these exact versions.
+# The defaults are Ubuntu 24.04 LTS (noble) release versions. Update
+# them together with UKG_UBUNTU_FAMILY, or pass a per-run override.
+# Each guest prints its installed version to the serial log, so the
+# stored evidence names the exact packages. Acquire::Retries keeps a
+# flaky apt mirror from failing the gate after billable time. Ticket
+# 1a21e263ad.
+WRK_VERSION="${UKG_WRK_VERSION:-4.1.0-4build2}"
+NGINX_VERSION="${UKG_NGINX_VERSION:-1.24.0-2ubuntu7}"
+
 # Smoke sweep parameters. The full matrix run overrides these.
 WRK_THREADS="${UKG_WRK_THREADS:-2}"
 WRK_CONNS="${UKG_WRK_CONNS:-50}"
@@ -101,6 +112,7 @@ echo "Server:       ${SRV_NAME} (${SRV_IP})"
 echo "Client:       ${CLI_NAME} (${CLI_IP})"
 echo "Subnet:       ${SUBNET}"
 echo "wrk:          -t${WRK_THREADS} -c${WRK_CONNS} -d${WRK_DURATION}s --latency"
+echo "Packages:     wrk=${WRK_VERSION} nginx=${NGINX_VERSION}"
 echo "Logs:         ${SRV_LOG} ${CLI_LOG} ${COMBINED_LOG}"
 echo "=================================================="
 
@@ -141,16 +153,17 @@ if [ "${READY}" != "1" ]; then
     exit 1
 fi
 export DEBIAN_FRONTEND=noninteractive
-if ! apt-get update -qq; then
+if ! apt-get update -qq -o Acquire::Retries=5; then
     echo "GATE_HTTP_BENCH_FAIL: apt-get update failed"
     poweroff
     exit 1
 fi
-if ! apt-get install -y -qq wrk; then
-    echo "GATE_HTTP_BENCH_FAIL: could not install wrk"
+if ! apt-get install -y -qq -o Acquire::Retries=5 "wrk=@@WRK_VERSION@@"; then
+    echo "GATE_HTTP_BENCH_FAIL: could not install pinned wrk=@@WRK_VERSION@@. Set UKG_WRK_VERSION to a version this image offers."
     poweroff
     exit 1
 fi
+dpkg-query -W -f='PKG wrk ${Version}\n' wrk
 echo "WRK_BEGIN"
 wrk -t@@THREADS@@ -c@@CONNS@@ -d@@DURATION@@s --latency "http://${TARGET}:${PORT}/" 2>&1 | tee /tmp/wrk-report.txt
 echo "WRK_END"
@@ -172,6 +185,7 @@ sed -i \
     -e "s|@@THREADS@@|${WRK_THREADS}|g" \
     -e "s|@@CONNS@@|${WRK_CONNS}|g" \
     -e "s|@@DURATION@@|${WRK_DURATION}|g" \
+    -e "s|@@WRK_VERSION@@|${WRK_VERSION}|g" \
     "${CLI_SCRIPT}"
 
 # 3. Render the nginx baseline server script for the linux flavor.
@@ -184,14 +198,15 @@ if [ "${UKG_TARGET}" = "linux" ]; then
 exec > /dev/console 2>&1
 echo "C1SERVER nginx baseline run=@@RUN@@"
 export DEBIAN_FRONTEND=noninteractive
-if ! apt-get update -qq; then
+if ! apt-get update -qq -o Acquire::Retries=5; then
     echo "GATE_NGINX_FAIL: apt-get update failed"
     exit 1
 fi
-if ! apt-get install -y -qq nginx; then
-    echo "GATE_NGINX_FAIL: nginx install failed"
+if ! apt-get install -y -qq -o Acquire::Retries=5 "nginx=@@NGINX_VERSION@@"; then
+    echo "GATE_NGINX_FAIL: could not install pinned nginx=@@NGINX_VERSION@@. Set UKG_NGINX_VERSION to a version this image offers."
     exit 1
 fi
+dpkg-query -W -f='PKG nginx ${Version}\n' nginx
 if ! systemctl enable --now nginx; then
     echo "GATE_NGINX_FAIL: nginx did not start"
     exit 1
@@ -203,8 +218,10 @@ if ! systemctl is-active --quiet nginx; then
 fi
 echo "GATE_NGINX_UP"
 SRV_EOF
-    sed -e "s|@@RUN@@|${UKG_RUN}|g" "${SRV_SCRIPT}" >"${SRV_SCRIPT}.tmp"
-    mv -f "${SRV_SCRIPT}.tmp" "${SRV_SCRIPT}"
+    sed -i \
+        -e "s|@@RUN@@|${UKG_RUN}|g" \
+        -e "s|@@NGINX_VERSION@@|${NGINX_VERSION}|g" \
+        "${SRV_SCRIPT}"
 fi
 
 # 4. Internal firewall rule. Open only what the gate needs: TCP 80
