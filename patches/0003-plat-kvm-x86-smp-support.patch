@@ -28,7 +28,7 @@ index 1623228..5ae6dcf 100644
  
  UK_BOOT_EARLYTAB_ENTRY(boot_acpi_init, UK_ACPI_INIT_PRIO);
 diff --git a/drivers/firmware/ukacpi/arch/x86_64/madt.c b/drivers/firmware/ukacpi/arch/x86_64/madt.c
-index 4883a75..2ca8ac2 100644
+index 4883a75..7c19898 100644
 --- a/drivers/firmware/ukacpi/arch/x86_64/madt.c
 +++ b/drivers/firmware/ukacpi/arch/x86_64/madt.c
 @@ -10,6 +10,7 @@
@@ -39,8 +39,17 @@ index 4883a75..2ca8ac2 100644
  #include <uk/assert.h>
  #include <uk/pcpuvar.h>
  #include <uk/print.h>
-@@ -22,7 +23,11 @@
+@@ -20,9 +21,20 @@
+ #include <uk/plat/common/bootinfo.h>
+ #endif /* CONFIG_LIBUKBOOT */
  
++/*
++ * CPUs that the platform presents, clamped to the configured maximum.
++ * Code that sizes per-core resources reads this instead of guessing
++ * from CONFIG_UKPLAT_CPU_MAXCOUNT. [Ticket 9a037affad]
++ */
++unsigned int uk_acpi_present_cpu_count = CONFIG_UKPLAT_CPU_MAXCOUNT;
++
  int uk_acpi_madt_fill_cpu_idmap(void)
  {
 -	__u64 bsp_cpu_id = uk_pcpuvar_lval(0, uk_pcpuvar_cpu_id);
@@ -52,7 +61,7 @@ index 4883a75..2ca8ac2 100644
  	union {
  		struct uk_acpi_madt_x2apic *x2apic;
  		struct uk_acpi_madt_lapic *lapic;
-@@ -38,7 +43,23 @@ int uk_acpi_madt_fill_cpu_idmap(void)
+@@ -38,7 +50,23 @@ int uk_acpi_madt_fill_cpu_idmap(void)
  
  	/* Enumerate all other CPUs */
  	madt = uk_acpi_get_madt();
@@ -77,7 +86,7 @@ index 4883a75..2ca8ac2 100644
  
  	len = madt->hdr.tab_len - sizeof(*madt);
  	idx = 1;
-@@ -80,7 +101,7 @@ int uk_acpi_madt_fill_cpu_idmap(void)
+@@ -80,12 +108,17 @@ int uk_acpi_madt_fill_cpu_idmap(void)
  
  		/* Ignore cores that exceed max configured value */
  		if (unlikely(idx == CONFIG_UKPLAT_CPU_MAXCOUNT)) {
@@ -86,6 +95,43 @@ index 4883a75..2ca8ac2 100644
  			break;
  		}
  	}
+ 	UK_ASSERT(bsp_found);
+ 
++	/* idx counted the BSP plus every mapped AP, capped at the
++	 * configured maximum. Publish it as the present CPU count.
++	 */
++	uk_acpi_present_cpu_count = idx;
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/firmware/ukacpi/exportsyms.uk b/drivers/firmware/ukacpi/exportsyms.uk
+index 6a3d241..34a88e7 100644
+--- a/drivers/firmware/ukacpi/exportsyms.uk
++++ b/drivers/firmware/ukacpi/exportsyms.uk
+@@ -2,3 +2,4 @@ uk_acpi_get_fadt
+ uk_acpi_get_madt
+ uk_acpi_init
+ uk_acpi_madt_fill_cpu_idmap
++uk_acpi_present_cpu_count
+diff --git a/drivers/firmware/ukacpi/include/uk/acpi/madt.h b/drivers/firmware/ukacpi/include/uk/acpi/madt.h
+index 53f6ee1..2db394c 100644
+--- a/drivers/firmware/ukacpi/include/uk/acpi/madt.h
++++ b/drivers/firmware/ukacpi/include/uk/acpi/madt.h
+@@ -239,6 +239,13 @@ struct uk_acpi_madt *uk_acpi_get_madt(void);
+  * @return 0 on success, !=0 on error.
+  */
+ int uk_acpi_madt_fill_cpu_idmap(void);
++
++/**
++ * Number of CPUs that the platform presents to this instance.
++ * uk_acpi_madt_fill_cpu_idmap() sets it while parsing the MADT.
++ * Without a MADT it stays at CONFIG_UKPLAT_CPU_MAXCOUNT.
++ */
++extern unsigned int uk_acpi_present_cpu_count;
+ #endif /* CONFIG_LIBUKACPI_MADT_FILL_CPU_IDMAP */
+ 
+ #ifdef __cplusplus
 diff --git a/drivers/ukintctlr/xpic/pic.c b/drivers/ukintctlr/xpic/pic.c
 index 7e8b51a..26094d2 100644
 --- a/drivers/ukintctlr/xpic/pic.c
@@ -877,10 +923,10 @@ index 3d7558b..1dd97a7 100644
  }
  #endif
 diff --git a/lib/ukboot/Config.uk b/lib/ukboot/Config.uk
-index cee02cb..e321b56 100644
+index cee02cb..02b49be 100644
 --- a/lib/ukboot/Config.uk
 +++ b/lib/ukboot/Config.uk
-@@ -144,6 +144,18 @@ config LIBUKBOOT_HEAP_BASE
+@@ -144,6 +144,21 @@ config LIBUKBOOT_HEAP_BASE
  	depends on LIBUKPAGING
  	depends on LIBUKBOOT_INITALLOC
  
@@ -890,7 +936,10 @@ index cee02cb..e321b56 100644
 +	depends on LIBUKBOOT_INITALLOC
 +	help
 +	  Split the largest free memory region at boot into N-1
-+	  partitions (N = CPU max count). Each non-boot core can then
++	  partitions. N is the number of CPUs that the platform
++	  presents. On x86_64 with MADT parsing enabled, the count
++	  comes from the ACPI MADT. Otherwise it is the CPU max count.
++	  Each non-boot core can then
 +	  run a standalone allocator instance on its own partition. The
 +	  boot core keeps the remaining region as the default allocator.
 +	  This enables a run-to-completion design where each core
@@ -900,7 +949,7 @@ index cee02cb..e321b56 100644
  # initialized. The check for !LIBUKBOOT_INITNOSCHED is not sufficient, as
  # the option is also not available if !LIBUKBOOT_INITALLOC is set. The
 diff --git a/lib/ukboot/boot.c b/lib/ukboot/boot.c
-index 0cd058c..1092418 100644
+index 0cd058c..3398f54 100644
 --- a/lib/ukboot/boot.c
 +++ b/lib/ukboot/boot.c
 @@ -52,6 +52,9 @@
@@ -934,7 +983,7 @@ index 0cd058c..1092418 100644
  #include "init.h"
  
  extern char **boot_argv;
-@@ -117,6 +127,123 @@ struct uk_semaphore main_sema;
+@@ -117,6 +127,148 @@ struct uk_semaphore main_sema;
  static struct uk_vas kernel_vas;
  #endif /* CONFIG_LIBUKBOOT_HEAP_BASE && CONFIG_LIBUKVMEM */
  
@@ -959,6 +1008,30 @@ index 0cd058c..1092418 100644
 +/* A per-core partition smaller than this size is not useful. */
 +#define UK_PERCORE_HEAP_MIN_SIZE	(16UL << 20)
 +
++#if CONFIG_LIBUKACPI && CONFIG_ARCH_X86_64 &&				\
++	CONFIG_LIBUKACPI_MADT_FILL_CPU_IDMAP
++#include <uk/acpi/madt.h>
++#endif
++
++/*
++ * Number of cores to carve partitions for. The MADT fill entry runs
++ * from the early boot table, before heap_init(). So the ACPI CPU
++ * count is known here on x86_64. Fall back to the configured maximum
++ * count when ACPI is not available. [Ticket 9a037affad]
++ */
++static unsigned int percore_heap_ncores(void)
++{
++	unsigned int n = CONFIG_UKPLAT_CPU_MAXCOUNT;
++
++#if CONFIG_LIBUKACPI && CONFIG_ARCH_X86_64 &&				\
++	CONFIG_LIBUKACPI_MADT_FILL_CPU_IDMAP
++	if (uk_acpi_present_cpu_count > 0 &&
++	    uk_acpi_present_cpu_count < n)
++		n = uk_acpi_present_cpu_count;
++#endif
++	return n;
++}
++
 +/*
 + * Carve one partition from the largest free memory region for each
 + * non-boot core. This function must run before uk_alloc_init() in
@@ -969,7 +1042,7 @@ index 0cd058c..1092418 100644
 +{
 +	struct ukplat_memregion_desc *md;
 +	struct ukplat_memregion_desc *biggest = NULL;
-+	unsigned int ncores = CONFIG_UKPLAT_CPU_MAXCOUNT;
++	unsigned int ncores = percore_heap_ncores();
 +	unsigned int i;
 +	__sz part;
 +
@@ -1015,9 +1088,10 @@ index 0cd058c..1092418 100644
 +
 +	if (percore_heap_count) {
 +		uk_pr_info("ukboot: per-core heap: %u partition(s) "
-+			  "of %lu bytes; core 0 keeps the default region\n",
++			  "of %lu bytes for %u core(s); "
++			  "core 0 keeps the default region\n",
 +			(unsigned int)percore_heap_count,
-+			(unsigned long)part);
++			(unsigned long)part, ncores);
 +	} else {
 +		uk_pr_info("ukboot: per-core heap: no partition carved\n");
 +	}
@@ -1058,7 +1132,7 @@ index 0cd058c..1092418 100644
  static struct uk_alloc *heap_init()
  {
  	struct uk_alloc *a = NULL;
-@@ -161,8 +288,8 @@ static struct uk_alloc *heap_init()
+@@ -161,8 +313,8 @@ static struct uk_alloc *heap_init()
  	if (unlikely(rc))
  		return NULL;
  
@@ -1069,7 +1143,7 @@ index 0cd058c..1092418 100644
  	if (unlikely(!a))
  		return NULL;
  
-@@ -199,8 +326,8 @@ static struct uk_alloc *heap_init()
+@@ -199,8 +351,8 @@ static struct uk_alloc *heap_init()
  	if (unlikely(rc))
  		return NULL;
  
@@ -1080,7 +1154,7 @@ index 0cd058c..1092418 100644
  #endif /* !CONFIG_LIBUKVMEM */
  #else /* CONFIG_LIBUKBOOT_HEAP_BASE */
  	/* Paging is disabled so we still have the static boot page table set
-@@ -210,6 +337,13 @@ static struct uk_alloc *heap_init()
+@@ -210,6 +362,13 @@ static struct uk_alloc *heap_init()
  	 * again with the next region. As soon we have an allocator, we simply
  	 * add every subsequent region to it.
  	 */
@@ -1094,7 +1168,7 @@ index 0cd058c..1092418 100644
  	ukplat_memregion_foreach(&md, UKPLAT_MEMRT_FREE, 0, 0) {
  		UK_ASSERT_VALID_FREE_MRD(md);
  
-@@ -224,7 +358,7 @@ static struct uk_alloc *heap_init()
+@@ -224,7 +383,7 @@ static struct uk_alloc *heap_init()
  			    );
  
  		if (!a)
