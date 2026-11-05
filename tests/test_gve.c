@@ -960,6 +960,141 @@ static void test_msix_unwind_flags(void)
 	assert(gve_msix_unwind_flags(pool, 5U, 0) == GVE_MSIX_UNWIND_IRQS);
 }
 
+/*
+ * MSI-X first-fit allocator reservation (ticket d9cdb2c635).
+ * A first-fit allocator returns the lowest free IRQ.
+ * Retain skipped low IRQs (< 17) during allocation to prevent
+ * an infinite loop. Free them after the loop completes.
+ */
+struct mock_irq_allocator {
+	uint64_t bitmap;
+	uint32_t alloc_calls;
+	uint32_t free_calls;
+	uint32_t max_allocatable;
+	uint32_t freed_irqs[64];
+	uint32_t num_freed;
+};
+
+static int mock_first_fit_alloc(unsigned int *irq, void *arg)
+{
+	struct mock_irq_allocator *m = (struct mock_irq_allocator *)arg;
+	uint32_t i;
+
+	m->alloc_calls++;
+	for (i = 0; i <= m->max_allocatable && i < 64U; i++) {
+		if ((m->bitmap & (1ULL << i)) == 0ULL) {
+			m->bitmap |= (1ULL << i);
+			*irq = i;
+			return 0;
+		}
+	}
+	return -1;
+}
+
+static void mock_first_fit_free(unsigned int *irq, void *arg)
+{
+	struct mock_irq_allocator *m = (struct mock_irq_allocator *)arg;
+	unsigned int val = *irq;
+
+	m->free_calls++;
+	assert(val < 64U);
+	assert((m->bitmap & (1ULL << val)) != 0ULL);
+	m->bitmap &= ~(1ULL << val);
+	if (m->num_freed < 64U)
+		m->freed_irqs[m->num_freed++] = val;
+}
+
+static void test_msix_first_fit_reservation(void)
+{
+	struct mock_irq_allocator mock;
+	uint16_t pool[8];
+	uint32_t k;
+
+	/*
+	 * Scenario 1: Low IRQs 0..16 are initially free.
+	 * The allocator returns 0 first. The reservation holds
+	 * 0..16, allocates 17..20, and frees 0..16 back.
+	 */
+	memset(&mock, 0, sizeof(mock));
+	memset(pool, 0, sizeof(pool));
+	mock.max_allocatable = 31U;
+
+	assert(gve_msix_reserve_irqs(pool, 4U, mock_first_fit_alloc,
+				     mock_first_fit_free, &mock) == 0);
+
+	/* Pool holds IRQs 17, 18, 19, 20 stored as irq + 1. */
+	assert(pool[0] == 18U);
+	assert(pool[1] == 19U);
+	assert(pool[2] == 20U);
+	assert(pool[3] == 21U);
+	assert(pool[4] == 0U);
+
+	/* Exactly 17 static IRQs were skipped and then freed. */
+	assert(mock.num_freed == 17U);
+	for (k = 0; k < 17U; k++)
+		assert((mock.bitmap & (1ULL << k)) == 0ULL);
+
+	/* Only IRQs 17..20 remain allocated in the bitmap. */
+	assert(mock.bitmap == ((1ULL << 17) | (1ULL << 18) |
+			       (1ULL << 19) | (1ULL << 20)));
+
+	/* Total alloc calls: 17 skipped plus 4 pool equals 21. */
+	assert(mock.alloc_calls == 21U);
+	assert(mock.free_calls == 17U);
+
+	/*
+	 * Scenario 2: Static IRQs 0..16 are already allocated.
+	 * The allocator returns 17 immediately.
+	 */
+	memset(&mock, 0, sizeof(mock));
+	memset(pool, 0, sizeof(pool));
+	mock.max_allocatable = 31U;
+	mock.bitmap = 0x1ffffULL;
+
+	assert(gve_msix_reserve_irqs(pool, 2U, mock_first_fit_alloc,
+				     mock_first_fit_free, &mock) == 0);
+	assert(pool[0] == 18U);
+	assert(pool[1] == 19U);
+	assert(mock.num_freed == 0U);
+	assert(mock.alloc_calls == 2U);
+	assert(mock.free_calls == 0U);
+
+	/*
+	 * Scenario 3: Allocator runs out of IRQs during reservation.
+	 * Both skipped and pool IRQs unwind cleanly.
+	 */
+	memset(&mock, 0, sizeof(mock));
+	memset(pool, 0, sizeof(pool));
+	mock.max_allocatable = 18U;
+
+	assert(gve_msix_reserve_irqs(pool, 4U, mock_first_fit_alloc,
+				     mock_first_fit_free, &mock) != 0);
+
+	/* All IRQs unwound. The bitmap is completely clean. */
+	assert(mock.bitmap == 0ULL);
+	for (k = 0; k < 4U; k++)
+		assert(pool[k] == 0U);
+
+	/*
+	 * Scenario 4: Bound check on static IRQ limit.
+	 * An immediate free causes an infinite loop with first fit.
+	 * Demonstrate the first-fit repeat behavior on immediate free.
+	 */
+	{
+		unsigned int test_irq = 999U;
+
+		mock.bitmap = 0ULL;
+		mock.num_freed = 0U;
+		assert(mock_first_fit_alloc(&test_irq, &mock) == 0);
+		assert(test_irq == 0U);
+		mock_first_fit_free(&test_irq, &mock);
+		/* Immediate free returns 0 again on the next call. */
+		assert(mock_first_fit_alloc(&test_irq, &mock) == 0);
+		assert(test_irq == 0U);
+		mock_first_fit_free(&test_irq, &mock);
+	}
+}
+
 int main(void)
 {
 	test_adminq_configure_resources();
@@ -993,6 +1128,7 @@ int main(void)
 	test_msix_marker_due();
 	test_dma_translation();
 	test_msix_unwind_flags();
+	test_msix_first_fit_reservation();
 	printf("test_gve: all unit tests passed\n");
 	return 0;
 }

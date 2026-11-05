@@ -1325,9 +1325,11 @@ static void gve_msix_teardown(struct gve_device *gdev)
 static void gve_msix_probe_check(struct gve_device *gdev)
 {
 	struct pci_device *pdev = gdev->pdev;
+	unsigned int skipped_irqs[GVE_MSIX_MAX_SKIPPED_IRQS];
 	uint32_t worst_irqs, bar_size, got = 0;
+	uint32_t num_skipped = 0;
 	unsigned int irq;
-	uint32_t i;
+	uint32_t i, j;
 
 	gdev->intr_want = gve_intr_policy();
 	if (!gdev->intr_want) {
@@ -1395,22 +1397,34 @@ static void gve_msix_probe_check(struct gve_device *gdev)
 		for (;;) {
 			if (uk_intctlr_irq_alloc(&irq, 1) != 0) {
 				/* Undo everything this call took:
-				 * pool irqs and the enable bit.
-				 * Ticket 0005e7ce7e.
+				 * pool irqs, skipped irqs, and the enable bit.
+				 * Tickets 0005e7ce7e and d9cdb2c635.
 				 */
+				for (j = 0; j < num_skipped; j++)
+					uk_intctlr_irq_free(&skipped_irqs[j], 1);
 				gve_msix_teardown(gdev);
 				uk_pr_info("gve: only %u of %u IRQs allocatable: RX stays polled\n",
 					   got, worst_irqs);
 				return;
 			}
-			/* Keep the platform static irqs (PIT 0, IPI 13
+			/* Keep platform static irqs (PIT 0, IPI 13
 			 * and 14, LAPIC timer 16) out of the pool.
-			 * Give each skipped irq back to the allocator
-			 * instead of dropping it. Ticket 0005e7ce7e.
+			 * Retain skipped irqs in a temporary array.
+			 * Free them only after the loop completes or
+			 * fails. Immediate free caused an infinite loop
+			 * with first-fit allocators. Ticket d9cdb2c635.
 			 */
-			if (irq >= 17U)
+			if (irq >= GVE_MSIX_MIN_IRQ)
 				break;
-			uk_intctlr_irq_free(&irq, 1);
+			if (num_skipped >= GVE_MSIX_MAX_SKIPPED_IRQS) {
+				uk_intctlr_irq_free(&irq, 1);
+				for (j = 0; j < num_skipped; j++)
+					uk_intctlr_irq_free(&skipped_irqs[j], 1);
+				gve_msix_teardown(gdev);
+				uk_pr_info("gve: static IRQ limit exceeded: RX stays polled\n");
+				return;
+			}
+			skipped_irqs[num_skipped++] = irq;
 		}
 		gdev->msix_irq_pool[i] = (uint16_t)(irq + 1U);
 		got++;
@@ -1418,6 +1432,9 @@ static void gve_msix_probe_check(struct gve_device *gdev)
 		mmio_write32(gve_msix_entry(gdev, i) +
 			     GVE_MSIX_ENTRY_CTRL / 4U, GVE_MSIX_ENTRY_CTRL_MASK);
 	}
+	/* Free all retained skipped IRQs back to the controller. */
+	for (j = 0; j < num_skipped; j++)
+		uk_intctlr_irq_free(&skipped_irqs[j], 1);
 	gdev->msix_pool_cnt = (uint8_t)got;
 	gdev->msix_capable = 1;
 	uk_pr_info("gve: MSI-X ready: cap=0x%x, table=%u vectors BAR%u offset=0x%x, %u irqs reserved\n",

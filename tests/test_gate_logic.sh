@@ -513,6 +513,17 @@ case "${got}" in
     *) bad "startup script path is private with mode 600 (got: ${got})" ;;
 esac
 
+# 10. Sed replacement escape helper. Escapes backslashes, ampersands,
+# and delimiter pipes for safe sed substitution. Ticket ca3a596670.
+TEST_INPUT='foo|bar&baz\qux'
+TEST_ESC="$(ukg_escape_sed "${TEST_INPUT}")"
+TEST_OUT="$(printf 'before @@V@@ after' | sed -e "s|@@V@@|${TEST_ESC}|g")"
+if [ "${TEST_OUT}" = "before foo|bar&baz\\qux after" ]; then
+    ok "ukg_escape_sed preserves backslashes ampersands and delimiter pipes"
+else
+    bad "ukg_escape_sed preserves backslashes ampersands and delimiter pipes (got: ${TEST_OUT})"
+fi
+
 echo ""
 echo "test_gate_logic: ${PASS_COUNT} passed, ${FAIL_COUNT} failed"
 [ "${FAIL_COUNT}" -eq 0 ]

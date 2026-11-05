@@ -1197,6 +1197,70 @@ static inline uint32_t gve_ntfy_cap(uint32_t want, uint32_t counters)
 #define GVE_MSI_ADDR_LO			0xfee00000U
 
 /*
+ * Static platform IRQ boundary (ticket d9cdb2c635).
+ * IRQs below 17 belong to legacy or platform devices (PIT 0, IPI 13
+ * and 14, LAPIC timer 16). The MSI-X pool must skip them.
+ */
+#define GVE_MSIX_MIN_IRQ		17U
+#define GVE_MSIX_MAX_SKIPPED_IRQS	17U
+
+/*
+ * MSI-X IRQ reservation logic (ticket d9cdb2c635).
+ * Reserve want IRQs, skipping platform static IRQs below GVE_MSIX_MIN_IRQ.
+ * Skipped IRQs stay retained in a temporary buffer until the reservation
+ * completes or fails. A first-fit allocator then does not loop on the same
+ * low IRQ.
+ */
+static inline int gve_msix_reserve_irqs(uint16_t *pool, uint32_t want,
+					int (*alloc_fn)(unsigned int *irq, void *arg),
+					void (*free_fn)(unsigned int *irq, void *arg),
+					void *arg)
+{
+	unsigned int skipped[GVE_MSIX_MAX_SKIPPED_IRQS];
+	uint32_t num_skipped = 0U;
+	uint32_t i, j;
+	int rc = 0;
+
+	for (i = 0; i < want; i++) {
+		for (;;) {
+			unsigned int irq = 0U;
+
+			if (alloc_fn(&irq, arg) != 0) {
+				rc = -1;
+				goto out_cleanup;
+			}
+			if (irq >= GVE_MSIX_MIN_IRQ) {
+				pool[i] = (uint16_t)(irq + 1U);
+				break;
+			}
+			if (num_skipped >= GVE_MSIX_MAX_SKIPPED_IRQS) {
+				free_fn(&irq, arg);
+				rc = -1;
+				goto out_cleanup;
+			}
+			skipped[num_skipped++] = irq;
+		}
+	}
+
+out_cleanup:
+	for (j = 0; j < num_skipped; j++)
+		free_fn(&skipped[j], arg);
+
+	if (rc != 0) {
+		for (j = 0; j < i; j++) {
+			unsigned int irq;
+
+			if (pool[j] == 0U)
+				continue;
+			irq = pool[j] - 1U;
+			free_fn(&irq, arg);
+			pool[j] = 0U;
+		}
+	}
+	return rc;
+}
+
+/*
  * Unwind actions for the MSI-X probe error path (ticket 0005e7ce7e).
  * An entry of the IRQ pool stores irq + 1, and 0 means the entry
  * holds nothing. The enable bit lives in the MSI-X capability

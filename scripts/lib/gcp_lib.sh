@@ -12,7 +12,7 @@
 # gcp_teardown.sh
 # Tickets: 1c76a66b26 4a7a2ca6f5 e3effabf78 4347c2a8e6 c16353731a
 # 06ea1706a7 5e6a2acd8a 74936642ce cf185ab6fd afc0a00b06 3a59523e76
-# 0bc13135d7 eec304d8cf 4c76b4d84d a5874d85fe 005b1e7772
+# 0bc13135d7 eec304d8cf 4c76b4d84d a5874d85fe 005b1e7772 ca3a596670
 
 # Directory of this file, the path of the teardown script, and the
 # root of this Fossil checkout. The evidence store step needs the
@@ -95,6 +95,14 @@ ukg_validate_image_name() {
 ukg_run_delete_filter() {
     local id="$1"
     echo "(labels.run=\"${id}\") OR (name ~ \"$(ukg_run_name_regex "${id}")\")"
+}
+
+# Escape special characters in a replacement string for sed s|...|...|g.
+# This function escapes backslashes, ampersands, and delimiter pipes.
+# Ticket ca3a596670.
+# Arg $1: replacement string. Prints the escaped string.
+ukg_escape_sed() {
+    printf '%s' "${1:-}" | sed -e 's/[\\&|]/\\&/g'
 }
 
 # Classify one gcloud storage rm result. An absent object is a
