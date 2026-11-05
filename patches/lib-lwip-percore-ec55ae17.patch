@@ -30,12 +30,18 @@ Description: Per-core lwIP state files required by the main lwIP port patch.
   per-core stack state of the calling core can corrupt the owner's
   pcb lists. Ticket c07f809ed7.
 
+  Foreign-core socket close. A close() from a non-owner core no longer
+  fails with EBADF. The socket lookup now redirects per-core stack state
+  to the owner core during close operations and deferred cleanups.
+  event_callback looks up sockets directly by core id to avoid drops.
+  Ticket c281148005.
+
 diff --git a/include/lwip_percore.h b/include/lwip_percore.h
 new file mode 100644
-index 0000000..eaedcd8
+index 0000000..91137cc
 --- /dev/null
 +++ b/include/lwip_percore.h
-@@ -0,0 +1,233 @@
+@@ -0,0 +1,237 @@
 +/* SPDX-License-Identifier: BSD-3-Clause */
 +/*
 + * Per-core stack state for lwIP in NO_SYS mode.
@@ -192,6 +198,7 @@ index 0000000..eaedcd8
 +} __align(64);
 +
 +extern struct lwip_core_state uk_lwip_core_states[LWIP_CORE_MAX];
++extern struct lwip_core_state *lwip_core_override[LWIP_CORE_MAX];
 +
 +/*
 + * A core id outside uk_lwip_core_states is a configuration error: the
@@ -241,7 +248,10 @@ index 0000000..eaedcd8
 +
 +static inline struct lwip_core_state *lwip_get_core_state(void)
 +{
-+	return &uk_lwip_core_states[lwip_current_core_id()];
++	unsigned int id = lwip_current_core_id();
++	if (unlikely(id < LWIP_CORE_MAX && lwip_core_override[id] != NULL))
++		return lwip_core_override[id];
++	return &uk_lwip_core_states[id];
 +}
 +
 +/*
@@ -467,10 +477,10 @@ index 0000000..88dd298
 + extern "C" {
 diff --git a/patches/0016-per-core-stack-state.patch b/patches/0016-per-core-stack-state.patch
 new file mode 100644
-index 0000000..fdc99e0
+index 0000000..01b491d
 --- /dev/null
 +++ b/patches/0016-per-core-stack-state.patch
-@@ -0,0 +1,733 @@
+@@ -0,0 +1,903 @@
 +--- a/src/include/lwip/priv/tcp_priv.h
 ++++ b/src/include/lwip/priv/tcp_priv.h
 +@@ -323,6 +323,17 @@
@@ -913,7 +923,49 @@ index 0000000..fdc99e0
 + #endif /* LWIP_SOCKET_SELECT || LWIP_SOCKET_POLL */
 + 
 + #define sock_set_errno(sk, e) do { \
-+@@ -417,11 +427,34 @@
++@@ -379,6 +389,21 @@
++  * (e.g. read-while-write or close-while-write, etc)
++  * This function is called at the end of functions using (try)get_socket*().
++  */
+++#if LWIP_PERCORE
+++static inline int
+++lwip_sock_to_core(const struct lwip_sock *sock)
+++{
+++  unsigned int c;
+++  for (c = 0; c < LWIP_CORE_MAX; c++) {
+++    if (sock >= &uk_lwip_core_states[c].sockets[0] &&
+++        sock < &uk_lwip_core_states[c].sockets[NUM_SOCKETS]) {
+++      return (int)c;
+++    }
+++  }
+++  return -1;
+++}
+++#endif
+++
++ static void
++ done_socket(struct lwip_sock *sock)
++ {
++@@ -402,7 +427,19 @@
++   SYS_ARCH_UNPROTECT(lev);
++ 
++   if (freed) {
+++#if LWIP_PERCORE
+++    int owner_core = lwip_sock_to_core(sock);
+++    unsigned int cur_core = lwip_current_core_id();
+++    if (owner_core >= 0 && (unsigned int)owner_core != cur_core && cur_core < LWIP_CORE_MAX) {
+++      lwip_core_override[cur_core] = lwip_get_core_state_by_id((unsigned int)owner_core);
+++    }
+++#endif
++     free_socket_free_elements(is_tcp, conn, &lastdata);
+++#if LWIP_PERCORE
+++    if (cur_core < LWIP_CORE_MAX) {
+++      lwip_core_override[cur_core] = NULL;
+++    }
+++#endif
++   }
++ }
++ 
++@@ -417,11 +454,34 @@
 + tryget_socket_unconn_nouse(int fd)
 + {
 +   int s = fd - LWIP_SOCKET_OFFSET;
@@ -949,7 +1001,44 @@ index 0000000..fdc99e0
 + }
 + 
 + struct lwip_sock *
-+@@ -486,7 +519,11 @@
++@@ -475,6 +535,36 @@
++   return NULL;
++ }
++ 
+++#if LWIP_PERCORE
+++/* Direct per-core socket access by core ID without caller core check */
+++static struct lwip_sock *
+++tryget_socket_core(int fd)
+++{
+++  int s = fd - LWIP_SOCKET_OFFSET;
+++  if (s < 0) {
+++    return NULL;
+++  }
+++  int core = s / NUM_SOCKETS;
+++  int idx = s % NUM_SOCKETS;
+++  if (core >= LWIP_CORE_MAX || idx >= NUM_SOCKETS) {
+++    return NULL;
+++  }
+++  struct lwip_core_state *cs = lwip_get_core_state_by_id((unsigned int)core);
+++  if (!cs) {
+++    return NULL;
+++  }
+++  struct lwip_sock *sock = &cs->sockets[idx];
+++  if (!sock_inc_used(sock)) {
+++    return NULL;
+++  }
+++  if (!sock->conn) {
+++    done_socket(sock);
+++    return NULL;
+++  }
+++  return sock;
+++}
+++#endif
+++
++ /**
++  * Map a externally used socket index to the internal socket representation.
++  *
++@@ -486,7 +576,11 @@
 + {
 +   struct lwip_sock *sock = tryget_socket(fd);
 +   if (!sock) {
@@ -961,7 +1050,7 @@ index 0000000..fdc99e0
 +       LWIP_DEBUGF(SOCKETS_DEBUG, ("get_socket(%d): invalid\n", fd));
 +     }
 +     set_errno(EBADF);
-+@@ -510,6 +547,37 @@
++@@ -510,6 +604,37 @@
 +   SYS_ARCH_DECL_PROTECT(lev);
 +   LWIP_UNUSED_ARG(accepted);
 + 
@@ -999,7 +1088,7 @@ index 0000000..fdc99e0
 +   /* allocate a new socket identifier */
 +   for (i = 0; i < NUM_SOCKETS; ++i) {
 +     /* Protect socket array */
-+@@ -542,6 +610,7 @@
++@@ -542,6 +667,7 @@
 +     SYS_ARCH_UNPROTECT(lev);
 +   }
 +   return -1;
@@ -1007,7 +1096,7 @@ index 0000000..fdc99e0
 + }
 + 
 + /** Free a socket (under lock)
-+@@ -664,8 +733,13 @@
++@@ -664,8 +790,13 @@
 +     done_socket(sock);
 +     return -1;
 +   }
@@ -1021,7 +1110,58 @@ index 0000000..fdc99e0
 + 
 +   /* See event_callback: If data comes in right away after an accept, even
 +    * though the server task might not have created a new socket yet.
-+@@ -1742,7 +1816,11 @@
++@@ -780,14 +911,29 @@
++   struct lwip_sock *sock;
++   int is_tcp = 0;
++   err_t err;
+++#if LWIP_PERCORE
+++  int core = (s >= LWIP_SOCKET_OFFSET) ? (s - LWIP_SOCKET_OFFSET) / NUM_SOCKETS : -1;
+++  unsigned int cur_core = lwip_current_core_id();
+++#endif
++ 
++   LWIP_DEBUGF(SOCKETS_DEBUG, ("lwip_close(%d)\n", s));
++ 
+++#if LWIP_PERCORE
+++  sock = tryget_socket_core(s);
+++#else
++   sock = get_socket(s);
+++#endif
++   if (!sock) {
+++    set_errno(EBADF);
++     return -1;
++   }
++ 
+++#if LWIP_PERCORE
+++  if (core >= 0 && core < LWIP_CORE_MAX && (unsigned int)core != cur_core && cur_core < LWIP_CORE_MAX) {
+++    lwip_core_override[cur_core] = lwip_get_core_state_by_id((unsigned int)core);
+++  }
+++#endif
+++
++   if (sock->conn != NULL) {
++     is_tcp = NETCONNTYPE_GROUP(netconn_type(sock->conn)) == NETCONN_TCP;
++   } else {
++@@ -807,10 +953,20 @@
++   if (err != ERR_OK) {
++     sock_set_errno(sock, err_to_errno(err));
++     done_socket(sock);
+++#if LWIP_PERCORE
+++    if (cur_core < LWIP_CORE_MAX) {
+++      lwip_core_override[cur_core] = NULL;
+++    }
+++#endif
++     return -1;
++   }
++ 
++   free_socket(sock, is_tcp);
+++#if LWIP_PERCORE
+++  if (cur_core < LWIP_CORE_MAX) {
+++    lwip_core_override[cur_core] = NULL;
+++  }
+++#endif
++   set_errno(0);
++   return 0;
++ }
++@@ -1742,7 +1898,11 @@
 +     return -1;
 +   }
 +   conn->socket = i;
@@ -1033,7 +1173,47 @@ index 0000000..fdc99e0
 +   LWIP_DEBUGF(SOCKETS_DEBUG, ("%d\n", i));
 +   set_errno(0);
 +   return i;
-+@@ -2883,6 +2961,9 @@
++@@ -2518,7 +2678,11 @@
++       SYS_ARCH_UNPROTECT(lev);
++     }
++ 
+++#if LWIP_PERCORE
+++    sock = tryget_socket_core(s);
+++#else
++     sock = get_socket(s);
+++#endif
++     if (!sock) {
++       return;
++     }
++@@ -2595,6 +2759,15 @@
++   int last_select_cb_ctr;
++   SYS_ARCH_DECL_PROTECT(lev);
++ #endif /* !LWIP_TCPIP_CORE_LOCKING */
+++#if LWIP_PERCORE
+++  int core = (s >= LWIP_SOCKET_OFFSET) ? (s - LWIP_SOCKET_OFFSET) / NUM_SOCKETS : -1;
+++  unsigned int cur_core = lwip_current_core_id();
+++  int overridden = 0;
+++  if (core >= 0 && core < LWIP_CORE_MAX && (unsigned int)core != cur_core && cur_core < LWIP_CORE_MAX) {
+++    lwip_core_override[cur_core] = lwip_get_core_state_by_id((unsigned int)core);
+++    overridden = 1;
+++  }
+++#endif
++ 
++   LWIP_ASSERT_CORE_LOCKED();
++ 
++@@ -2660,6 +2833,11 @@
++   }
++   SYS_ARCH_UNPROTECT(lev);
++ #endif
+++#if LWIP_PERCORE
+++  if (overridden && cur_core < LWIP_CORE_MAX) {
+++    lwip_core_override[cur_core] = NULL;
+++  }
+++#endif
++ }
++ #endif /* LWIP_SOCKET_SELECT || LWIP_SOCKET_POLL */
++ 
++@@ -2883,6 +3061,9 @@
 +   case SO_KEEPALIVE:
 +     return SOF_KEEPALIVE;
 +   case SO_REUSEADDR:
@@ -1043,7 +1223,7 @@ index 0000000..fdc99e0
 +     return SOF_REUSEADDR;
 +   default:
 +     LWIP_ASSERT("Unknown socket option", 0);
-+@@ -2934,6 +3015,9 @@
++@@ -2934,6 +3115,9 @@
 +         case SO_KEEPALIVE:
 + #if SO_REUSE
 +         case SO_REUSEADDR:
@@ -1053,7 +1233,7 @@ index 0000000..fdc99e0
 + #endif /* SO_REUSE */
 +           if ((optname == SO_BROADCAST) &&
 +               (NETCONNTYPE_GROUP(sock->conn->type) != NETCONN_UDP)) {
-+@@ -3342,6 +3426,9 @@
++@@ -3342,6 +3526,9 @@
 +         case SO_KEEPALIVE:
 + #if SO_REUSE
 +         case SO_REUSEADDR:
@@ -1206,10 +1386,10 @@ index 0000000..fdc99e0
 +    UDP code. */
 diff --git a/percore.c b/percore.c
 new file mode 100644
-index 0000000..f34e5aa
+index 0000000..2914d8e
 --- /dev/null
 +++ b/percore.c
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,72 @@
 +/* SPDX-License-Identifier: BSD-3-Clause */
 +/*
 + * Per-core state storage and initialization for lwIP in NO_SYS mode.
@@ -1223,6 +1403,7 @@ index 0000000..f34e5aa
 +#include "lwip_percore.h"
 +
 +struct lwip_core_state uk_lwip_core_states[LWIP_CORE_MAX];
++struct lwip_core_state *lwip_core_override[LWIP_CORE_MAX];
 +
 +#if defined(__Unikraft__) && defined(CONFIG_UKPLAT_CPU_MAXCOUNT)
 +/*
@@ -1259,6 +1440,8 @@ index 0000000..f34e5aa
 +
 +	if (core_id >= LWIP_CORE_MAX)
 +		return;
++
++	lwip_core_override[core_id] = NULL;
 +
 +	cs = &uk_lwip_core_states[core_id];
 +	memset(cs, 0, sizeof(*cs));

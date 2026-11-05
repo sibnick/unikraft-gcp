@@ -553,20 +553,15 @@ static int gve_dma_map(const void *vaddr, size_t len, uint64_t *dma_out)
 }
 
 /*
- * Read one BAR size with the standard config-space probe: save the
- * BAR, write all ones, read the decode mask, and restore the BAR.
- * Nothing maps or accesses the BAR while it holds the probe value,
- * so the write cannot disturb the running system. Return the size
- * in bytes, decoded by gve_bar_size_from_mask(). Ticket ad4bd33ab8.
+ * Read one BAR size with the atomic config-space probe.
+ * The probe holds pci_conf_lock across the write, read, and restore
+ * sequence. Return the size in bytes, decoded by
+ * gve_bar_size_from_mask(). Ticket ad4bd33ab8, 8e61791e4e.
  */
 static uint64_t gve_bar_size(struct pci_device *pdev, uint32_t bar_off)
 {
-	uint32_t orig = uk_pci_read_config32(&pdev->addr, bar_off);
-	uint32_t mask;
+	uint32_t mask = uk_pci_probe_bar_mask(&pdev->addr, (__u8)bar_off);
 
-	uk_pci_write_config32(&pdev->addr, bar_off, 0xffffffffU);
-	mask = uk_pci_read_config32(&pdev->addr, bar_off);
-	uk_pci_write_config32(&pdev->addr, bar_off, orig);
 	return gve_bar_size_from_mask(mask);
 }
 

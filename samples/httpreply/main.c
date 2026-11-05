@@ -50,6 +50,7 @@
 #include <lwip/ip_addr.h>
 #include <lwip/etharp.h>
 #include "netif/uknetdev.h"
+#include "../common/http_close.h"
 
 #define LISTEN_PORT 80
 #define BACKLOG 512
@@ -527,12 +528,7 @@ int main(int argc, char *argv[])
 						     http_resp_len, 0);
 					}
 
-					if (strstr(buffer,
-						   "Connection: close") !=
-						NULL ||
-					    strstr(buffer,
-						   "connection: close") !=
-						NULL) {
+					if (ukg_http_wants_close(buffer)) {
 						drop_connection(epfd, fd);
 					}
 				} else if (bytes_read == 0 ||

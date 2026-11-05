@@ -7,27 +7,31 @@ sequence private in its own file, so a driver that needs config
 access must repeat raw port I/O. The gVNIC driver carried such a
 private copy for this reason.
 
-Export uk_pci_read_config32, uk_pci_write_config32, and
-uk_pci_read_bar from the x86_64 backend and declare them in
-uk/bus/pci.h. The address build mirrors the CF8 sequence that the
-backend probe already uses. List the three symbols in
-exportsyms.uk. The build demotes every library symbol that is not
-listed there, so drivers in other libraries could not call them
-otherwise. Ticket 040c3378ff.
+Export uk_pci_read_config32, uk_pci_write_config32, uk_pci_read_bar,
+and uk_pci_probe_bar_mask from the x86_64 backend and declare them
+in uk/bus/pci.h. The address build mirrors the CF8 sequence that the
+backend probe already uses. List the four symbols in exportsyms.uk.
+The build demotes every library symbol that is not listed there, so
+drivers in other libraries could not call them otherwise. Ticket
+040c3378ff.
 
 A config access is two port operations: write the address to CF8,
 then access CFC. One core now holds a lock with interrupts off over
 the whole pair, so two cores cannot interleave the steps and hit
 the wrong register. uk_pci_read_bar checks the register offset and
 reads no register past the last BAR. Ticket 8c30628023.
+
+uk_pci_probe_bar_mask performs the write-read-restore probe under
+the config lock. Other cores never see the intermediate all-ones
+value. Ticket 8e61791e4e.
 ---
- drivers/ukbus/pci/arch/x86_64/pci_bus.c | 110 ++++++++++++++++++++++++++++++++
- drivers/ukbus/pci/exportsyms.uk         |   3 +
- drivers/ukbus/pci/include/uk/bus/pci.h  |  53 +++++++++++++++
- 3 files changed, 166 insertions(+)
+ drivers/ukbus/pci/arch/x86_64/pci_bus.c | 129 ++++++++++++++++++++++++++++++++
+ drivers/ukbus/pci/exportsyms.uk         |   4 +
+ drivers/ukbus/pci/include/uk/bus/pci.h  |  71 ++++++++++++++++++
+ 3 files changed, 204 insertions(+)
 
 diff --git a/drivers/ukbus/pci/arch/x86_64/pci_bus.c b/drivers/ukbus/pci/arch/x86_64/pci_bus.c
-index 279e399..6d77f42 100644
+index 279e399..627ee35 100644
 --- a/drivers/ukbus/pci/arch/x86_64/pci_bus.c
 +++ b/drivers/ukbus/pci/arch/x86_64/pci_bus.c
 @@ -54,6 +54,8 @@
@@ -39,7 +43,7 @@ index 279e399..6d77f42 100644
  #include <uk/print.h>
  #include <uk/bus/pci.h>
  
-@@ -240,3 +242,111 @@ int arch_pci_probe(struct uk_alloc *pha)
+@@ -240,3 +242,130 @@ int arch_pci_probe(struct uk_alloc *pha)
  
  	return 0;
  }
@@ -151,20 +155,40 @@ index 279e399..6d77f42 100644
 +
 +	return base;
 +}
++
++__u32 uk_pci_probe_bar_mask(const struct pci_address *addr, __u8 bar_off)
++{
++	unsigned long flags;
++	__u32 orig;
++	__u32 mask;
++
++	if (bar_off < PCI_BASE_ADDRESS_0 || bar_off > PCI_BASE_ADDRESS_5)
++		return 0;
++
++	flags = pci_conf_lock_get();
++	orig = pci_conf_read32(addr, bar_off);
++	pci_conf_write32(addr, bar_off, 0xffffffffU);
++	mask = pci_conf_read32(addr, bar_off);
++	pci_conf_write32(addr, bar_off, orig);
++	pci_conf_lock_put(flags);
++
++	return mask;
++}
 diff --git a/drivers/ukbus/pci/exportsyms.uk b/drivers/ukbus/pci/exportsyms.uk
-index ca0612b..44ebf35 100644
+index ca0612b..e17d1d4 100644
 --- a/drivers/ukbus/pci/exportsyms.uk
 +++ b/drivers/ukbus/pci/exportsyms.uk
-@@ -1 +1,4 @@
+@@ -1 +1,5 @@
  _pci_register_driver
 +uk_pci_read_config32
 +uk_pci_write_config32
 +uk_pci_read_bar
++uk_pci_probe_bar_mask
 diff --git a/drivers/ukbus/pci/include/uk/bus/pci.h b/drivers/ukbus/pci/include/uk/bus/pci.h
-index a38ab91..90e8a82 100644
+index a38ab91..35f0d6a 100644
 --- a/drivers/ukbus/pci/include/uk/bus/pci.h
 +++ b/drivers/ukbus/pci/include/uk/bus/pci.h
-@@ -300,6 +300,59 @@ static struct pci_bus_handler ph __unused;
+@@ -300,6 +300,77 @@ static struct pci_bus_handler ph __unused;
  
  struct pci_driver *pci_find_driver(struct pci_device_id *id);
  
@@ -220,6 +244,24 @@ index a38ab91..90e8a82 100644
 + *  Address Registers also returns 0.
 + */
 +__u64 uk_pci_read_bar(const struct pci_address *addr, __u8 bar);
++
++/**
++ * Probe the decode mask of one Base Address Register.
++ *
++ * Write all ones to the register, read back the mask, and restore
++ * the original value. The function holds the config-space lock with
++ * interrupts off across the whole probe sequence.
++ *
++ * @param addr
++ *  The address of the function on the bus.
++ * @param bar_off
++ *  Byte offset of the register: PCI_BASE_ADDRESS_0 through
++ *  PCI_BASE_ADDRESS_5.
++ * @return
++ *  The 32-bit BAR mask read from configuration space. An offset
++ *  outside the six Base Address Registers returns 0.
++ */
++__u32 uk_pci_probe_bar_mask(const struct pci_address *addr, __u8 bar_off);
 +
  #ifdef __cplusplus
  }
