@@ -14,17 +14,32 @@ backend probe already uses. List the three symbols in
 exportsyms.uk. The build demotes every library symbol that is not
 listed there, so drivers in other libraries could not call them
 otherwise. Ticket 040c3378ff.
+
+A config access is two port operations: write the address to CF8,
+then access CFC. One core now holds a lock with interrupts off over
+the whole pair, so two cores cannot interleave the steps and hit
+the wrong register. uk_pci_read_bar checks the register offset and
+reads no register past the last BAR. Ticket 8c30628023.
 ---
- drivers/ukbus/pci/arch/x86_64/pci_bus.c | 44 +++++++++++++++++++++++++++++
- drivers/ukbus/pci/exportsyms.uk         |  3 ++
- drivers/ukbus/pci/include/uk/bus/pci.h  | 50 +++++++++++++++++++++++++++++++++
- 3 files changed, 97 insertions(+)
+ drivers/ukbus/pci/arch/x86_64/pci_bus.c | 110 ++++++++++++++++++++++++++++++++
+ drivers/ukbus/pci/exportsyms.uk         |   3 +
+ drivers/ukbus/pci/include/uk/bus/pci.h  |  53 +++++++++++++++
+ 3 files changed, 166 insertions(+)
 
 diff --git a/drivers/ukbus/pci/arch/x86_64/pci_bus.c b/drivers/ukbus/pci/arch/x86_64/pci_bus.c
-index 279e399..9146bb3 100644
+index 279e399..6d77f42 100644
 --- a/drivers/ukbus/pci/arch/x86_64/pci_bus.c
 +++ b/drivers/ukbus/pci/arch/x86_64/pci_bus.c
-@@ -240,3 +240,47 @@ int arch_pci_probe(struct uk_alloc *pha)
+@@ -54,6 +54,8 @@
+ #include <string.h>
+ 
+ #include <uk/arch/util.h>
++#include <uk/atomic.h>
++#include <uk/lcpu.h>
+ #include <uk/print.h>
+ #include <uk/bus/pci.h>
+ 
+@@ -240,3 +242,111 @@ int arch_pci_probe(struct uk_alloc *pha)
  
  	return 0;
  }
@@ -43,33 +58,97 @@ index 279e399..9146bb3 100644
 +		| ((__u32)offset & 0xfcU);
 +}
 +
-+__u32 uk_pci_read_config32(const struct pci_address *addr, __u8 offset)
++/*
++ * The CF8/CFC port pair is one global resource. A config access
++ * writes the address to CF8, then reads or writes CFC. On an SMP
++ * guest two cores can interleave the two steps and hit the wrong
++ * register. Such a stray write can destroy a BAR or the MSI-X
++ * control word. One core holds this lock with interrupts off for
++ * the whole pair. Interrupts stay off so a handler on the lock
++ * holder cannot recurse into these accessors and deadlock.
++ * [Ticket 8c30628023]
++ */
++static unsigned int pci_conf_lock;
++
++static unsigned long pci_conf_lock_get(void)
++{
++	unsigned long flags = uk_lcpu_save_irqf();
++	unsigned int exp = 0;
++
++	while (!uk_compare_exchange_n(&pci_conf_lock, &exp, 1u))
++		exp = 0;
++
++	return flags;
++}
++
++static void pci_conf_lock_put(unsigned long flags)
++{
++	uk_exchange_n(&pci_conf_lock, 0u);
++	uk_lcpu_restore_irqf(flags);
++}
++
++/* Config space access helpers. The caller holds the lock. */
++static __u32 pci_conf_read32(const struct pci_address *addr, __u8 offset)
 +{
 +	uk_arch_x86_64_outl(PCI_CONFIG_ADDR, pci_conf_addr(addr, offset));
 +	return uk_arch_x86_64_inl(PCI_CONFIG_DATA);
 +}
 +
-+void uk_pci_write_config32(const struct pci_address *addr, __u8 offset,
-+			   __u32 value)
++static void pci_conf_write32(const struct pci_address *addr, __u8 offset,
++			     __u32 value)
 +{
 +	uk_arch_x86_64_outl(PCI_CONFIG_ADDR, pci_conf_addr(addr, offset));
 +	uk_arch_x86_64_outl(PCI_CONFIG_DATA, value);
 +}
 +
++__u32 uk_pci_read_config32(const struct pci_address *addr, __u8 offset)
++{
++	unsigned long flags;
++	__u32 value;
++
++	flags = pci_conf_lock_get();
++	value = pci_conf_read32(addr, offset);
++	pci_conf_lock_put(flags);
++
++	return value;
++}
++
++void uk_pci_write_config32(const struct pci_address *addr, __u8 offset,
++			   __u32 value)
++{
++	unsigned long flags;
++
++	flags = pci_conf_lock_get();
++	pci_conf_write32(addr, offset, value);
++	pci_conf_lock_put(flags);
++}
++
 +__u64 uk_pci_read_bar(const struct pci_address *addr, __u8 bar)
 +{
++	unsigned long flags;
 +	__u32 low;
 +	__u64 base;
 +
-+	low = uk_pci_read_config32(addr, bar);
-+	if (low & 0x1U) { /* I/O space BAR. The value is a port number. */
-+		return (__u64)(low & ~0x3U);
-+	}
++	if (bar < PCI_BASE_ADDRESS_0 || bar > PCI_BASE_ADDRESS_5)
++		return 0;
 +
-+	base = (__u64)(low & ~0xfU);
-+	if (((low >> 1) & 0x3U) == 0x2U) { /* 64-bit memory BAR */
-+		base |= (__u64)uk_pci_read_config32(addr, bar + 4) << 32;
++	flags = pci_conf_lock_get();
++	low = pci_conf_read32(addr, bar);
++	if (low & 0x1U) { /* I/O space BAR. The value is a port number. */
++		base = (__u64)(low & ~0x3U);
++	} else {
++		base = (__u64)(low & ~0xfU);
++		/* 64-bit memory BAR: the next register holds the high
++		 * half. No register follows the last BAR, so a 64-bit
++		 * type field there is invalid and the high half stays
++		 * zero. [Ticket 8c30628023]
++		 */
++		if (((low >> 1) & 0x3U) == 0x2U &&
++		    bar != PCI_BASE_ADDRESS_5)
++			base |= (__u64)pci_conf_read32(addr, bar + 4) << 32;
 +	}
++	pci_conf_lock_put(flags);
++
 +	return base;
 +}
 diff --git a/drivers/ukbus/pci/exportsyms.uk b/drivers/ukbus/pci/exportsyms.uk
@@ -82,10 +161,10 @@ index ca0612b..44ebf35 100644
 +uk_pci_write_config32
 +uk_pci_read_bar
 diff --git a/drivers/ukbus/pci/include/uk/bus/pci.h b/drivers/ukbus/pci/include/uk/bus/pci.h
-index a38ab91..039d3ca 100644
+index a38ab91..90e8a82 100644
 --- a/drivers/ukbus/pci/include/uk/bus/pci.h
 +++ b/drivers/ukbus/pci/include/uk/bus/pci.h
-@@ -300,6 +300,56 @@ static struct pci_bus_handler ph __unused;
+@@ -300,6 +300,59 @@ static struct pci_bus_handler ph __unused;
  
  struct pci_driver *pci_find_driver(struct pci_device_id *id);
  
@@ -93,7 +172,9 @@ index a38ab91..039d3ca 100644
 + * Configuration space access for x86_64. The implementation uses the
 + * CF8/CFC port pair and lives in
 + * drivers/ukbus/pci/arch/x86_64/pci_bus.c. Drivers must call these
-+ * functions instead of repeating the port I/O sequence.
++ * functions instead of repeating the port I/O sequence. The
++ * implementation holds a lock with interrupts off over the whole
++ * CF8/CFC pair, so calls from several cores are safe.
 + */
 +
 +/**
@@ -135,7 +216,8 @@ index a38ab91..039d3ca 100644
 + * @return
 + *  The decoded address. For an I/O space register this is the port
 + *  number. For a 64-bit memory register the two halves are joined.
-+ *  A disabled register returns 0.
++ *  A disabled register returns 0. An offset outside the six Base
++ *  Address Registers also returns 0.
 + */
 +__u64 uk_pci_read_bar(const struct pci_address *addr, __u8 bar);
 +

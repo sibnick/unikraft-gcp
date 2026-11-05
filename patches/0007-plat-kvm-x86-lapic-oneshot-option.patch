@@ -12,16 +12,21 @@ wake because the one-shot code arrived later, in patch 0003. Ticket
 Add CONFIG_KVM_X86_LAPIC_ONESHOT, default y, and guard the one-shot code and
 the dispatch in tscclock_cpu_block. A single-vCPU image can disable it and
 use the i8254 wake, the path proven on GCP.
+
+Make the option depend on HAVE_SMP, so single-core builds never carry the
+one-shot path. A build that forgets the option cannot hang silently on the
+target platform. Also print one boot warning that names the option, so an
+idle hang on a multicore image is easy to trace. Ticket 9182e9a293.
 ---
- plat/kvm/Config.uk     | 13 +++++++++++++
- plat/kvm/x86/tscclock.c |  6 +++++-
- 2 files changed, 18 insertions(+), 1 deletion(-)
+ plat/kvm/Config.uk      | 19 +++++++++++++++++++
+ plat/kvm/x86/tscclock.c | 13 ++++++++++++-
+ 2 files changed, 31 insertions(+), 1 deletion(-)
 
 diff --git a/plat/kvm/Config.uk b/plat/kvm/Config.uk
-index 34a433a..56fb2b1 100644
+index 34a433a..26f65d3 100644
 --- a/plat/kvm/Config.uk
 +++ b/plat/kvm/Config.uk
-@@ -141,3 +141,16 @@ config KVM_VMM_QEMU_ISA_DEBUG_EXIT
+@@ -141,3 +141,22 @@ config KVM_VMM_QEMU_ISA_DEBUG_EXIT
  	depends on LIBUKPM
  	depends on KVM_VMM_QEMU
  	depends on ARCH_X86_64
@@ -29,17 +34,23 @@ index 34a433a..56fb2b1 100644
 +config KVM_X86_LAPIC_ONESHOT
 +	bool "Per-vCPU LAPIC one-shot CPU idle wake"
 +	depends on ARCH_X86_64
++	depends on HAVE_SMP
 +	default y
 +	help
-+	  Arm the local APIC timer of the calling core to wake a halted
-+	  core. The i8254 fallback reaches only vCPU 0, so keep this
-+	  enabled for multicore images. Single-core images can disable
-+	  it and use the i8254 idle wake. The prepare probe checks that
-+	  the masked one-shot counter runs down. Some hypervisors
-+	  emulate the counter, but do not deliver the timer vector to a
-+	  halted core, and the probe cannot see that case.
++	  Arm the local APIC timer of the calling core to wake a
++	  halted core. Keep this enabled for multicore images. The
++	  i8254 fallback reaches only vCPU 0. Single-core builds do
++	  not offer this option. They always use the i8254 idle
++	  wake, the path proven on Google Cloud. The prepare probe
++	  checks that the masked one-shot counter runs down. Some
++	  hypervisors emulate the counter, but do not deliver the
++	  timer vector to a halted core, and the probe cannot see
++	  that case. One Google Cloud build hung on the first idle
++	  with this wake active. The boot prints one warning that
++	  names this option, so a silent hang is easier to trace.
++	  [Ticket 9182e9a293]
 diff --git a/plat/kvm/x86/tscclock.c b/plat/kvm/x86/tscclock.c
-index e9e3111..091231a 100644
+index e9e3111..02335a2 100644
 --- a/plat/kvm/x86/tscclock.c
 +++ b/plat/kvm/x86/tscclock.c
 @@ -319,6 +319,7 @@ __u64 tscclock_epochoffset(void)
@@ -50,7 +61,21 @@ index e9e3111..091231a 100644
  /*
   * Per-vCPU LAPIC one-shot wake. [Ticket a5b91e7993]
   *
-@@ -529,6 +530,7 @@ static void tscclock_cpu_block_lapic(unsigned int id, __u64 delta_ns)
+@@ -492,6 +493,13 @@ static void tscclock_lapic_prepare(void)
+ 	lapic_ready[id] = 1;
+ 	uk_pr_info("kvm: cpu %u LAPIC one-shot wake ready: %u ticks/us\n",
+ 		   id, (unsigned int)((lapic_mult[id] * 1000ULL) >> 32));
++
++	/* Name the option once at boot. A hypervisor that never
++	 * delivers the timer vector hangs with no other serial
++	 * error. [Ticket 9182e9a293]
++	 */
++	if (uk_pcpuvar_current_get(uk_pcpuvar_cpu_idx) == 0)
++		uk_pr_warn("kvm: LAPIC one-shot wake is on (CONFIG_KVM_X86_LAPIC_ONESHOT=y). A hypervisor that drops the timer vector hangs on the first idle. Set the option to n for such hosts.\n");
+ }
+ 
+ /*
+@@ -529,6 +537,7 @@ static void tscclock_cpu_block_lapic(unsigned int id, __u64 delta_ns)
  
  	uk_lcpu_halt_irq();
  }
@@ -58,7 +83,7 @@ index e9e3111..091231a 100644
  
  /*
   * Returns early if any interrupts are serviced, or if the requested delay is
-@@ -546,7 +548,7 @@ static void tscclock_cpu_block(__u64 until)
+@@ -546,7 +555,7 @@ static void tscclock_cpu_block(__u64 until)
  	__u64 now, delta_ns;
  	__u64 delta_ticks;
  	unsigned int ticks;
@@ -67,7 +92,7 @@ index e9e3111..091231a 100644
  
  	UK_ASSERT(uk_lcpu_irqs_disabled());
  
-@@ -560,6 +562,7 @@ static void tscclock_cpu_block(__u64 until)
+@@ -560,6 +569,7 @@ static void tscclock_cpu_block(__u64 until)
  	 * if it fails, this core keeps the i8254 arm.
  	 * [Ticket a5b91e7993]
  	 */
@@ -75,7 +100,7 @@ index e9e3111..091231a 100644
  	id = uk_pcpuvar_current_get(uk_pcpuvar_cpu_id);
  	if (id < LAPIC_MAX_CPUS) {
  		if (!lapic_tried[id])
-@@ -569,6 +572,7 @@ static void tscclock_cpu_block(__u64 until)
+@@ -569,6 +579,7 @@ static void tscclock_cpu_block(__u64 until)
  			return;
  		}
  	}

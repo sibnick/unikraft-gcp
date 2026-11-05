@@ -1,8 +1,8 @@
 From: Nik <sibnick@gmail.com>
-Subject: [PATCH] plat/kvm/x86: map the local APIC page in the kernel page table
+Subject: [PATCH] plat/kvm/x86: map the local APIC page uncacheable
 
 GRUB may not report the page at the APIC base address in the memory map. With
-CONFIG_PAGING=y the kernel activates a new page table built only from the
+CONFIG_LIBUKPAGING=y the kernel activates a new page table built only from the
 reported memory regions, so the local APIC MMIO page stays unmapped. The
 per-vCPU LAPIC one-shot wake path in tscclock_cpu_block then faults on its
 first MMIO access as soon as the system idles. This hits every paging build
@@ -13,12 +13,18 @@ Register the APIC page as a reserved read-write memory region during platform
 setup, before the paging boot init builds the kernel page table. Read the base
 from the APIC base MSR. Skip the region when the APIC is disabled or in x2APIC
 mode, because x2APIC uses MSRs instead of MMIO.
+
+The paging boot maps regions with protection bits only, so the APIC page
+starts cached. Cacheable MMIO is architecturally undefined for the local APIC.
+After the kernel page table is active, set PCD and PWT on the page with
+uk_paging_page_set_attr. Also fix the print format of the base address. A
+64-bit value needs %llx, not %x. Ticket 96a26ff367.
 ---
- plat/kvm/x86/setup.c | 41 +++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 41 insertions(+)
+ plat/kvm/x86/setup.c | 94 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 94 insertions(+)
 
 diff --git a/plat/kvm/x86/setup.c b/plat/kvm/x86/setup.c
-index ae78e4b..fac5ba8 100644
+index ae78e4b..53dd0fc 100644
 --- a/plat/kvm/x86/setup.c
 +++ b/plat/kvm/x86/setup.c
 @@ -24,6 +24,7 @@
@@ -29,10 +35,34 @@ index ae78e4b..fac5ba8 100644
  
  #if CONFIG_HAVE_SYSCALL
  /* syscall entrance provided by platform library */
-@@ -128,6 +129,43 @@ static void __noreturn ukplat_entry2(void *arg __unused)
+@@ -128,6 +129,89 @@ static void __noreturn ukplat_entry2(void *arg __unused)
  /* At this point we expect that the C runtime is configured and that
   * bootcode has enabled all CPU features used by compiled code.
   */
++/*
++ * Base address of the local APIC MMIO page, or 0 when the APIC is
++ * disabled or in x2APIC mode. x2APIC uses MSRs instead of MMIO.
++ */
++static __u64 lapic_base;
++
++static __u64 ukplat_lapic_mmio_base(void)
++{
++	__u32 lo = 0, hi = 0;
++	__u64 base;
++
++	uk_arch_x86_64_rdmsr(UK_ARCH_X86_64_APIC_MSR_BASE, &lo, &hi);
++	if (!(lo & UK_ARCH_X86_64_APIC_BASE_EN))
++		return 0;
++	if (lo & UK_ARCH_X86_64_APIC_BASE_EXTD)
++		return 0;
++
++	base = ((((__u64)hi << 32) | (__u64)lo) & 0xFFFFF000UL);
++	if (!base)
++		base = 0xFEE00000UL;
++
++	return base;
++}
++
 +/*
 + * Register the local APIC MMIO page as a platform memory region.
 + *
@@ -40,24 +70,18 @@ index ae78e4b..fac5ba8 100644
 + * memory map. The paging boot then leaves it unmapped and the
 + * per-vCPU LAPIC one-shot wake path in tscclock faults on its
 + * first MMIO access. Add the page as a reserved region before the
-+ * paging boot init runs, so the kernel page table maps it. The
-+ * x2APIC mode needs no mapping because it uses MSRs instead of
-+ * MMIO. [Ticket 4ecf9dcedf]
++ * paging boot init runs, so the kernel page table maps it.
++ * [Ticket 4ecf9dcedf]
 + */
 +static void ukplat_add_lapic_region(struct ukplat_bootinfo *bi)
 +{
-+	__u32 lo = 0, hi = 0;
 +	struct ukplat_memregion_desc mrd = {0};
 +
-+	uk_arch_x86_64_rdmsr(UK_ARCH_X86_64_APIC_MSR_BASE, &lo, &hi);
-+	if (!(lo & UK_ARCH_X86_64_APIC_BASE_EN))
-+		return;
-+	if (lo & UK_ARCH_X86_64_APIC_BASE_EXTD)
++	lapic_base = ukplat_lapic_mmio_base();
++	if (!lapic_base)
 +		return;
 +
-+	mrd.pbase = ((((__u64)hi << 32) | (__u64)lo) & 0xFFFFF000UL);
-+	if (!mrd.pbase)
-+		mrd.pbase = 0xFEE00000UL;
++	mrd.pbase = lapic_base;
 +	mrd.vbase = mrd.pbase;
 +	mrd.len = 0x1000;
 +	mrd.type = UKPLAT_MEMRT_RESERVED;
@@ -66,14 +90,42 @@ index ae78e4b..fac5ba8 100644
 +	mrd.pg_count = UK_PAGING_PAGE_COUNT(mrd.pg_off + mrd.len);
 +
 +	if (ukplat_memregion_list_insert(&bi->mrds, &mrd))
-+		uk_pr_warn("kvm: could not register local APIC page 0x%x\n",
-+			   mrd.pbase);
++		uk_pr_warn("kvm: could not register local APIC page 0x%llx\n",
++			   (unsigned long long)mrd.pbase);
 +}
++
++#if CONFIG_LIBUKPAGING
++#include <uk/paging.h>
++
++/*
++ * Map the local APIC page uncacheable. The paging boot maps regions
++ * with protection bits only, so the page starts cached. Cacheable MMIO
++ * is architecturally undefined for the local APIC. Set uncacheable
++ * (PCD and PWT) on the page after the kernel page table is active.
++ * [Ticket 96a26ff367]
++ */
++static void ukplat_map_lapic_uncacheable(void)
++{
++	int rc;
++
++	if (!lapic_base)
++		return;
++
++	rc = uk_paging_page_set_attr(uk_paging_pt_get_active(),
++				     (__vaddr_t)lapic_base, 1,
++				     UK_PAGING_PAGE_ATTR_PROT_RW |
++				     UK_ARCH_X86_64_PAGE_ATTR_WRITECOMBINE,
++				     0);
++	if (rc)
++		uk_pr_warn("kvm: uncacheable remap of APIC page 0x%llx failed: %d\n",
++			   (unsigned long long)lapic_base, rc);
++}
++#endif /* CONFIG_LIBUKPAGING */
 +
  void _ukplat_entry(struct ukplat_bootinfo *bi)
  {
  	void *bstack;
-@@ -138,6 +176,9 @@ void _ukplat_entry(struct ukplat_bootinfo *bi)
+@@ -138,6 +222,9 @@ void _ukplat_entry(struct ukplat_bootinfo *bi)
  	if (unlikely(rc))
  		UK_CRASH("Bootstrap processor init failed: %d\n", rc);
  
@@ -83,3 +135,17 @@ index ae78e4b..fac5ba8 100644
  	/* Execute ealry init */
  	uk_boot_early_init(bi);
  
+@@ -167,6 +254,13 @@ void _ukplat_entry(struct ukplat_bootinfo *bi)
+ 	if (unlikely(rc))
+ 		UK_CRASH("Mem init failed: %d\n", rc);
+ 
++#if CONFIG_LIBUKPAGING
++	/* The kernel page table is active now. Set the APIC page
++	 * uncacheable for the MMIO access rules.
++	 */
++	ukplat_map_lapic_uncacheable();
++#endif /* CONFIG_LIBUKPAGING */
++
+ #ifdef CONFIG_HAVE_SYSCALL
+ 	_init_syscall();
+ #endif /* CONFIG_HAVE_SYSCALL */
