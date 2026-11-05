@@ -28,6 +28,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+#include "../common/seen_src.h"
+
 #if defined(__linux__) && !defined(__Unikraft__)
 #include <sched.h>
 #include <pthread.h>
@@ -410,7 +412,15 @@ int main(int argc, char *argv[])
 	uint64_t tx_packets = 0;
 	uint64_t rx_bytes = 0;
 #if defined(__Unikraft__)
-	uint32_t last_src = 0; /* gateway ARP for each new source */
+	/* Sources that already have a static ARP entry, plus this
+	 * interface's own address and netmask in network byte order.
+	 * Ticket 47ca2a4774. */
+	static struct ukg_seen_src seen_src;
+	uint32_t own_ip = 0;
+	uint32_t own_mask = 0;
+
+	own_ip = netif_ip4_addr(netif_default)->addr;
+	own_mask = netif_ip4_netmask(netif_default)->addr;
 #endif
 
 	while (g_running) {
@@ -432,16 +442,21 @@ int main(int argc, char *argv[])
 		}
 
 #if defined(__Unikraft__)
-		/* Echo needs the GCP static route for this source. The
-		 * benchmark keeps one client, so comparing against the
-		 * last source is enough; a new client re-adds the entry,
-		 * which is idempotent. */
-		if (client_addr.sin_addr.s_addr != last_src) {
+		/* The echo needs a GCP static ARP entry for this
+		 * source. Add one entry per source, not one entry per
+		 * packet. A source outside the run subnet gets no
+		 * entry: the echo to that sender then fails, which is
+		 * the safe result for an unexpected host. A source
+		 * that arrives after the list is full also gets no
+		 * entry. Ticket 47ca2a4774. */
+		if (ukg_src_in_subnet(client_addr.sin_addr.s_addr, own_ip,
+				      own_mask) &&
+		    ukg_seen_src_add(&seen_src,
+				     client_addr.sin_addr.s_addr) == 1) {
 			ip4_addr_t src_ip;
 
 			src_ip.addr = client_addr.sin_addr.s_addr;
 			set_gcp_static_arp(&src_ip);
-			last_src = client_addr.sin_addr.s_addr;
 		}
 #endif
 

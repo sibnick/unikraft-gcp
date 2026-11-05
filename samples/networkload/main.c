@@ -34,10 +34,27 @@
 #include <lwip/etharp.h>
 #include <lwip/inet_chksum.h>
 
+#include "../common/ukarg.h"
+
 #define DEFAULT_PORT 9000
 #define DEFAULT_PKT_COUNT 1000
 #define DEFAULT_PKT_SIZE 1024
 #define NETLOAD_MAGIC 0x554b4731 /* "UKG1" */
+
+/*
+ * Bounds for the command line parameters. Ticket 5d4890b96e.
+ *
+ * NL_MAX_PKT_COUNT: the client keeps one receive bit per packet, so
+ * the count sets the size of that bit map. One million packets need
+ * 128 KiB. The bound also stops (count + 8u) / 8u from wrapping into
+ * a bit map far too small for the run.
+ *
+ * NL_MAX_PKT_SIZE: the UDP payload limit. A larger datagram can never
+ * leave as one datagram. The bound also keeps pkt_size + 128 for the
+ * receive buffer from wrapping.
+ */
+#define NL_MAX_PKT_COUNT 1048576u
+#define NL_MAX_PKT_SIZE 65507u
 
 struct __attribute__((packed)) icmp_echo_hdr {
 	uint8_t type;       /* 8 = echo request, 0 = echo reply */
@@ -638,18 +655,42 @@ int main(int argc, char *argv[])
 	printf("Hello from Unikraft on Google Cloud (Phase A3)!\n");
 	printf("========================================\n");
 
-	/* Parse arguments from kernel command line */
+	/* Parse arguments from kernel command line. Each number goes
+	 * through ukarg_u64 with its own range. A bad value stops the
+	 * run with GATE_FAIL, so it can never size a buffer that is
+	 * too small. Ticket 5d4890b96e. */
 	for (int i = 1; i < argc; i++) {
+		uint64_t num;
+
 		if (strncmp(argv[i], "role=", 5) == 0) {
 			role = argv[i] + 5;
 		} else if (strncmp(argv[i], "peer=", 5) == 0) {
 			peer = argv[i] + 5;
 		} else if (strncmp(argv[i], "port=", 5) == 0) {
-			port = atoi(argv[i] + 5);
+			if (ukarg_u64(argv[i] + 5, 1, 65535, &num) != 0) {
+				printf("GATE_FAIL: bad port=%s need 1..65535\n",
+				       argv[i] + 5);
+				return 1;
+			}
+			port = (int)num;
 		} else if (strncmp(argv[i], "count=", 6) == 0) {
-			count = (uint32_t)atoi(argv[i] + 6);
+			if (ukarg_u64(argv[i] + 6, 1, NL_MAX_PKT_COUNT,
+				      &num) != 0) {
+				printf("GATE_FAIL: bad count=%s need 1..%u\n",
+				       argv[i] + 6, NL_MAX_PKT_COUNT);
+				return 1;
+			}
+			count = (uint32_t)num;
 		} else if (strncmp(argv[i], "size=", 5) == 0) {
-			size = (size_t)atoi(argv[i] + 5);
+			if (ukarg_u64(argv[i] + 5, sizeof(struct netload_pkt),
+				      NL_MAX_PKT_SIZE, &num) != 0) {
+				printf("GATE_FAIL: bad size=%s need %zu..%u\n",
+				       argv[i] + 5,
+				       sizeof(struct netload_pkt),
+				       NL_MAX_PKT_SIZE);
+				return 1;
+			}
+			size = (size_t)num;
 		} else if (strncmp(argv[i], "ip=", 3) == 0) {
 			ip_param = argv[i] + 3;
 		} else if (strncmp(argv[i], "netdev.ip=", 10) == 0) {
