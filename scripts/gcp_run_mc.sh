@@ -58,6 +58,16 @@ CLIENT_MACHINE="${UKG_CLIENT_MACHINE:-e2-standard-2}"
 UBUNTU_FAMILY="${UKG_UBUNTU_FAMILY:-ubuntu-2404-lts-amd64}"
 UBUNTU_PROJECT="${UKG_UBUNTU_PROJECT:-ubuntu-os-cloud}"
 
+# Pinned guest package version. The MC result must compare against C1
+# with the same wrk build, so the client installs this exact version.
+# The default is the Ubuntu 24.04 LTS (noble) release version. Update
+# it together with UKG_UBUNTU_FAMILY, or pass a per-run override. The
+# client prints its installed version to the serial log, so the
+# stored evidence names the exact package. Acquire::Retries keeps a
+# flaky apt mirror from failing the gate after billable time. Ticket
+# 1a21e263ad.
+WRK_VERSION="${UKG_WRK_VERSION:-4.1.0-4build2}"
+
 # wrk sizing. Smoke defaults hit one concurrency level. The full
 # sweep overrides these from the environment.
 WRK_THREADS="${UKG_WRK_THREADS:-2}"
@@ -83,9 +93,9 @@ SRV_LOG="$(ukg_mk_serial_log "${UKG_RUN}-srv")"
 CLI_LOG="$(ukg_mk_serial_log "${UKG_RUN}-cli")"
 COMBINED_LOG="$(ukg_mk_serial_log "${UKG_RUN}")"
 
-LOG_DIR="${UKG_LOG_DIR:-/tmp/opencode}"
-mkdir -p "${LOG_DIR}"
-CLI_SCRIPT="$(mktemp "${LOG_DIR}/${UKG_RUN}-cli-startup-XXXXXX.sh")"
+# Client startup script. The helper places it in the private
+# per-user log directory.
+CLI_SCRIPT="$(ukg_mk_startup_script "${UKG_RUN}" cli)"
 
 # Evidence contract wiring, same as the C1 script.
 UKG_GATE="MC"
@@ -108,6 +118,7 @@ echo "Server:       ${SRV_NAME} (${SRV_IP})"
 echo "Client:       ${CLI_NAME} (${CLI_IP})"
 echo "Subnet:       ${SUBNET}"
 echo "wrk:          -t${WRK_THREADS} -c${WRK_CONNS} -d${WRK_DURATION}s --latency"
+echo "Packages:     wrk=${WRK_VERSION}"
 echo "Logs:         ${SRV_LOG} ${CLI_LOG} ${COMBINED_LOG}"
 echo "=================================================="
 
@@ -146,16 +157,17 @@ if [ "${READY}" != "1" ]; then
     exit 1
 fi
 export DEBIAN_FRONTEND=noninteractive
-if ! apt-get update -qq; then
+if ! apt-get update -qq -o Acquire::Retries=5; then
     echo "GATE_HTTP_BENCH_FAIL: apt-get update failed"
     poweroff
     exit 1
 fi
-if ! apt-get install -y -qq wrk; then
-    echo "GATE_HTTP_BENCH_FAIL: could not install wrk"
+if ! apt-get install -y -qq -o Acquire::Retries=5 "wrk=@@WRK_VERSION@@"; then
+    echo "GATE_HTTP_BENCH_FAIL: could not install pinned wrk=@@WRK_VERSION@@. Set UKG_WRK_VERSION to a version this image offers."
     poweroff
     exit 1
 fi
+dpkg-query -W -f='PKG wrk ${Version}\n' wrk
 echo "WRK_BEGIN"
 wrk -t@@THREADS@@ -c@@CONNS@@ -d@@DURATION@@s --latency "http://${TARGET}:${PORT}/" 2>&1 | tee /tmp/wrk-report.txt
 echo "WRK_END"
@@ -228,6 +240,7 @@ sed -i \
     -e "s|@@THREADS@@|${WRK_THREADS}|g" \
     -e "s|@@CONNS@@|${WRK_CONNS}|g" \
     -e "s|@@DURATION@@|${WRK_DURATION}|g" \
+    -e "s|@@WRK_VERSION@@|${WRK_VERSION}|g" \
     "${CLI_SCRIPT}"
 
 # 3. Internal firewall rule: TCP on the benchmark port and ICMP for

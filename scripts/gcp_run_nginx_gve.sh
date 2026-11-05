@@ -88,6 +88,16 @@ CLIENT_MACHINE="${UKG_CLIENT_MACHINE:-e2-small}"
 UBUNTU_FAMILY="${UKG_UBUNTU_FAMILY:-ubuntu-2404-lts-amd64}"
 UBUNTU_PROJECT="${UKG_UBUNTU_PROJECT:-ubuntu-os-cloud}"
 
+# Pinned guest package version for the smoke client. The install
+# branch runs only when the image ships no curl, so pinning never
+# fights a preinstalled newer curl. The default is the Ubuntu 24.04
+# LTS (noble) release version. Update it together with
+# UKG_UBUNTU_FAMILY, or pass a per-run override. The client prints
+# the installed version to the serial log, so the stored evidence
+# names the exact package. Acquire::Retries keeps a flaky apt mirror
+# from failing the gate after billable time. Ticket 1a21e263ad.
+CURL_VERSION="${UKG_CURL_VERSION:-8.5.0-2ubuntu10}"
+
 SRV_NAME="${UKG_RUN}-srv"
 CLI_NAME="${UKG_RUN}-cli"
 SRV_IMG="${UKG_RUN}-srv-img"
@@ -109,10 +119,9 @@ CLI_LOG="$(ukg_mk_serial_log "${UKG_RUN}-cli")"
 COMBINED_LOG="$(ukg_mk_serial_log "${UKG_RUN}")"
 
 # Client startup script, rendered below and passed through instance
-# metadata.
-LOG_DIR="${UKG_LOG_DIR:-/tmp/opencode}"
-mkdir -p "${LOG_DIR}"
-CLI_SCRIPT="$(mktemp "${LOG_DIR}/${UKG_RUN}-cli-startup-XXXXXX.sh")"
+# metadata. The helper places it in the private per-user log
+# directory.
+CLI_SCRIPT="$(ukg_mk_startup_script "${UKG_RUN}" cli)"
 
 # Evidence contract wiring, same as the other run scripts.
 UKG_GATE="GVE_MSIX"
@@ -133,6 +142,7 @@ echo "Run ID:       ${UKG_RUN}"
 echo "Server:       ${SRV_NAME} (${SRV_IP}) image: ${SRV_IMG}"
 echo "Client:       ${CLI_NAME} (${CLI_IP})"
 echo "Subnet:       ${SUBNET}"
+echo "Packages:     curl=${CURL_VERSION}"
 echo "Logs:         ${SRV_LOG} ${CLI_LOG} ${COMBINED_LOG}"
 echo "=================================================="
 
@@ -193,12 +203,14 @@ if [ "${READY}" != "1" ]; then
 fi
 if ! command -v curl >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
-    if ! apt-get update -qq || ! apt-get install -y -qq curl; then
-        echo "GATE_NGINX_SMOKE_FAIL: could not install curl"
+    if ! apt-get update -qq -o Acquire::Retries=5 ||
+       ! apt-get install -y -qq -o Acquire::Retries=5 "curl=@@CURL_VERSION@@"; then
+        echo "GATE_NGINX_SMOKE_FAIL: could not install pinned curl=@@CURL_VERSION@@. Set UKG_CURL_VERSION to a version this image offers."
         poweroff
         exit 1
     fi
 fi
+dpkg-query -W -f='PKG curl ${Version}\n' curl
 STATUS1="$(curl -sS -m 10 -o /tmp/ukg-body-1 -w '%{http_code}' "http://${TARGET}:${PORT}/" 2>/dev/null || echo 000)"
 echo "NGINX_SMOKE_RESULT status=${STATUS1}"
 echo "NGINX_BODY_BEGIN"
@@ -222,6 +234,7 @@ sed -i \
     -e "s|@@RUN@@|${UKG_RUN}|g" \
     -e "s|@@TARGET@@|${SRV_IP}|g" \
     -e "s|@@MARKER@@|${SMOKE_MARKER}|g" \
+    -e "s|@@CURL_VERSION@@|${CURL_VERSION}|g" \
     "${CLI_SCRIPT}"
 
 # 3. Internal firewall rule. Open only what the gate needs: TCP 80 for

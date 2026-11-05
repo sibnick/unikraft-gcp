@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # Host test for the gate and naming helpers in scripts/lib/gcp_lib.sh.
 # Covers tickets 74936642ce (run-id name boundary), 5e6a2acd8a
-# (run-scoped image names), and 06ea1706a7 (failure markers veto
-# gate passes). No Fossil and no Google Cloud calls happen.
+# (run-scoped image names), 06ea1706a7 (failure markers veto
+# gate passes), and 005b1e7772 (private log directory). No Fossil and
+# no Google Cloud calls happen.
 # The UKG_* variables are inputs to the library functions. ShellCheck
 # cannot see that use, so the unused warnings do not apply here.
 # shellcheck disable=SC2034
@@ -450,6 +451,67 @@ if ukg_wrk_ok "${WORK}/wrk_empty.log"; then
 else
     ok "wrk verdict vetoes an empty report"
 fi
+
+# 9. Private log directory helpers. The default base directory is
+# per user, mode 700, and owned by the caller. The helpers refuse a
+# base directory that group or other could read. Ticket 005b1e7772.
+FAKE_HOME="${WORK}/fakehome"
+FAKE_STATE="${WORK}/fakestate"
+mkdir -p "${FAKE_HOME}" "${FAKE_STATE}"
+got="$( (HOME="${FAKE_HOME}"; unset XDG_STATE_HOME UKG_LOG_DIR; ukg_log_dir 2>&1) )"
+if [ "${got}" = "${FAKE_HOME}/.local/state/ukg" ]; then
+    ok "log dir default sits under HOME"
+else
+    bad "log dir default sits under HOME (got: ${got})"
+fi
+if [ -d "${FAKE_HOME}/.local/state/ukg" ] &&
+   [ "$(stat -c '%a' "${FAKE_HOME}/.local/state/ukg")" = "700" ] &&
+   [ "$(stat -c '%u' "${FAKE_HOME}/.local/state/ukg")" = "$(id -u)" ]; then
+    ok "log dir default is mode 700 and owned by the caller"
+else
+    bad "log dir default is mode 700 and owned by the caller"
+fi
+got="$( (HOME="${FAKE_HOME}"; XDG_STATE_HOME="${FAKE_STATE}";
+         unset UKG_LOG_DIR; ukg_log_dir 2>&1) )"
+if [ "${got}" = "${FAKE_STATE}/ukg" ]; then
+    ok "XDG_STATE_HOME overrides the HOME default"
+else
+    bad "XDG_STATE_HOME overrides the HOME default (got: ${got})"
+fi
+got="$( (UKG_LOG_DIR="${WORK}/custom-logs"; unset HOME XDG_STATE_HOME;
+         ukg_log_dir 2>&1) )"
+if [ "${got}" = "${WORK}/custom-logs" ] &&
+   [ "$(stat -c '%a' "${WORK}/custom-logs")" = "700" ]; then
+    ok "UKG_LOG_DIR overrides the base directory"
+else
+    bad "UKG_LOG_DIR overrides the base directory (got: ${got})"
+fi
+OPEN_DIR="${WORK}/open-share"
+mkdir -m 755 "${OPEN_DIR}"
+( UKG_LOG_DIR="${OPEN_DIR}"; ukg_log_dir ) >/dev/null 2>&1 &&
+    bad "log dir refuses an open base directory" ||
+    ok "log dir refuses an open base directory"
+got="$( (UKG_LOG_DIR="${WORK}/custom-logs"; ukg_mk_serial_log ukg-x 2>&1) )"
+case "${got}" in
+    "${WORK}/custom-logs/ukg-x-serial-"*.log)
+        if [ -f "${got}" ] && [ "$(stat -c '%a' "${got}")" = "600" ]; then
+            ok "serial log path is private with mode 600"
+        else
+            bad "serial log path is private with mode 600 (file: ${got})"
+        fi ;;
+    *) bad "serial log path is private with mode 600 (got: ${got})" ;;
+esac
+got="$( (UKG_LOG_DIR="${WORK}/custom-logs";
+         ukg_mk_startup_script ukg-x cli 2>&1) )"
+case "${got}" in
+    "${WORK}/custom-logs/ukg-x-cli-startup-"*.sh)
+        if [ -f "${got}" ] && [ "$(stat -c '%a' "${got}")" = "600" ]; then
+            ok "startup script path is private with mode 600"
+        else
+            bad "startup script path is private with mode 600 (file: ${got})"
+        fi ;;
+    *) bad "startup script path is private with mode 600 (got: ${got})" ;;
+esac
 
 echo ""
 echo "test_gate_logic: ${PASS_COUNT} passed, ${FAIL_COUNT} failed"
