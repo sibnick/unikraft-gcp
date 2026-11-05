@@ -7,12 +7,35 @@ Description: Per-core lwIP state files required by the main lwIP port patch.
   byte-identical from Unikraft-ENA samples at lib-lwip ec55ae17.
   Ticket da7e090342.
 
+  Hardening on this pin. A core id at or above LWIP_CORE_MAX now stops
+  the kernel with a clear message instead of silently sharing core 0
+  state, and lwip_get_core_state_by_id() returns NULL for a bad id.
+  Per-core mode with SMP but without CONFIG_LIBUKPCPUVAR fails at
+  compile time. Ticket 9a44f9e225.
+
+  Memp hardening. A compile-time check ties MEMP_MAX to LWIP_MEMP_MAX.
+  A pool lookup miss no longer falls back to pool 0. Every core gets
+  an even private split, the remainder goes to a lock-guarded shared
+  reserve, and pools smaller than the core count live in that reserve
+  entirely. Ticket de29b056ef.
+
+  Shared state hardening. The nested patch 0016 moves the lwIP source
+  port counter, the TCP ISS base, and the udp and raw pcb lists into
+  per-core state, gives each core its own port slice, and makes the
+  three netif mutators assert the boot-core-only contract. LWIP_SNMP
+  with per-core mode now fails at compile time. Ticket 7582e2ea37.
+
+  Cross-core socket use. A socket fd opened on one core and used on
+  another core now fails with EBADF at the socket lookup, before any
+  per-core stack state of the calling core can corrupt the owner's
+  pcb lists. Ticket c07f809ed7.
+
 diff --git a/include/lwip_percore.h b/include/lwip_percore.h
 new file mode 100644
-index 0000000..41951d3
+index 0000000..eaedcd8
 --- /dev/null
 +++ b/include/lwip_percore.h
-@@ -0,0 +1,170 @@
+@@ -0,0 +1,233 @@
 +/* SPDX-License-Identifier: BSD-3-Clause */
 +/*
 + * Per-core stack state for lwIP in NO_SYS mode.
@@ -65,11 +88,36 @@ index 0000000..41951d3
 +#define LWIP_MEMP_MAX 32
 +#endif
 +
++/*
++ * Per-core mode needs the per-CPU variable library. Without it,
++ * lwip_current_core_id() returns 0 on every core, so all cores share
++ * core 0 state. Fail at compile time instead.
++ * Ticket 9a44f9e225.
++ */
++#if LWIP_PERCORE && defined(CONFIG_HAVE_SMP) && \
++	(!defined(CONFIG_LIBUKPCPUVAR) || !CONFIG_LIBUKPCPUVAR)
++#error "lwIP per-core mode requires CONFIG_LIBUKPCPUVAR"
++#endif
++
++UK_CTASSERT(LWIP_CORE_MAX > 0);
++
++/*
++ * The SNMP mib code walks the global udp_pcbs list. Per-core mode moves
++ * that list into per-core state, so the code cannot compile against it.
++ * This port keeps LWIP_SNMP off everywhere. Fail loudly if a
++ * configuration turns it on. Ticket 7582e2ea37.
++ */
++#if LWIP_PERCORE && LWIP_SNMP
++#error "lwIP per-core mode does not support LWIP_SNMP"
++#endif
++
 +struct tcp_pcb;
 +struct tcp_pcb_listen;
 +struct memp;
 +struct lwip_select_cb;
 +struct etharp_q_entry;
++struct udp_pcb;
++struct raw_pcb;
 +
 +#ifndef TCP_LISTEN_PCBS_T_DEFINED
 +#define TCP_LISTEN_PCBS_T_DEFINED
@@ -114,6 +162,18 @@ index 0000000..41951d3
 +	u32_t current_timeout_due_time;
 +	int tcpip_tcp_timer_active;
 +
++	/* TCP source port and ISS allocation. Each core keeps its own
++	 * counter, so two cores cannot pick the same local port.
++	 * Ticket 7582e2ea37. */
++	u16_t tcp_port;
++	u32_t tcp_iss;
++
++	/* UDP source port, UDP pcb list base, and RAW pcb list base.
++	 * Same reason as above. Ticket 7582e2ea37. */
++	u16_t udp_port;
++	struct udp_pcb *udp_pcbs;
++	struct raw_pcb *raw_pcbs;
++
 +	/* Memory pool free list heads */
 +	struct memp *memp_tabs[LWIP_MEMP_MAX];
 +
@@ -133,6 +193,22 @@ index 0000000..41951d3
 +
 +extern struct lwip_core_state uk_lwip_core_states[LWIP_CORE_MAX];
 +
++/*
++ * A core id outside uk_lwip_core_states is a configuration error: the
++ * booting CPU count is above LWIP_CORE_MAX. Sharing core 0 state would
++ * corrupt the pcb lists and the memp pools. Report the core id and
++ * stop. Ticket 9a44f9e225.
++ */
++#if defined(__Unikraft__)
++void lwip_core_id_overflow(unsigned int id);
++#else
++static inline void lwip_core_id_overflow(unsigned int id)
++{
++	(void)id;
++	for (;;) { }
++}
++#endif
++
 +#if !defined(__Unikraft__)
 +extern __thread unsigned int lwip_test_core_id;
 +static inline void lwip_set_current_core_id(unsigned int id)
@@ -146,15 +222,19 @@ index 0000000..41951d3
 +#if defined(__Unikraft__)
 +#if defined(CONFIG_LIBUKPCPUVAR) && CONFIG_LIBUKPCPUVAR
 +	unsigned int id = (unsigned int)uk_pcpuvar_current_get(uk_pcpuvar_cpu_idx);
-+	if (unlikely(id >= LWIP_CORE_MAX))
-+		return 0;
++	if (unlikely(id >= LWIP_CORE_MAX)) {
++		lwip_core_id_overflow(id);
++		return 0; /* not reached: the call above stops the core */
++	}
 +	return id;
 +#else
 +	return 0;
 +#endif
 +#else
-+	if (lwip_test_core_id >= LWIP_CORE_MAX)
-+		return 0;
++	if (unlikely(lwip_test_core_id >= LWIP_CORE_MAX)) {
++		lwip_core_id_overflow(lwip_test_core_id);
++		return 0; /* not reached: the call above stops the core */
++	}
 +	return lwip_test_core_id;
 +#endif
 +}
@@ -164,10 +244,16 @@ index 0000000..41951d3
 +	return &uk_lwip_core_states[lwip_current_core_id()];
 +}
 +
++/*
++ * Return the state of one core, or NULL when the id is outside the
++ * table. Earlier code returned core 0 state instead. That let a bad
++ * core id read and write another core's data with no lock. Callers
++ * must check for NULL. Ticket 9a44f9e225.
++ */
 +static inline struct lwip_core_state *lwip_get_core_state_by_id(unsigned int core_id)
 +{
 +	if (unlikely(core_id >= LWIP_CORE_MAX))
-+		return &uk_lwip_core_states[0];
++		return NULL;
 +	return &uk_lwip_core_states[core_id];
 +}
 +
@@ -381,10 +467,10 @@ index 0000000..88dd298
 + extern "C" {
 diff --git a/patches/0016-per-core-stack-state.patch b/patches/0016-per-core-stack-state.patch
 new file mode 100644
-index 0000000..56a790d
+index 0000000..fdc99e0
 --- /dev/null
 +++ b/patches/0016-per-core-stack-state.patch
-@@ -0,0 +1,411 @@
+@@ -0,0 +1,726 @@
 +--- a/src/include/lwip/priv/tcp_priv.h
 ++++ b/src/include/lwip/priv/tcp_priv.h
 +@@ -323,6 +323,17 @@
@@ -421,8 +507,20 @@ index 0000000..56a790d
 +    1) Every TCP PCB that is not CLOSED is in one of the lists.
 +--- a/src/core/tcp.c
 ++++ b/src/core/tcp.c
-+@@ -159,7 +159,9 @@
++@@ -156,10 +156,21 @@
++ };
++ 
++ /* last local TCP port */
+++#if LWIP_PERCORE
+++/* One counter per core. tcp_new_port() allocates inside the core's own
+++ * slice of the range, so two cores cannot pick the same local port.
+++ * Ticket 7582e2ea37. */
+++#include "lwip_percore.h"
+++#define tcp_port (lwip_get_core_state()->tcp_port)
+++UK_CTASSERT((TCP_LOCAL_PORT_RANGE_END - TCP_LOCAL_PORT_RANGE_START) >= LWIP_CORE_MAX);
+++#else
 + static u16_t tcp_port = TCP_LOCAL_PORT_RANGE_START;
+++#endif
 + 
 + /* Incremented every coarse grained timer shot (typically every 500 ms). */
 ++#if !LWIP_PERCORE
@@ -431,7 +529,7 @@ index 0000000..56a790d
 + static const u8_t tcp_backoff[13] =
 + { 1, 2, 3, 4, 5, 6, 7, 7, 7, 7, 7, 7, 7};
 + /* Times per slowtmr hits */
-+@@ -167,6 +169,7 @@
++@@ -167,6 +178,7 @@
 + 
 + /* The TCP PCB lists. */
 + 
@@ -439,7 +537,7 @@ index 0000000..56a790d
 + /** List of all TCP PCBs bound but not yet (connected || listening) */
 + struct tcp_pcb *tcp_bound_pcbs;
 + /** List of all TCP PCBs in LISTEN state */
-+@@ -187,6 +190,10 @@
++@@ -187,6 +199,10 @@
 + /** Timer counter to handle calling slow-timer from tcp_tmr() */
 + static u8_t tcp_timer;
 + static u8_t tcp_timer_ctr;
@@ -450,6 +548,67 @@ index 0000000..56a790d
 + static u16_t tcp_new_port(void);
 + 
 + static err_t tcp_close_shutdown_fin(struct tcp_pcb *pcb);
++@@ -1016,10 +1032,30 @@
++   struct tcp_pcb *pcb;
++ 
++ again:
+++#if LWIP_PERCORE
+++  {
+++    u32_t slice = (u32_t)(TCP_LOCAL_PORT_RANGE_END -
+++                          TCP_LOCAL_PORT_RANGE_START) / LWIP_CORE_MAX;
+++    u16_t base = (u16_t)(TCP_LOCAL_PORT_RANGE_START +
+++                         lwip_current_core_id() * slice);
+++    u16_t end = (u16_t)(base + slice);
+++
+++    /* Seed the counter once, inside this core's slice. tcp_init() may
+++     * have stored a value outside the slice. */
+++    if (tcp_port < base || tcp_port >= end) {
+++      tcp_port = (u16_t)(base + (LWIP_RAND() % slice));
+++    }
+++    tcp_port++;
+++    if (tcp_port >= end) {
+++      tcp_port = base;
+++    }
+++  }
+++#else
++   tcp_port++;
++   if (tcp_port == TCP_LOCAL_PORT_RANGE_END) {
++     tcp_port = TCP_LOCAL_PORT_RANGE_START;
++   }
+++#endif
++   /* Check all PCB lists. */
++   for (i = 0; i < NUM_TCP_PCB_LISTS; i++) {
++     for (pcb = *tcp_pcb_lists[i]; pcb != NULL; pcb = pcb->next) {
++@@ -2222,6 +2258,21 @@
++   LWIP_ASSERT("tcp_next_iss: invalid pcb", pcb != NULL);
++   return LWIP_HOOK_TCP_ISN(&pcb->local_ip, pcb->local_port, &pcb->remote_ip, pcb->remote_port);
++ #else /* LWIP_HOOK_TCP_ISN */
+++#if LWIP_PERCORE
+++  u32_t *iss = &lwip_get_core_state()->tcp_iss;
+++
+++  LWIP_ASSERT("tcp_next_iss: invalid pcb", pcb != NULL);
+++  LWIP_UNUSED_ARG(pcb);
+++
+++  if (*iss == 0) {
+++    /* First call on this core. Each core starts at a different point in
+++     * the sequence space, so two cores never share an ISS stream.
+++     * Ticket 7582e2ea37. */
+++    *iss = 6510u + 0x9e3779b9u * (u32_t)(lwip_current_core_id() + 1);
+++  }
+++  *iss += tcp_ticks;       /* XXX */
+++  return *iss;
+++#else
++   static u32_t iss = 6510;
++ 
++   LWIP_ASSERT("tcp_next_iss: invalid pcb", pcb != NULL);
++@@ -2229,6 +2280,7 @@
++ 
++   iss += tcp_ticks;       /* XXX */
++   return iss;
+++#endif /* LWIP_PERCORE */
++ #endif /* LWIP_HOOK_TCP_ISN */
++ }
++ 
 +--- a/src/core/tcp_in.c
 ++++ b/src/core/tcp_in.c
 +@@ -85,7 +85,9 @@
@@ -523,12 +682,31 @@ index 0000000..56a790d
 +     the cache (even if this means removing an active entry or so). */
 +--- a/src/core/memp.c
 ++++ b/src/core/memp.c
-+@@ -75,6 +75,19 @@
++@@ -75,6 +75,52 @@
 + #include "lwip/ip6_frag.h"
 + #include "lwip/mld6.h"
 + 
 ++#if LWIP_PERCORE
 ++#include "lwip_percore.h"
+++#include <uk/arch/spinlock.h>
+++
+++/* cs->memp_tabs has one slot per pool type. A larger MEMP_MAX would
+++   write past the array. Fail at compile time. Ticket de29b056ef. */
+++UK_CTASSERT(MEMP_MAX <= LWIP_MEMP_MAX);
+++
+++/* Shared reserve per pool, guarded by a per-pool spinlock. A core
+++   with an empty private list takes from here. Pools smaller than the
+++   core count live here entirely, so no core starts with zero
+++   elements. Ticket de29b056ef. */
+++static struct memp *memp_shared[MEMP_MAX];
+++static __spinlock memp_shared_lock[MEMP_MAX] = {
+++  [0 ... MEMP_MAX - 1] = UKARCH_SPINLOCK_INITIALIZER()
+++};
+++static u8_t memp_shared_only[MEMP_MAX];
+++
+++/* Return the pool index, or MEMP_MAX when the desc is not a known
+++   pool. The old code returned 0 then, so a lookup miss silently used
+++   the wrong pool. Ticket de29b056ef. */
 ++static inline memp_t memp_get_pool_type(const struct memp_desc *desc)
 ++{
 ++  memp_t i;
@@ -536,14 +714,28 @@ index 0000000..56a790d
 ++    if (memp_pools[i] == desc)
 ++      return i;
 ++  }
-++  return 0;
+++  return MEMP_MAX;
+++}
+++
+++/* Pop one element from the shared reserve of one pool. */
+++static struct memp *
+++memp_shared_take(memp_t type)
+++{
+++  struct memp *m;
+++  ukarch_spin_lock(&memp_shared_lock[type]);
+++  m = memp_shared[type];
+++  if (m != NULL) {
+++    memp_shared[type] = m->next;
+++  }
+++  ukarch_spin_unlock(&memp_shared_lock[type]);
+++  return m;
 ++}
 ++#endif
 ++
 + #define LWIP_MEMPOOL(name,num,size,desc) LWIP_MEMPOOL_DECLARE(name,num,size,desc)
 + #include "lwip/priv/memp_std.h"
 + 
-+@@ -177,6 +190,34 @@
++@@ -177,6 +223,62 @@
 + #if MEMP_MEM_MALLOC
 +   LWIP_UNUSED_ARG(desc);
 + #else
@@ -557,14 +749,31 @@ index 0000000..56a790d
 ++                            + MEM_SANITY_REGION_AFTER_ALIGNED
 ++#endif
 ++                           );
-++  u16_t count_per_core = total / LWIP_CORE_MAX;
-++  u16_t rem = total % LWIP_CORE_MAX;
+++  u16_t count_per_core;
+++  u16_t rem;
+++
+++  /* A desc outside memp_pools is a caller bug. Stop with a clear
+++     message instead of writing to slot 0. Ticket de29b056ef. */
+++  UK_ASSERT(type < MEMP_MAX);
+++  if (unlikely(type >= MEMP_MAX)) {
+++    LWIP_DEBUGF(MEMP_DEBUG | LWIP_DBG_LEVEL_SERIOUS, ("memp_init_pool: unknown pool %s\n", desc->desc));
+++    return;
+++  }
+++
+++  /* A pool with fewer elements than cores cannot give every core a
+++     private element. Put the whole pool into the shared reserve for
+++     that case. Otherwise split evenly and keep the remainder in the
+++     reserve, so no element is lost. Ticket de29b056ef. */
+++  memp_shared_only[type] = (total < LWIP_CORE_MAX) ? 1 : 0;
+++  count_per_core = memp_shared_only[type] ? 0 : (u16_t)(total / LWIP_CORE_MAX);
+++  rem = (u16_t)(total - count_per_core * LWIP_CORE_MAX);
+++
+++  memp_shared[type] = NULL;
 ++
 ++  for (c = 0; c < LWIP_CORE_MAX; c++) {
 ++    struct lwip_core_state *cs = lwip_get_core_state_by_id(c);
-++    u16_t n = count_per_core + (c < rem ? 1 : 0);
 ++    cs->memp_tabs[type] = NULL;
-++    for (i = 0; i < n; ++i) {
+++    for (i = 0; i < count_per_core; ++i) {
 ++      struct memp *m = (struct memp *)(void *)curr;
 ++      m->next = cs->memp_tabs[type];
 ++      cs->memp_tabs[type] = m;
@@ -574,11 +783,22 @@ index 0000000..56a790d
 ++      curr += elem_size;
 ++    }
 ++  }
+++  /* Elements the even split did not place go to the shared
+++     reserve. */
+++  for (i = 0; i < rem; ++i) {
+++    struct memp *m = (struct memp *)(void *)curr;
+++    m->next = memp_shared[type];
+++    memp_shared[type] = m;
+++#if MEMP_OVERFLOW_CHECK
+++    memp_overflow_init_element(m, desc);
+++#endif
+++    curr += elem_size;
+++  }
 ++#else
 +   int i;
 +   struct memp *memp;
 + 
-+@@ -204,6 +245,7 @@
++@@ -204,6 +306,7 @@
 + #endif
 +                                   );
 +   }
@@ -586,41 +806,75 @@ index 0000000..56a790d
 + #if MEMP_STATS
 +   desc->stats->avail = desc->num;
 + #endif /* MEMP_STATS */
-+@@ -250,7 +292,12 @@
++@@ -250,7 +353,28 @@
 +   struct memp *memp;
 +   SYS_ARCH_DECL_PROTECT(old_level);
 + 
 +-#if MEMP_MEM_MALLOC
 ++#if LWIP_PERCORE
 ++  memp_t type = memp_get_pool_type(desc);
-++  struct lwip_core_state *cs = lwip_get_core_state();
+++  struct lwip_core_state *cs;
+++
+++  /* Same guard as memp_init_pool: never touch slot 0 of the wrong
+++     pool. Ticket de29b056ef. */
+++  UK_ASSERT(type < MEMP_MAX);
+++  if (unlikely(type >= MEMP_MAX)) {
+++    LWIP_DEBUGF(MEMP_DEBUG | LWIP_DBG_LEVEL_SERIOUS, ("memp_malloc: unknown pool %s\n", desc->desc));
+++    return NULL;
+++  }
+++  cs = lwip_get_core_state();
 ++  SYS_ARCH_PROTECT(old_level);
 ++  memp = cs->memp_tabs[type];
+++  if (memp != NULL) {
+++    cs->memp_tabs[type] = memp->next;
+++  } else {
+++    /* Private list empty: take from the shared reserve before
+++       reporting an error. Ticket de29b056ef. */
+++    memp = memp_shared_take(type);
+++  }
 ++#elif MEMP_MEM_MALLOC
 +   memp = (struct memp *)mem_malloc(MEMP_SIZE + MEMP_ALIGN_SIZE(desc->size));
 +   SYS_ARCH_PROTECT(old_level);
 + #else /* MEMP_MEM_MALLOC */
-+@@ -265,7 +312,11 @@
++@@ -265,7 +389,10 @@
 +     memp_overflow_check_element(memp, desc);
 + #endif /* MEMP_OVERFLOW_CHECK */
 + 
-++#if LWIP_PERCORE
-++    cs->memp_tabs[type] = memp->next;
-++#else
+++#if !LWIP_PERCORE
+++    /* The per-core path already popped the element above. */
 +     *desc->tab = memp->next;
 ++#endif
 + #if MEMP_OVERFLOW_CHECK
 +     memp->next = NULL;
 + #endif /* MEMP_OVERFLOW_CHECK */
-+@@ -382,8 +433,15 @@
++@@ -382,8 +509,34 @@
 +   SYS_ARCH_UNPROTECT(old_level);
 +   mem_free(memp);
 + #else /* MEMP_MEM_MALLOC */
 ++#if LWIP_PERCORE
 ++  memp_t type = memp_get_pool_type(desc);
-++  struct lwip_core_state *cs = lwip_get_core_state();
-++  memp->next = cs->memp_tabs[type];
-++  cs->memp_tabs[type] = memp;
+++
+++  /* Same guard as memp_init_pool. Ticket de29b056ef. */
+++  UK_ASSERT(type < MEMP_MAX);
+++  if (unlikely(type >= MEMP_MAX)) {
+++    SYS_ARCH_UNPROTECT(old_level);
+++    LWIP_DEBUGF(MEMP_DEBUG | LWIP_DBG_LEVEL_SERIOUS, ("memp_free: unknown pool %s\n", desc->desc));
+++    return;
+++  }
+++  if (memp_shared_only[type]) {
+++    /* Whole pool is shared: return the element to the shared
+++       reserve so every core can reach it again. Ticket de29b056ef. */
+++    ukarch_spin_lock(&memp_shared_lock[type]);
+++    memp->next = memp_shared[type];
+++    memp_shared[type] = memp;
+++    ukarch_spin_unlock(&memp_shared_lock[type]);
+++  } else {
+++    /* Elements from the shared reserve join the private list of the
+++       freeing core. The pool total is conserved. */
+++    struct lwip_core_state *cs = lwip_get_core_state();
+++    memp->next = cs->memp_tabs[type];
+++    cs->memp_tabs[type] = memp;
+++  }
 ++#else
 +   memp->next = *desc->tab;
 +   *desc->tab = memp;
@@ -644,7 +898,8 @@ index 0000000..56a790d
 + 
 + #if LWIP_SOCKET_SELECT || LWIP_SOCKET_POLL
 + #if LWIP_TCPIP_CORE_LOCKING
-+@@ -278,7 +284,11 @@
++@@ -277,10 +283,14 @@
++ #define LWIP_SOCKET_SELECT_UNPROTECT(lev)     SYS_ARCH_UNPROTECT(lev)
 + /** This counter is increased from lwip_select when the list is changed
 +     and checked in select_check_waiters to see if it has changed. */
 ++#if !LWIP_PERCORE
@@ -656,7 +911,9 @@ index 0000000..56a790d
 + static struct lwip_select_cb *select_cb_list;
 ++#endif
 + #endif /* LWIP_SOCKET_SELECT || LWIP_SOCKET_POLL */
-+@@ -417,11 +425,24 @@
++ 
++ #define sock_set_errno(sk, e) do { \
++@@ -417,11 +427,34 @@
 + tryget_socket_unconn_nouse(int fd)
 + {
 +   int s = fd - LWIP_SOCKET_OFFSET;
@@ -671,6 +928,16 @@ index 0000000..56a790d
 ++    LWIP_DEBUGF(SOCKETS_DEBUG, ("tryget_socket_unconn(%d): invalid\n", fd));
 ++    return NULL;
 ++  }
+++  if (core != (int)lwip_current_core_id()) {
+++    /* This fd belongs to another core. Every stack call that follows
+++     * this lookup uses the per-core state of the calling core: the pcb
+++     * lists, the memp pools, the select list. Running it on the owner's
+++     * socket would corrupt the owner's lists. Fail with EBADF instead.
+++     * Ticket c07f809ed7. */
+++    LWIP_DEBUGF(SOCKETS_DEBUG, ("tryget_socket_unconn(%d): wrong core\n", fd));
+++    set_errno(EBADF);
+++    return NULL;
+++  }
 ++  return &lwip_get_core_state_by_id(core)->sockets[idx];
 ++#else
 ++  if (s >= NUM_SOCKETS) {
@@ -682,7 +949,7 @@ index 0000000..56a790d
 + }
 + 
 + struct lwip_sock *
-+@@ -486,7 +507,11 @@
++@@ -486,7 +519,11 @@
 + {
 +   struct lwip_sock *sock = tryget_socket(fd);
 +   if (!sock) {
@@ -694,7 +961,7 @@ index 0000000..56a790d
 +       LWIP_DEBUGF(SOCKETS_DEBUG, ("get_socket(%d): invalid\n", fd));
 +     }
 +     set_errno(EBADF);
-+@@ -510,6 +535,37 @@
++@@ -510,6 +547,37 @@
 +   SYS_ARCH_DECL_PROTECT(lev);
 +   LWIP_UNUSED_ARG(accepted);
 + 
@@ -732,7 +999,7 @@ index 0000000..56a790d
 +   /* allocate a new socket identifier */
 +   for (i = 0; i < NUM_SOCKETS; ++i) {
 +     /* Protect socket array */
-+@@ -542,6 +598,7 @@
++@@ -542,6 +610,7 @@
 +     SYS_ARCH_UNPROTECT(lev);
 +   }
 +   return -1;
@@ -740,7 +1007,7 @@ index 0000000..56a790d
 + }
 + 
 + /** Free a socket (under lock)
-+@@ -664,8 +721,13 @@
++@@ -664,8 +733,13 @@
 +     done_socket(sock);
 +     return -1;
 +   }
@@ -754,7 +1021,7 @@ index 0000000..56a790d
 + 
 +   /* See event_callback: If data comes in right away after an accept, even
 +    * though the server task might not have created a new socket yet.
-+@@ -1742,7 +1804,11 @@
++@@ -1742,7 +1816,11 @@
 +     return -1;
 +   }
 +   conn->socket = i;
@@ -766,7 +1033,7 @@ index 0000000..56a790d
 +   LWIP_DEBUGF(SOCKETS_DEBUG, ("%d\n", i));
 +   set_errno(0);
 +   return i;
-+@@ -2883,6 +2949,9 @@
++@@ -2883,6 +2961,9 @@
 +   case SO_KEEPALIVE:
 +     return SOF_KEEPALIVE;
 +   case SO_REUSEADDR:
@@ -776,7 +1043,7 @@ index 0000000..56a790d
 +     return SOF_REUSEADDR;
 +   default:
 +     LWIP_ASSERT("Unknown socket option", 0);
-+@@ -2934,6 +3003,9 @@
++@@ -2934,6 +3015,9 @@
 +         case SO_KEEPALIVE:
 + #if SO_REUSE
 +         case SO_REUSEADDR:
@@ -786,7 +1053,7 @@ index 0000000..56a790d
 + #endif /* SO_REUSE */
 +           if ((optname == SO_BROADCAST) &&
 +               (NETCONNTYPE_GROUP(sock->conn->type) != NETCONN_UDP)) {
-+@@ -3342,6 +3414,9 @@
++@@ -3342,6 +3426,9 @@
 +         case SO_KEEPALIVE:
 + #if SO_REUSE
 +         case SO_REUSEADDR:
@@ -796,12 +1063,146 @@ index 0000000..56a790d
 + #endif /* SO_REUSE */
 +           if ((optname == SO_BROADCAST) &&
 +               (NETCONNTYPE_GROUP(sock->conn->type) != NETCONN_UDP)) {
++--- a/src/core/udp.c
+++++ b/src/core/udp.c
++@@ -74,11 +74,22 @@
++ #endif
++ 
++ /* last local UDP port */
+++#if LWIP_PERCORE
+++/* One counter and one pcb list base per core. udp_new_port() allocates
+++ * inside the core's own slice of the range. The list base is private
+++ * because every walker on this port is a same-core caller: udp_input,
+++ * udp_connect/udp_bind/udp_disconnect, the per-core timers, and the
+++ * per-core memp and mem stats. Ticket 7582e2ea37. */
+++#include "lwip_percore.h"
+++#define udp_port  (lwip_get_core_state()->udp_port)
+++#define udp_pcbs  (lwip_get_core_state()->udp_pcbs)
+++#else
++ static u16_t udp_port = UDP_LOCAL_PORT_RANGE_START;
++ 
++ /* The list of UDP PCBs */
++ /* exported in udp.h (was static) */
++ struct udp_pcb *udp_pcbs;
+++#endif
++ 
++ /**
++  * Initialize this module.
++@@ -103,9 +114,29 @@
++   struct udp_pcb *pcb;
++ 
++ again:
+++#if LWIP_PERCORE
+++  {
+++    u32_t slice = (u32_t)(UDP_LOCAL_PORT_RANGE_END -
+++                          UDP_LOCAL_PORT_RANGE_START) / LWIP_CORE_MAX;
+++    u16_t base = (u16_t)(UDP_LOCAL_PORT_RANGE_START +
+++                         lwip_current_core_id() * slice);
+++    u16_t end = (u16_t)(base + slice);
+++
+++    /* Seed the counter once, inside this core's slice. udp_init() may
+++     * have stored a value outside the slice. */
+++    if (udp_port < base || udp_port >= end) {
+++      udp_port = (u16_t)(base + (LWIP_RAND() % slice));
+++    }
+++    udp_port++;
+++    if (udp_port >= end) {
+++      udp_port = base;
+++    }
+++  }
+++#else
++   if (udp_port++ == UDP_LOCAL_PORT_RANGE_END) {
++     udp_port = UDP_LOCAL_PORT_RANGE_START;
++   }
+++#endif
++   /* Check all PCBs. */
++   for (pcb = udp_pcbs; pcb != NULL; pcb = pcb->next) {
++     if (pcb->local_port == udp_port) {
++--- a/src/core/raw.c
+++++ b/src/core/raw.c
++@@ -63,7 +63,16 @@
++ #include <string.h>
++ 
++ /** The list of RAW PCBs */
+++#if LWIP_PERCORE
+++/* Per-core list base. Every walker in raw.c is a same-core caller:
+++ * raw_input, raw_new/bind/connect/disconnect, and raw_remove. The raw
+++ * module has no port allocator, so it needs no port slice.
+++ * Ticket 7582e2ea37. */
+++#include "lwip_percore.h"
+++#define raw_pcbs  (lwip_get_core_state()->raw_pcbs)
+++#else
++ static struct raw_pcb *raw_pcbs;
+++#endif
++ 
++ static u8_t
++ raw_input_local_match(struct raw_pcb *pcb, u8_t broadcast)
++--- a/src/core/netif.c
+++++ b/src/core/netif.c
++@@ -74,6 +74,21 @@
++ 
++ #include "netif/ethernet.h"
++ 
+++#if LWIP_PERCORE
+++/*
+++ * The netif list is global to all cores. This port keeps it that way on
+++ * purpose. Management code owns it: the app adds and removes netifs on
+++ * the boot core before it starts worker cores, and the periodic etharp
+++ * timer runs on core 0 only. The three mutators below assert that
+++ * contract. Full per-core netif ownership is a redesign, tracked on
+++ * ticket 7582e2ea37.
+++ */
+++#include <uk/assert.h>
+++#define NETIF_BOOTSIDE_ASSERT() UK_ASSERT(lwip_current_core_id() == 0)
+++#else /* !LWIP_PERCORE */
+++#define NETIF_BOOTSIDE_ASSERT()
+++#endif /* !LWIP_PERCORE */
+++
++ #if LWIP_AUTOIP
++ #include "lwip/autoip.h"
++ #endif /* LWIP_AUTOIP */
++@@ -284,6 +299,7 @@
++ #endif
++ 
++   LWIP_ASSERT_CORE_LOCKED();
+++  NETIF_BOOTSIDE_ASSERT();
++ 
++ #if LWIP_SINGLE_NETIF
++   if (netif_default != NULL) {
++@@ -744,6 +760,7 @@
++ #endif
++ 
++   LWIP_ASSERT_CORE_LOCKED();
+++  NETIF_BOOTSIDE_ASSERT();
++ 
++   if (netif == NULL) {
++     return;
++@@ -825,6 +842,7 @@
++ netif_set_default(struct netif *netif)
++ {
++   LWIP_ASSERT_CORE_LOCKED();
+++  NETIF_BOOTSIDE_ASSERT();
++ 
++   if (netif == NULL) {
++     /* remove default route */
++--- a/src/include/lwip/udp.h
+++++ b/src/include/lwip/udp.h
++@@ -112,7 +112,9 @@
++   void *recv_arg;
++ };
++ /* udp_pcbs export for external reference (e.g. SNMP agent) */
+++#if !LWIP_PERCORE
++ extern struct udp_pcb *udp_pcbs;
+++#endif
++ 
++ /* The following functions is the application layer interface to the
++    UDP code. */
 diff --git a/percore.c b/percore.c
 new file mode 100644
-index 0000000..f25e847
+index 0000000..f34e5aa
 --- /dev/null
 +++ b/percore.c
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,68 @@
 +/* SPDX-License-Identifier: BSD-3-Clause */
 +/*
 + * Per-core state storage and initialization for lwIP in NO_SYS mode.
@@ -809,9 +1210,36 @@ index 0000000..f25e847
 +
 +#include <uk/config.h>
 +#include <string.h>
++#include <uk/assert.h>
++#include <uk/print.h>
 +#include "lwip_percore.h"
 +
 +struct lwip_core_state uk_lwip_core_states[LWIP_CORE_MAX];
++
++#if defined(__Unikraft__) && defined(CONFIG_UKPLAT_CPU_MAXCOUNT)
++/*
++ * The platform numbers CPUs below CONFIG_UKPLAT_CPU_MAXCOUNT. The
++ * state table must cover every slot the platform can hand out, or a
++ * valid CPU id would fall outside uk_lwip_core_states.
++ * Ticket 9a44f9e225.
++ */
++UK_CTASSERT(LWIP_CORE_MAX >= CONFIG_UKPLAT_CPU_MAXCOUNT);
++#endif
++
++/*
++ * A core reached lwIP with an id above LWIP_CORE_MAX. Continuing here
++ * would let the core use core 0 state while core 0 runs at the same
++ * time. Stop the machine instead: the next line names the bad id and
++ * the fix. Ticket 9a44f9e225.
++ */
++void lwip_core_id_overflow(unsigned int id)
++{
++	uk_pr_crit("lwip: core id %u above LWIP_CORE_MAX %u: boot with at most %u CPUs or raise CONFIG_UKPLAT_CPU_MAXCOUNT\n",
++		   id, (unsigned int)LWIP_CORE_MAX,
++		   (unsigned int)LWIP_CORE_MAX);
++	UK_ASSERT(0);
++	for (;;) { }
++}
 +
 +#if !defined(__Unikraft__)
 +__thread unsigned int lwip_test_core_id = 0;
@@ -839,4 +1267,7 @@ index 0000000..f25e847
 +
 +	for (i = 0; i < LWIP_CORE_MAX; i++)
 +		lwip_core_state_init(i);
++
++	uk_pr_info("lwip: per-core state ready (%u core slots)\n",
++		   (unsigned int)LWIP_CORE_MAX);
 +}
