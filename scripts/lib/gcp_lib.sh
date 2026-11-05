@@ -223,24 +223,24 @@ ukg_log_dir() {
 # Print a fresh private path for a serial console log file. The base
 # directory comes from ukg_log_dir, so the path is unpredictable and
 # other users cannot reach it. mktemp also refuses to follow planted
-# symlinks. Ticket 005b1e7772.
+# symlinks. Tickets 005b1e7772 and 23023b62d4.
 # Arg $1: name prefix, usually the run id.
 ukg_mk_serial_log() {
     local dir
-    dir="$(ukg_log_dir)"
+    dir="$(ukg_log_dir)" || return 1
     mktemp "${dir}/${1}-serial-XXXXXX.log"
 }
 
 # Print a fresh private path for a rendered guest startup script.
 # Startup scripts can carry project and instance data, so they share
 # the private base directory with the serial logs. One helper
-# replaces the duplicated LOG_DIR blocks in the run scripts. Ticket
-# 005b1e7772.
+# replaces the duplicated LOG_DIR blocks in the run scripts. Tickets
+# 005b1e7772 and 23023b62d4.
 # Arg $1: name prefix, usually the run id. Arg $2: role word, for
 # example cli or srv.
 ukg_mk_startup_script() {
     local dir
-    dir="$(ukg_log_dir)"
+    dir="$(ukg_log_dir)" || return 1
     mktemp "${dir}/${1}-${2}-startup-XXXXXX.sh"
 }
 

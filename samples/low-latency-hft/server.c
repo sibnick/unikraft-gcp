@@ -29,6 +29,7 @@
 #include <arpa/inet.h>
 
 #include "../common/seen_src.h"
+#include "../common/ukarg.h"
 
 #if defined(__linux__) && !defined(__Unikraft__)
 #include <sched.h>
@@ -86,6 +87,18 @@ const char *inet_ntop(int af, const void *src, char *dst, socklen_t size)
 #define DEFAULT_BIND_IP "0.0.0.0"
 #define BUFFER_SIZE 65536
 #define SOCKET_BUFFER_SIZE (4 * 1024 * 1024)
+
+/*
+ * MAX_CORE_ID: the highest CPU id the glibc cpuset type holds. A
+ * larger id makes CPU_SET write past the end of that type.
+ */
+#ifndef MAX_CORE_ID
+#if defined(CPU_SETSIZE)
+#define MAX_CORE_ID (CPU_SETSIZE - 1)
+#else
+#define MAX_CORE_ID 1023U
+#endif
+#endif
 
 #if !defined(__Unikraft__)
 static volatile sig_atomic_t g_running = 1;
@@ -233,14 +246,22 @@ static int bring_up_netif(int argc, char *argv[])
 
 		if (slash) {
 			size_t len = (size_t)(slash - ip_param);
-			int bits;
+			char bits_buf[8] = {0};
+			const char *bits_end =
+				(colon && colon > slash) ? colon :
+				slash + 1 + strlen(slash + 1);
+			size_t bits_len = (size_t)(bits_end - (slash + 1));
+			uint64_t bits;
 
 			if (len < sizeof(ip_buf)) {
 				strncpy(ip_buf, ip_param, len);
 				ip_buf[len] = '\0';
 			}
-			bits = atoi(slash + 1);
-			if (bits > 0 && bits <= 32) {
+			if (bits_len < sizeof(bits_buf)) {
+				memcpy(bits_buf, slash + 1, bits_len);
+				bits_buf[bits_len] = '\0';
+			}
+			if (ukarg_u64(bits_buf, 1, 32, &bits) == 0) {
 				uint32_t mask_val =
 					htonl(~((1ULL << (32 - bits)) - 1));
 				my_mask.addr = mask_val;
@@ -302,20 +323,33 @@ int main(int argc, char *argv[])
 	while ((opt = getopt_long(argc, argv, "p:b:c:vh", long_options,
 				  NULL)) != -1) {
 		switch (opt) {
-		case 'p':
-			port = atoi(optarg);
-			if (port <= 0 || port > 65535) {
-				fprintf(stderr, "Error: Invalid port %s\n",
+		case 'p': {
+			uint64_t p;
+
+			if (ukarg_u64(optarg, 1, 65535, &p) != 0) {
+				fprintf(stderr,
+					"Error: Port must be 1..65535: '%s'\n",
 					optarg);
 				return EXIT_FAILURE;
 			}
+			port = (int)p;
 			break;
+		}
 		case 'b':
 			bind_ip = optarg;
 			break;
-		case 'c':
-			pin_core = atoi(optarg);
+		case 'c': {
+			uint64_t core;
+
+			if (ukarg_u64(optarg, 0, MAX_CORE_ID, &core) != 0) {
+				fprintf(stderr,
+					"Error: Core id must be 0..%u: '%s'\n",
+					(unsigned int)MAX_CORE_ID, optarg);
+				return EXIT_FAILURE;
+			}
+			pin_core = (int)core;
 			break;
+		}
 		case 'v':
 			verbose = true;
 			break;
@@ -339,6 +373,8 @@ int main(int argc, char *argv[])
 				pin_core);
 		}
 	}
+#else
+	(void)pin_core;
 #endif
 
 #if defined(__Unikraft__)
@@ -414,13 +450,15 @@ int main(int argc, char *argv[])
 #if defined(__Unikraft__)
 	/* Sources that already have a static ARP entry, plus this
 	 * interface's own address and netmask in network byte order.
-	 * Ticket 47ca2a4774. */
+	 * Tickets 47ca2a4774 and b5d3be2bd8. */
 	static struct ukg_seen_src seen_src;
 	uint32_t own_ip = 0;
 	uint32_t own_mask = 0;
 
-	own_ip = netif_ip4_addr(netif_default)->addr;
-	own_mask = netif_ip4_netmask(netif_default)->addr;
+	if (netif_default) {
+		own_ip = netif_ip4_addr(netif_default)->addr;
+		own_mask = netif_ip4_netmask(netif_default)->addr;
+	}
 #endif
 
 	while (g_running) {
@@ -445,18 +483,40 @@ int main(int argc, char *argv[])
 		/* The echo needs a GCP static ARP entry for this
 		 * source. Add one entry per source, not one entry per
 		 * packet. A source outside the run subnet gets no
-		 * entry: the echo to that sender then fails, which is
+		 * entry. The echo to that sender then fails. This is
 		 * the safe result for an unexpected host. A source
 		 * that arrives after the list is full also gets no
-		 * entry. Ticket 47ca2a4774. */
-		if (ukg_src_in_subnet(client_addr.sin_addr.s_addr, own_ip,
-				      own_mask) &&
-		    ukg_seen_src_add(&seen_src,
-				     client_addr.sin_addr.s_addr) == 1) {
-			ip4_addr_t src_ip;
+		 * entry. Tickets 47ca2a4774 and b5d3be2bd8. */
+		if (own_ip == 0 && netif_default) {
+			own_ip = netif_ip4_addr(netif_default)->addr;
+			own_mask = netif_ip4_netmask(netif_default)->addr;
+		}
 
-			src_ip.addr = client_addr.sin_addr.s_addr;
-			set_gcp_static_arp(&src_ip);
+		if (ukg_src_in_subnet(client_addr.sin_addr.s_addr, own_ip,
+				      own_mask)) {
+			int add_rc = ukg_seen_src_add(&seen_src,
+						     client_addr.sin_addr.s_addr);
+			if (add_rc == 1) {
+				ip4_addr_t src_ip;
+
+				src_ip.addr = client_addr.sin_addr.s_addr;
+				set_gcp_static_arp(&src_ip);
+			} else if (add_rc == -1) {
+				static bool warned_full = false;
+
+				if (!warned_full) {
+					warned_full = true;
+					printf("Warning: Seen-source list is full (%u entries), ignoring new sources\n",
+					       UKG_SEEN_SRC_MAX);
+				}
+			}
+		} else if (verbose) {
+			char client_str[INET_ADDRSTRLEN];
+
+			inet_ntop(AF_INET, &client_addr.sin_addr, client_str,
+				  sizeof(client_str));
+			printf("Warning: Source %s outside subnet, ignoring\n",
+			       client_str);
 		}
 #endif
 

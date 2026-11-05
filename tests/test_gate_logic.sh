@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # Host test for the gate and naming helpers in scripts/lib/gcp_lib.sh.
 # Covers tickets 74936642ce (run-id name boundary), 5e6a2acd8a
-# (run-scoped image names), 06ea1706a7 (failure markers veto
-# gate passes), and 005b1e7772 (private log directory). No Fossil and
-# no Google Cloud calls happen.
+# (run-scoped image names), and 06ea1706a7 (failure markers veto
+# gate passes). Also covers 005b1e7772 (private log directory)
+# and 23023b62d4 (stop mk helpers on log dir failure). No Fossil
+# and no Google Cloud calls happen.
 # The UKG_* variables are inputs to the library functions. ShellCheck
 # cannot see that use, so the unused warnings do not apply here.
 # shellcheck disable=SC2034
@@ -454,7 +455,8 @@ fi
 
 # 9. Private log directory helpers. The default base directory is
 # per user, mode 700, and owned by the caller. The helpers refuse a
-# base directory that group or other could read. Ticket 005b1e7772.
+# base directory that group or other could read. Tickets 005b1e7772
+# and 23023b62d4.
 FAKE_HOME="${WORK}/fakehome"
 FAKE_STATE="${WORK}/fakestate"
 mkdir -p "${FAKE_HOME}" "${FAKE_STATE}"
@@ -491,6 +493,12 @@ mkdir -m 755 "${OPEN_DIR}"
 ( UKG_LOG_DIR="${OPEN_DIR}"; ukg_log_dir ) >/dev/null 2>&1 &&
     bad "log dir refuses an open base directory" ||
     ok "log dir refuses an open base directory"
+( UKG_LOG_DIR="${OPEN_DIR}"; ukg_mk_serial_log ukg-x ) >/dev/null 2>&1 &&
+    bad "ukg_mk_serial_log refuses an open base directory" ||
+    ok "ukg_mk_serial_log refuses an open base directory"
+( UKG_LOG_DIR="${OPEN_DIR}"; ukg_mk_startup_script ukg-x cli ) >/dev/null 2>&1 &&
+    bad "ukg_mk_startup_script refuses an open base directory" ||
+    ok "ukg_mk_startup_script refuses an open base directory"
 got="$( (UKG_LOG_DIR="${WORK}/custom-logs"; ukg_mk_serial_log ukg-x 2>&1) )"
 case "${got}" in
     "${WORK}/custom-logs/ukg-x-serial-"*.log)

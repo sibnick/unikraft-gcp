@@ -28,7 +28,7 @@ index 1623228..5ae6dcf 100644
  
  UK_BOOT_EARLYTAB_ENTRY(boot_acpi_init, UK_ACPI_INIT_PRIO);
 diff --git a/drivers/firmware/ukacpi/arch/x86_64/madt.c b/drivers/firmware/ukacpi/arch/x86_64/madt.c
-index 4883a75..7c19898 100644
+index 4883a75..b409dc9 100644
 --- a/drivers/firmware/ukacpi/arch/x86_64/madt.c
 +++ b/drivers/firmware/ukacpi/arch/x86_64/madt.c
 @@ -10,6 +10,7 @@
@@ -39,7 +39,7 @@ index 4883a75..7c19898 100644
  #include <uk/assert.h>
  #include <uk/pcpuvar.h>
  #include <uk/print.h>
-@@ -20,9 +21,20 @@
+@@ -20,9 +21,65 @@
  #include <uk/plat/common/bootinfo.h>
  #endif /* CONFIG_LIBUKBOOT */
  
@@ -49,6 +49,51 @@ index 4883a75..7c19898 100644
 + * from CONFIG_UKPLAT_CPU_MAXCOUNT. [Ticket 9a037affad]
 + */
 +unsigned int uk_acpi_present_cpu_count = CONFIG_UKPLAT_CPU_MAXCOUNT;
++
++static unsigned int madt_detect_cpuid_cpu_count(void)
++{
++	__u32 a = 0, b = 0, c = 0, d = 0;
++	unsigned int max_leaf;
++	unsigned int count = 0;
++
++	uk_arch_x86_64_cpuid(0, 0, &a, &b, &c, &d);
++	max_leaf = a;
++
++	if (max_leaf >= 0x1f) {
++		unsigned int sub = 0;
++
++		while (1) {
++			uk_arch_x86_64_cpuid(0x1f, sub, &a, &b, &c, &d);
++			if (((c >> 8) & 0xff) == 0)
++				break;
++			count = b & 0xffff;
++			sub++;
++		}
++	}
++
++	if (!count && max_leaf >= 0xb) {
++		unsigned int sub = 0;
++
++		while (1) {
++			uk_arch_x86_64_cpuid(0xb, sub, &a, &b, &c, &d);
++			if (((c >> 8) & 0xff) == 0)
++				break;
++			count = b & 0xffff;
++			sub++;
++		}
++	}
++
++	if (!count && max_leaf >= 1) {
++		uk_arch_x86_64_cpuid(1, 0, &a, &b, &c, &d);
++		if (d & (1u << 28))
++			count = (b >> 16) & 0xff;
++	}
++
++	if (!count)
++		count = 1;
++
++	return count;
++}
 +
  int uk_acpi_madt_fill_cpu_idmap(void)
  {
@@ -61,24 +106,37 @@ index 4883a75..7c19898 100644
  	union {
  		struct uk_acpi_madt_x2apic *x2apic;
  		struct uk_acpi_madt_lapic *lapic;
-@@ -38,7 +50,23 @@ int uk_acpi_madt_fill_cpu_idmap(void)
+@@ -38,7 +95,36 @@ int uk_acpi_madt_fill_cpu_idmap(void)
  
  	/* Enumerate all other CPUs */
  	madt = uk_acpi_get_madt();
 -	UK_ASSERT(madt);
 +	if (unlikely(!madt)) {
 +		/*
-+		 * UEFI boot loaders (for example GRUB in EFI mode) do not
-+		 * publish the legacy ACPI RSDP. Without a RSDP there is no
-+		 * MADT. On KVM-style hypervisors the local APIC IDs are
-+		 * 0..N-1, so fall back to an identity CPU id map.
-+		 * [Ticket 3dc1f3f6b6]
++		 * UEFI boot loaders (such as GRUB in EFI mode) do not
++		 * publish the legacy ACPI RSDP. Without a RSDP there is
++		 * no MADT. Query the CPU count via CPUID leaves 0x1f,
++		 * 0xb, or 0x1. Clamp the count to CONFIG_UKPLAT_CPU_MAXCOUNT.
++		 * On KVM hypervisors APIC IDs are contiguous. Set up an
++		 * identity map for present CPUs. [Ticket b1326f22d2]
 +		 */
-+		uk_pr_warn("No MADT present: using identity CPU id map\n");
++		unsigned int cpu_cnt = madt_detect_cpuid_cpu_count();
++		unsigned int cur_idx = 1;
 +
-+		for (idx = 1; idx < CONFIG_UKPLAT_CPU_MAXCOUNT; idx++) {
-+			uk_pcpuvar_lval(idx, uk_pcpuvar_cpu_id) = idx;
-+			uk_pcpuvar_lval(idx, uk_pcpuvar_cpu_idx) = idx;
++		if (cpu_cnt > CONFIG_UKPLAT_CPU_MAXCOUNT)
++			cpu_cnt = CONFIG_UKPLAT_CPU_MAXCOUNT;
++
++		uk_acpi_present_cpu_count = cpu_cnt;
++
++		uk_pr_warn("No MADT present: detected %u CPU(s) via CPUID; using identity CPU id map\n",
++			   cpu_cnt);
++
++		for (__u64 apic_id = 0; apic_id < cpu_cnt && cur_idx < cpu_cnt; apic_id++) {
++			if (apic_id == bsp_cpu_id)
++				continue;
++			uk_pcpuvar_lval(cur_idx, uk_pcpuvar_cpu_id) = apic_id;
++			uk_pcpuvar_lval(cur_idx, uk_pcpuvar_cpu_idx) = cur_idx;
++			cur_idx++;
 +		}
 +
 +		return 0;
@@ -86,7 +144,7 @@ index 4883a75..7c19898 100644
  
  	len = madt->hdr.tab_len - sizeof(*madt);
  	idx = 1;
-@@ -80,12 +108,17 @@ int uk_acpi_madt_fill_cpu_idmap(void)
+@@ -80,7 +166,7 @@ int uk_acpi_madt_fill_cpu_idmap(void)
  
  		/* Ignore cores that exceed max configured value */
  		if (unlikely(idx == CONFIG_UKPLAT_CPU_MAXCOUNT)) {
@@ -95,16 +153,6 @@ index 4883a75..7c19898 100644
  			break;
  		}
  	}
- 	UK_ASSERT(bsp_found);
- 
-+	/* idx counted the BSP plus every mapped AP, capped at the
-+	 * configured maximum. Publish it as the present CPU count.
-+	 */
-+	uk_acpi_present_cpu_count = idx;
-+
- 	return 0;
- }
- 
 diff --git a/drivers/firmware/ukacpi/exportsyms.uk b/drivers/firmware/ukacpi/exportsyms.uk
 index 6a3d241..34a88e7 100644
 --- a/drivers/firmware/ukacpi/exportsyms.uk
@@ -949,7 +997,7 @@ index cee02cb..02b49be 100644
  # initialized. The check for !LIBUKBOOT_INITNOSCHED is not sufficient, as
  # the option is also not available if !LIBUKBOOT_INITALLOC is set. The
 diff --git a/lib/ukboot/boot.c b/lib/ukboot/boot.c
-index 0cd058c..3398f54 100644
+index 0cd058c..dae01a2 100644
 --- a/lib/ukboot/boot.c
 +++ b/lib/ukboot/boot.c
 @@ -52,6 +52,9 @@
@@ -983,7 +1031,7 @@ index 0cd058c..3398f54 100644
  #include "init.h"
  
  extern char **boot_argv;
-@@ -117,6 +127,148 @@ struct uk_semaphore main_sema;
+@@ -117,6 +127,183 @@ struct uk_semaphore main_sema;
  static struct uk_vas kernel_vas;
  #endif /* CONFIG_LIBUKBOOT_HEAP_BASE && CONFIG_LIBUKVMEM */
  
@@ -1086,6 +1134,41 @@ index 0cd058c..3398f54 100644
 +			(unsigned long)part, (unsigned int)i);
 +	}
 +
++	if (i < ncores) {
++		/*
++		 * Allocation failed before carving partitions for all
++		 * non-boot cores. Unwind partial carve and return the
++		 * reserved memory to the default heap. [Ticket b1326f22d2]
++		 */
++		struct ukplat_bootinfo *bi = ukplat_bootinfo_get();
++		unsigned int j;
++		int r;
++
++		uk_pr_warn("ukboot: per-core heap: carve failed for core %u of %u; unwinding\n",
++			   i, ncores);
++
++		for (j = 0; j < i - 1; j++) {
++			__uptr pbase = percore_heap_parts[j].base;
++			struct ukplat_memregion_desc *mrd;
++
++			for (r = 0; r < ukplat_memregion_count(); r++) {
++				if (ukplat_memregion_get(r, &mrd) == 0 &&
++				    mrd->pbase == pbase &&
++				    mrd->type == UKPLAT_MEMRT_RESERVED) {
++					mrd->type = UKPLAT_MEMRT_FREE;
++					mrd->flags = UKPLAT_MEMRF_READ |
++						     UKPLAT_MEMRF_WRITE;
++					break;
++				}
++			}
++			percore_heap_parts[j].base = 0;
++			percore_heap_parts[j].len = 0;
++		}
++		percore_heap_count = 0;
++		if (bi)
++			ukplat_memregion_list_coalesce(&bi->mrds);
++	}
++
 +	if (percore_heap_count) {
 +		uk_pr_info("ukboot: per-core heap: %u partition(s) "
 +			  "of %lu bytes for %u core(s); "
@@ -1132,7 +1215,7 @@ index 0cd058c..3398f54 100644
  static struct uk_alloc *heap_init()
  {
  	struct uk_alloc *a = NULL;
-@@ -161,8 +313,8 @@ static struct uk_alloc *heap_init()
+@@ -161,8 +348,8 @@ static struct uk_alloc *heap_init()
  	if (unlikely(rc))
  		return NULL;
  
@@ -1143,7 +1226,7 @@ index 0cd058c..3398f54 100644
  	if (unlikely(!a))
  		return NULL;
  
-@@ -199,8 +351,8 @@ static struct uk_alloc *heap_init()
+@@ -199,8 +386,8 @@ static struct uk_alloc *heap_init()
  	if (unlikely(rc))
  		return NULL;
  
@@ -1154,7 +1237,7 @@ index 0cd058c..3398f54 100644
  #endif /* !CONFIG_LIBUKVMEM */
  #else /* CONFIG_LIBUKBOOT_HEAP_BASE */
  	/* Paging is disabled so we still have the static boot page table set
-@@ -210,6 +362,13 @@ static struct uk_alloc *heap_init()
+@@ -210,6 +397,13 @@ static struct uk_alloc *heap_init()
  	 * again with the next region. As soon we have an allocator, we simply
  	 * add every subsequent region to it.
  	 */
@@ -1168,7 +1251,7 @@ index 0cd058c..3398f54 100644
  	ukplat_memregion_foreach(&md, UKPLAT_MEMRT_FREE, 0, 0) {
  		UK_ASSERT_VALID_FREE_MRD(md);
  
-@@ -224,7 +383,7 @@ static struct uk_alloc *heap_init()
+@@ -224,7 +418,7 @@ static struct uk_alloc *heap_init()
  			    );
  
  		if (!a)
@@ -1519,7 +1602,7 @@ new file mode 100644
 index 0000000..753d4bd
 --- /dev/null
 +++ b/plat/kvm/x86/lcpu.c
-@@ -0,0 +1,470 @@
+@@ -0,0 +1,480 @@
 +/* SPDX-License-Identifier: BSD-3-Clause */
 +/*
 + * KVM x86_64 platform: secondary CPU (AP) bring-up.
@@ -1885,12 +1968,15 @@ index 0000000..753d4bd
 +	/*
 +	 * Check that every AP came online. On the AP, uk_lcpu_init
 +	 * sets the per-CPU state to a busy state before the AP entry
-+	 * runs. A core still offline after the timeout never started;
-+	 * the gate log needs a line that names it. [Ticket f05cbd814a]
++	 * runs. Retry SIPI at mid-timeout if the AP has not come online.
++	 * A core still offline after the timeout never started;
++	 * print GATE_FAIL naming the AP and mark it halted.
++	 * [Ticket f05cbd814a] [Ticket dd4a8c64ea]
 +	 */
 +	for (i = 0; i < *num; i++) {
 +		struct uk_lcpu *lcpu;
 +		unsigned int ms;
++		int retried = 0;
 +
 +		id = uk_pcpuvar_lval(lcpuidx[i], uk_pcpuvar_cpu_id);
 +		if (id == this_cpu_id)
@@ -1900,6 +1986,11 @@ index 0000000..753d4bd
 +		for (ms = 0; ms < UK_AP_ONLINE_TIMEOUT_MS; ms++) {
 +			if (uk_lcpu_state_is_online(uk_load_n(&lcpu->state)))
 +				break;
++			if (!retried && ms >= (UK_AP_ONLINE_TIMEOUT_MS / 2)) {
++				/* Retry SIPI once before giving up */
++				apic_send_sipi(uk_plat_native_x86_64_start16_addr, id);
++				retried = 1;
++			}
 +			mdelay(1);
 +		}
 +
@@ -1907,6 +1998,8 @@ index 0000000..753d4bd
 +				     uk_load_n(&lcpu->state)))) {
 +			uk_pr_err("GATE_FAIL: kvm: AP 0x%lx did not come online within %d ms\n",
 +				  id, UK_AP_ONLINE_TIMEOUT_MS);
++			lcpu->state = UK_LCPU_STATE_HALTED;
++			lcpu->error_code = -ETIMEDOUT;
 +			if (!rc)
 +				rc = -ETIMEDOUT;
 +		}

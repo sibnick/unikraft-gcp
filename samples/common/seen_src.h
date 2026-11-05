@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 /*
  * Bounded list of peer addresses that already have a static ARP entry.
- * Ticket 47ca2a4774.
+ * Tickets 47ca2a4774 and b5d3be2bd8.
  *
  * The GCP fabric never answers ARP for a guest address. A sample that
  * replies to an inbound packet must map that source to the encoded
@@ -65,12 +65,19 @@ static inline int ukg_seen_src_add(struct ukg_seen_src *list, uint32_t addr)
  * and the netmask as the netif reports them. All three stay in network
  * byte order, so one AND per side is enough.
  *
- * A netmask of 0 matches every address. That is the right fallback for
- * a netif with no mask: the caller keeps its previous behavior.
+ * A local address of 0 means the interface has no address yet. Return
+ * 0 so an unconfigured interface does not match.
+ *
+ * A netmask of 0 or a /32 host mask (all bits set) has no subnet peer
+ * restriction. Match every valid non-zero source.
  */
 static inline int ukg_src_in_subnet(uint32_t src, uint32_t local,
 				    uint32_t mask)
 {
+	if (local == 0 || src == 0)
+		return 0;
+	if (mask == 0 || mask == 0xffffffffU)
+		return 1;
 	return (src & mask) == (local & mask);
 }
 
