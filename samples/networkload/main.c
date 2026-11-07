@@ -732,15 +732,38 @@ int main(int argc, char *argv[])
 
 			if (slash) {
 				size_t len = (size_t)(slash - ip_param);
+				char bits_buf[8] = {0};
+				const char *bits_end =
+					(colon && colon > slash) ? colon :
+					slash + 1 + strlen(slash + 1);
+				size_t bits_len =
+					(size_t)(bits_end - (slash + 1));
+				uint64_t bits;
+
 				if (len < sizeof(ip_buf)) {
 					strncpy(ip_buf, ip_param, len);
 					ip_buf[len] = '\0';
 				}
-				int bits = atoi(slash + 1);
-				if (bits > 0 && bits <= 32) {
-					uint32_t mask_val = htonl(~((1ULL << (32 - bits)) - 1));
-					my_mask.addr = mask_val;
+				/* The prefix is the text between '/' and
+				 * the next ':'. ukarg_u64 rejects trailing
+				 * garbage, so 10.0.0.1/24abc stops the run
+				 * instead of running with mask 24. A
+				 * longer prefix is always invalid too.
+				 * Ticket 9e415a5dfe. */
+				if (bits_len >= sizeof(bits_buf)) {
+					printf("GATE_FAIL: bad ip=%s need prefix 1..32\n",
+					       ip_param);
+					return 1;
 				}
+				memcpy(bits_buf, slash + 1, bits_len);
+				bits_buf[bits_len] = '\0';
+				if (ukarg_u64(bits_buf, 1, 32, &bits) != 0) {
+					printf("GATE_FAIL: bad prefix=%s in ip=%s need 1..32\n",
+					       bits_buf, ip_param);
+					return 1;
+				}
+				my_mask.addr =
+					htonl(~((1ULL << (32 - bits)) - 1));
 				ip4addr_aton(ip_buf, &my_ip);
 			} else {
 				size_t len = colon ? (size_t)(colon - ip_param) : strlen(ip_param);
