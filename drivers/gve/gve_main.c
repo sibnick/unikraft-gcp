@@ -118,7 +118,7 @@ struct uk_netdev_tx_queue {
 	uint32_t db_idx;	/* device BAR2 doorbell index, checked at configure */
 	struct gve_queue_resources *q_resources;
 	uint8_t *bounce_bufs;
-	uint64_t bounce_dma;	/* device address of bounce_bufs, checked at configure */
+	uint64_t *bounce_dma;	/* per-slot device DMA addresses */
 
 	/* DQO_RDA rings and state */
 	union gve_tx_desc_dqo *dqo_tx_ring;
@@ -157,7 +157,7 @@ struct uk_netdev_rx_queue {
 	struct gve_rx_desc_dqo *dqo_bufq_ring;
 	struct gve_rx_compl_desc_dqo *dqo_complq_ring;
 	uint8_t *dqo_rx_bufs;
-	uint64_t dqo_rx_bufs_dma;	/* device address, contiguity checked at configure */
+	uint64_t *dqo_rx_bufs_dma;	/* per-buffer device DMA addresses */
 	uint32_t dqo_bufq_tail;
 	uint32_t dqo_refill_pending;	/* reposts since last doorbell */
 	uint32_t dqo_complq_head;
@@ -1754,6 +1754,8 @@ static void gve_txq_free(struct gve_device *gdev,
 		uk_free(a, txq->qpl_page_bus);
 	if (txq->qpl_pages)
 		uk_free(a, txq->qpl_pages);
+	if (txq->bounce_dma)
+		uk_free(a, txq->bounce_dma);
 	if (txq->bounce_bufs)
 		uk_free(a, txq->bounce_bufs);
 	if (txq->dqo_compl_ring)
@@ -1780,6 +1782,7 @@ static struct uk_netdev_tx_queue *gve_netdev_txq_configure(
 	uint64_t comp_dma = 0;
 	struct uk_alloc *a;
 	size_t bounce_sz;
+	uint32_t i;
 	int rc;
 
 	if (!gdev || queue_id >= (gdev->queue_pairs ? gdev->queue_pairs : 1U))
@@ -1861,10 +1864,26 @@ static struct uk_netdev_tx_queue *gve_netdev_txq_configure(
 			rc = gve_dma_map(txq->dqo_compl_ring,
 					 (size_t)txq->comp_cnt * sizeof(struct gve_tx_compl_desc),
 					 &comp_dma);
-		if (rc == 0)
-			rc = gve_dma_map(txq->bounce_bufs,
-					 (size_t)txq->cnt * GVE_DEFAULT_RX_BUFFER_SIZE,
-					 &txq->bounce_dma);
+		if (rc == 0) {
+			txq->bounce_dma = uk_malloc(a,
+				(size_t)txq->cnt * sizeof(uint64_t));
+			if (!txq->bounce_dma) {
+				rc = -ENOMEM;
+				goto err_free;
+			}
+			for (i = 0; i < (uint32_t)txq->cnt; i++) {
+				rc = gve_dma_map(
+					txq->bounce_bufs +
+					(size_t)i * GVE_DEFAULT_RX_BUFFER_SIZE,
+					GVE_DEFAULT_RX_BUFFER_SIZE,
+					&txq->bounce_dma[i]);
+				if (rc != 0) {
+					uk_pr_err("gve: TX%u bounce slot %u has no usable DMA address (%d)\n",
+						  queue_id, i, rc);
+					goto err_free;
+				}
+			}
+		}
 		if (rc != 0) {
 			uk_pr_err("gve: TX%u queue buffers have no usable DMA address (%d)\n",
 				  queue_id, rc);
@@ -1924,10 +1943,26 @@ static struct uk_netdev_tx_queue *gve_netdev_txq_configure(
 			rc = gve_dma_map(txq->gqi_tx_ring,
 					 (size_t)txq->cnt * sizeof(union gve_tx_desc),
 					 &ring_dma);
-		if (rc == 0 && txq->bounce_bufs != NULL)
-			rc = gve_dma_map(txq->bounce_bufs,
-					 (size_t)txq->cnt * GVE_DEFAULT_RX_BUFFER_SIZE,
-					 &txq->bounce_dma);
+		if (rc == 0 && txq->bounce_bufs != NULL) {
+			txq->bounce_dma = uk_malloc(a,
+				(size_t)txq->cnt * sizeof(uint64_t));
+			if (!txq->bounce_dma) {
+				rc = -ENOMEM;
+				goto err_free;
+			}
+			for (i = 0; i < (uint32_t)txq->cnt; i++) {
+				rc = gve_dma_map(
+					txq->bounce_bufs +
+					(size_t)i * GVE_DEFAULT_RX_BUFFER_SIZE,
+					GVE_DEFAULT_RX_BUFFER_SIZE,
+					&txq->bounce_dma[i]);
+				if (rc != 0) {
+					uk_pr_err("gve: TX%u bounce slot %u has no usable DMA address (%d)\n",
+						  queue_id, i, rc);
+					goto err_free;
+				}
+			}
+		}
 		if (rc != 0) {
 			uk_pr_err("gve: TX%u queue buffers have no usable DMA address (%d)\n",
 				  queue_id, rc);
@@ -2042,6 +2077,8 @@ static void gve_rxq_free(struct gve_device *gdev,
 		uk_free(a, rxq->qpl_page_bus);
 	if (rxq->qpl_pages)
 		uk_free(a, rxq->qpl_pages);
+	if (rxq->dqo_rx_bufs_dma)
+		uk_free(a, rxq->dqo_rx_bufs_dma);
 	if (rxq->dqo_rx_bufs)
 		uk_free(a, rxq->dqo_rx_bufs);
 	if (rxq->dqo_complq_ring)
@@ -2155,10 +2192,26 @@ static struct uk_netdev_rx_queue *gve_netdev_rxq_configure(
 			rc = gve_dma_map(rxq->dqo_bufq_ring,
 					 (size_t)rxq->buf_cnt * sizeof(struct gve_rx_desc_dqo),
 					 &bufq_dma);
-		if (rc == 0)
-			rc = gve_dma_map(rxq->dqo_rx_bufs,
-					 (size_t)rxq->buf_cnt * GVE_DEFAULT_RX_BUFFER_SIZE,
-					 &rxq->dqo_rx_bufs_dma);
+		if (rc == 0) {
+			rxq->dqo_rx_bufs_dma = uk_malloc(a,
+				(size_t)rxq->buf_cnt * sizeof(uint64_t));
+			if (!rxq->dqo_rx_bufs_dma) {
+				rc = -ENOMEM;
+				goto err_free;
+			}
+			for (i = 0; i < (uint32_t)rxq->buf_cnt; i++) {
+				rc = gve_dma_map(
+					rxq->dqo_rx_bufs +
+					(size_t)i * GVE_DEFAULT_RX_BUFFER_SIZE,
+					GVE_DEFAULT_RX_BUFFER_SIZE,
+					&rxq->dqo_rx_bufs_dma[i]);
+				if (rc != 0) {
+					uk_pr_err("gve: RX%u buffer %u has no usable DMA address (%d)\n",
+						  queue_id, i, rc);
+					goto err_free;
+				}
+			}
+		}
 		if (rc != 0) {
 			uk_pr_err("gve: RX%u queue buffers have no usable DMA address (%d)\n",
 				  queue_id, rc);
@@ -2167,9 +2220,7 @@ static struct uk_netdev_rx_queue *gve_netdev_rxq_configure(
 
 		for (i = 0; i < (uint32_t)(rxq->buf_cnt - 1U); i++) {
 			rxq->dqo_bufq_ring[i].buf_id = (uint16_t)i;
-			rxq->dqo_bufq_ring[i].buf_addr =
-				rxq->dqo_rx_bufs_dma +
-				(uint64_t)i * GVE_DEFAULT_RX_BUFFER_SIZE;
+			rxq->dqo_bufq_ring[i].buf_addr = rxq->dqo_rx_bufs_dma[i];
 			rxq->dqo_bufq_ring[i].header_buf_addr = 0;
 		}
 		rxq->dqo_bufq_tail = (uint32_t)(rxq->buf_cnt - 1U);
@@ -2558,8 +2609,7 @@ static int gve_netdev_xmit(struct uk_netdev *dev,
 		gve_dqo_fill_tx_general_ctx_desc(
 			&queue->dqo_tx_ring[ctx_slot].general_ctx);
 		gve_dqo_fill_tx_pkt_desc(&queue->dqo_tx_ring[pkt_slot].pkt,
-					 queue->bounce_dma +
-					 (uint64_t)pkt_slot * GVE_DEFAULT_RX_BUFFER_SIZE,
+					 queue->bounce_dma[pkt_slot],
 					 (uint16_t)pkt_slot,
 					 (uint16_t)padded_len);
 		__asm__ __volatile__("mfence" ::: "memory");
@@ -2599,8 +2649,7 @@ static int gve_netdev_xmit(struct uk_netdev *dev,
 		} else {
 			dst = queue->bounce_bufs +
 			      (size_t)slot * GVE_DEFAULT_RX_BUFFER_SIZE;
-			addr = queue->bounce_dma +
-			       (uint64_t)slot * GVE_DEFAULT_RX_BUFFER_SIZE;
+			addr = queue->bounce_dma[slot];
 		}
 
 		for (iter = pkt; iter != NULL; iter = iter->next) {
@@ -2713,8 +2762,7 @@ static int gve_netdev_recv(struct uk_netdev *dev,
 			bslot = queue->dqo_bufq_tail;
 			queue->dqo_bufq_ring[bslot].buf_id = buf_id;
 			queue->dqo_bufq_ring[bslot].buf_addr =
-				queue->dqo_rx_bufs_dma +
-				(uint64_t)buf_id * GVE_DEFAULT_RX_BUFFER_SIZE;
+				queue->dqo_rx_bufs_dma[buf_id];
 			queue->dqo_bufq_ring[bslot].header_buf_addr = 0;
 			__asm__ __volatile__("mfence" ::: "memory");
 
