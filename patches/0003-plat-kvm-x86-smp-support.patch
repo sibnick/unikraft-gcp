@@ -28,7 +28,7 @@ index 1623228..5ae6dcf 100644
  
  UK_BOOT_EARLYTAB_ENTRY(boot_acpi_init, UK_ACPI_INIT_PRIO);
 diff --git a/drivers/firmware/ukacpi/arch/x86_64/madt.c b/drivers/firmware/ukacpi/arch/x86_64/madt.c
-index 4883a75..2ca8ac2 100644
+index 4883a75..b409dc9 100644
 --- a/drivers/firmware/ukacpi/arch/x86_64/madt.c
 +++ b/drivers/firmware/ukacpi/arch/x86_64/madt.c
 @@ -10,6 +10,7 @@
@@ -39,8 +39,62 @@ index 4883a75..2ca8ac2 100644
  #include <uk/assert.h>
  #include <uk/pcpuvar.h>
  #include <uk/print.h>
-@@ -22,7 +23,11 @@
+@@ -20,9 +21,65 @@
+ #include <uk/plat/common/bootinfo.h>
+ #endif /* CONFIG_LIBUKBOOT */
  
++/*
++ * CPUs that the platform presents, clamped to the configured maximum.
++ * Code that sizes per-core resources reads this instead of guessing
++ * from CONFIG_UKPLAT_CPU_MAXCOUNT. [Ticket 9a037affad]
++ */
++unsigned int uk_acpi_present_cpu_count = CONFIG_UKPLAT_CPU_MAXCOUNT;
++
++static unsigned int madt_detect_cpuid_cpu_count(void)
++{
++	__u32 a = 0, b = 0, c = 0, d = 0;
++	unsigned int max_leaf;
++	unsigned int count = 0;
++
++	uk_arch_x86_64_cpuid(0, 0, &a, &b, &c, &d);
++	max_leaf = a;
++
++	if (max_leaf >= 0x1f) {
++		unsigned int sub = 0;
++
++		while (1) {
++			uk_arch_x86_64_cpuid(0x1f, sub, &a, &b, &c, &d);
++			if (((c >> 8) & 0xff) == 0)
++				break;
++			count = b & 0xffff;
++			sub++;
++		}
++	}
++
++	if (!count && max_leaf >= 0xb) {
++		unsigned int sub = 0;
++
++		while (1) {
++			uk_arch_x86_64_cpuid(0xb, sub, &a, &b, &c, &d);
++			if (((c >> 8) & 0xff) == 0)
++				break;
++			count = b & 0xffff;
++			sub++;
++		}
++	}
++
++	if (!count && max_leaf >= 1) {
++		uk_arch_x86_64_cpuid(1, 0, &a, &b, &c, &d);
++		if (d & (1u << 28))
++			count = (b >> 16) & 0xff;
++	}
++
++	if (!count)
++		count = 1;
++
++	return count;
++}
++
  int uk_acpi_madt_fill_cpu_idmap(void)
  {
 -	__u64 bsp_cpu_id = uk_pcpuvar_lval(0, uk_pcpuvar_cpu_id);
@@ -52,24 +106,37 @@ index 4883a75..2ca8ac2 100644
  	union {
  		struct uk_acpi_madt_x2apic *x2apic;
  		struct uk_acpi_madt_lapic *lapic;
-@@ -38,7 +43,23 @@ int uk_acpi_madt_fill_cpu_idmap(void)
+@@ -38,7 +95,36 @@ int uk_acpi_madt_fill_cpu_idmap(void)
  
  	/* Enumerate all other CPUs */
  	madt = uk_acpi_get_madt();
 -	UK_ASSERT(madt);
 +	if (unlikely(!madt)) {
 +		/*
-+		 * UEFI boot loaders (for example GRUB in EFI mode) do not
-+		 * publish the legacy ACPI RSDP. Without a RSDP there is no
-+		 * MADT. On KVM-style hypervisors the local APIC IDs are
-+		 * 0..N-1, so fall back to an identity CPU id map.
-+		 * [Ticket 3dc1f3f6b6]
++		 * UEFI boot loaders (such as GRUB in EFI mode) do not
++		 * publish the legacy ACPI RSDP. Without a RSDP there is
++		 * no MADT. Query the CPU count via CPUID leaves 0x1f,
++		 * 0xb, or 0x1. Clamp the count to CONFIG_UKPLAT_CPU_MAXCOUNT.
++		 * On KVM hypervisors APIC IDs are contiguous. Set up an
++		 * identity map for present CPUs. [Ticket b1326f22d2]
 +		 */
-+		uk_pr_warn("No MADT present: using identity CPU id map\n");
++		unsigned int cpu_cnt = madt_detect_cpuid_cpu_count();
++		unsigned int cur_idx = 1;
 +
-+		for (idx = 1; idx < CONFIG_UKPLAT_CPU_MAXCOUNT; idx++) {
-+			uk_pcpuvar_lval(idx, uk_pcpuvar_cpu_id) = idx;
-+			uk_pcpuvar_lval(idx, uk_pcpuvar_cpu_idx) = idx;
++		if (cpu_cnt > CONFIG_UKPLAT_CPU_MAXCOUNT)
++			cpu_cnt = CONFIG_UKPLAT_CPU_MAXCOUNT;
++
++		uk_acpi_present_cpu_count = cpu_cnt;
++
++		uk_pr_warn("No MADT present: detected %u CPU(s) via CPUID; using identity CPU id map\n",
++			   cpu_cnt);
++
++		for (__u64 apic_id = 0; apic_id < cpu_cnt && cur_idx < cpu_cnt; apic_id++) {
++			if (apic_id == bsp_cpu_id)
++				continue;
++			uk_pcpuvar_lval(cur_idx, uk_pcpuvar_cpu_id) = apic_id;
++			uk_pcpuvar_lval(cur_idx, uk_pcpuvar_cpu_idx) = cur_idx;
++			cur_idx++;
 +		}
 +
 +		return 0;
@@ -77,7 +144,7 @@ index 4883a75..2ca8ac2 100644
  
  	len = madt->hdr.tab_len - sizeof(*madt);
  	idx = 1;
-@@ -80,7 +101,7 @@ int uk_acpi_madt_fill_cpu_idmap(void)
+@@ -80,7 +166,7 @@ int uk_acpi_madt_fill_cpu_idmap(void)
  
  		/* Ignore cores that exceed max configured value */
  		if (unlikely(idx == CONFIG_UKPLAT_CPU_MAXCOUNT)) {
@@ -86,6 +153,33 @@ index 4883a75..2ca8ac2 100644
  			break;
  		}
  	}
+diff --git a/drivers/firmware/ukacpi/exportsyms.uk b/drivers/firmware/ukacpi/exportsyms.uk
+index 6a3d241..34a88e7 100644
+--- a/drivers/firmware/ukacpi/exportsyms.uk
++++ b/drivers/firmware/ukacpi/exportsyms.uk
+@@ -2,3 +2,4 @@ uk_acpi_get_fadt
+ uk_acpi_get_madt
+ uk_acpi_init
+ uk_acpi_madt_fill_cpu_idmap
++uk_acpi_present_cpu_count
+diff --git a/drivers/firmware/ukacpi/include/uk/acpi/madt.h b/drivers/firmware/ukacpi/include/uk/acpi/madt.h
+index 53f6ee1..2db394c 100644
+--- a/drivers/firmware/ukacpi/include/uk/acpi/madt.h
++++ b/drivers/firmware/ukacpi/include/uk/acpi/madt.h
+@@ -239,6 +239,13 @@ struct uk_acpi_madt *uk_acpi_get_madt(void);
+  * @return 0 on success, !=0 on error.
+  */
+ int uk_acpi_madt_fill_cpu_idmap(void);
++
++/**
++ * Number of CPUs that the platform presents to this instance.
++ * uk_acpi_madt_fill_cpu_idmap() sets it while parsing the MADT.
++ * Without a MADT it stays at CONFIG_UKPLAT_CPU_MAXCOUNT.
++ */
++extern unsigned int uk_acpi_present_cpu_count;
+ #endif /* CONFIG_LIBUKACPI_MADT_FILL_CPU_IDMAP */
+ 
+ #ifdef __cplusplus
 diff --git a/drivers/ukintctlr/xpic/pic.c b/drivers/ukintctlr/xpic/pic.c
 index 7e8b51a..26094d2 100644
 --- a/drivers/ukintctlr/xpic/pic.c
@@ -650,42 +744,58 @@ index b4f7d55..84e53bb 100644
  }
  
 diff --git a/lib/ukallocbbuddy/bbuddy.c b/lib/ukallocbbuddy/bbuddy.c
-index 3e39480..8516782 100644
+index 3e39480..43ad882 100644
 --- a/lib/ukallocbbuddy/bbuddy.c
 +++ b/lib/ukallocbbuddy/bbuddy.c
-@@ -82,8 +82,31 @@ struct uk_bbpalloc {
+@@ -50,6 +50,7 @@
+ #include <uk/arch/limits.h>
+ #include <uk/atomic.h>
+ #include <uk/bitops/bitscan.h>
++#include <uk/lcpu.h>
+ #include <uk/print.h>
+ #include <uk/assert.h>
+ #include <uk/list.h>
+@@ -82,8 +83,39 @@ struct uk_bbpalloc {
  	unsigned long nr_free_pages;
  	struct uk_hlist_head free_head[FREELIST_SIZE];
  	struct uk_bbpalloc_memr *memr_head;
-+	/* Set for an allocator shared between cores. The default heap is
-+	 * used by every core (posix-socket, posix-poll, lwIP mailboxes).
-+	 * bbuddy is not thread-safe without this guard: concurrent
-+	 * malloc/free corrupts the free lists. [Ticket d4c2a6bd2a] */
-+	unsigned int shared;
++	/* Guards the free lists. Every instance takes this lock, with
++	 * interrupts off, on every operation. The default heap is used
++	 * by every core. A per-core heap can also receive a cross-core
++	 * free: for example, one core frees a netbuf that another core
++	 * allocated. Without the lock, such use corrupts the free
++	 * lists. [Ticket d4c2a6bd2a, 5bec1639dc] */
 +	unsigned int lock;
  };
  
-+static inline void bbuddy_lock(struct uk_bbpalloc *b)
++/*
++ * Take the allocator lock with interrupts off. The lock word guards
++ * the free lists. Turning interrupts off stops an interrupt handler
++ * on the lock holder from allocating or freeing on the same core. The
++ * return value carries the saved interrupt flags to the matching
++ * unlock. [Ticket f9d24435b8]
++ */
++static inline unsigned long bbuddy_lock(struct uk_bbpalloc *b)
 +{
-+	unsigned int exp;
++	unsigned long flags = uk_lcpu_save_irqf();
++	unsigned int exp = 0;
 +
-+	if (!b->shared)
-+		return;
-+	exp = 0;
 +	while (!uk_compare_exchange_n(&b->lock, &exp, 1u))
 +		exp = 0;
++
++	return flags;
 +}
 +
-+static inline void bbuddy_unlock(struct uk_bbpalloc *b)
++static inline void bbuddy_unlock(struct uk_bbpalloc *b, unsigned long flags)
 +{
-+	if (b->shared)
-+		uk_exchange_n(&b->lock, 0u);
++	uk_exchange_n(&b->lock, 0u);
++	uk_lcpu_restore_irqf(flags);
 +}
 +
  #if CONFIG_LIBUKALLOCBBUDDY_FREELIST_SANITY
  /* Provide sanity checking of freelists, walking their length and checking
   * for consistency. Useful when suspecting memory corruption.
-@@ -356,7 +379,7 @@ static inline void bbuddy_trim(struct uk_bbpalloc *b, struct chunk_head *ch,
+@@ -356,7 +388,7 @@ static inline void bbuddy_trim(struct uk_bbpalloc *b, struct chunk_head *ch,
  	}
  }
  
@@ -694,25 +804,26 @@ index 3e39480..8516782 100644
  {
  	struct uk_bbpalloc *const b = (struct uk_bbpalloc *)&a->priv;
  	struct chunk_head *alloc_ch;
-@@ -400,6 +423,17 @@ err_nomem:
+@@ -400,6 +432,18 @@ err_nomem:
  	return NULL;
  }
  
 +static void *bbuddy_palloc(struct uk_alloc *a, unsigned long num_pages)
 +{
 +	struct uk_bbpalloc *const b = (struct uk_bbpalloc *)&a->priv;
++	unsigned long flags;
 +	void *obj;
 +
-+	bbuddy_lock(b);
++	flags = bbuddy_lock(b);
 +	obj = bbuddy_palloc_nolock(a, num_pages);
-+	bbuddy_unlock(b);
++	bbuddy_unlock(b, flags);
 +	return obj;
 +}
 +
  /**
   * INTERNAL. Maximally merge chunk `*chp` of order `ord` with any free buddies,
   * updating its value along the way.
-@@ -460,7 +494,8 @@ static inline size_t bbuddy_merge(struct uk_bbpalloc *b,
+@@ -460,7 +504,8 @@ static inline size_t bbuddy_merge(struct uk_bbpalloc *b,
  	return ord;
  }
  
@@ -722,25 +833,63 @@ index 3e39480..8516782 100644
  {
  	struct uk_bbpalloc *const b = (struct uk_bbpalloc *)&a->priv;
  	char *base = obj;
-@@ -505,6 +540,16 @@ static void bbuddy_pfree(struct uk_alloc *a, void *obj, unsigned long num_pages)
+@@ -505,7 +550,18 @@ static void bbuddy_pfree(struct uk_alloc *a, void *obj, unsigned long num_pages)
  	freelist_sanitycheck(b->free_head);
  }
  
+-static long bbuddy_pmaxalloc(struct uk_alloc *a)
 +static void bbuddy_pfree(struct uk_alloc *a, void *obj,
 +			unsigned long num_pages)
 +{
 +	struct uk_bbpalloc *const b = (struct uk_bbpalloc *)&a->priv;
++	unsigned long flags;
 +
-+	bbuddy_lock(b);
++	flags = bbuddy_lock(b);
 +	bbuddy_pfree_nolock(a, obj, num_pages);
-+	bbuddy_unlock(b);
++	bbuddy_unlock(b, flags);
 +}
 +
- static long bbuddy_pmaxalloc(struct uk_alloc *a)
++static long bbuddy_pmaxalloc_nolock(struct uk_alloc *a)
  {
  	struct uk_bbpalloc *b;
-@@ -535,7 +580,7 @@ static long bbuddy_pavailmem(struct uk_alloc *a)
- 	return (long) b->nr_free_pages;
+ 	size_t i, order;
+@@ -525,17 +581,41 @@ static long bbuddy_pmaxalloc(struct uk_alloc *a)
+ 	return (long) (1 << order);
+ }
+ 
++static long bbuddy_pmaxalloc(struct uk_alloc *a)
++{
++	struct uk_bbpalloc *const b = (struct uk_bbpalloc *)&a->priv;
++	unsigned long flags;
++	long ret;
++
++	/* The walk reads the free list heads. A concurrent alloc or
++	 * free updates them, so take the lock. [Ticket 5bec1639dc] */
++	flags = bbuddy_lock(b);
++	ret = bbuddy_pmaxalloc_nolock(a);
++	bbuddy_unlock(b, flags);
++
++	return ret;
++}
++
+ static long bbuddy_pavailmem(struct uk_alloc *a)
+ {
+ 	struct uk_bbpalloc *b;
++	unsigned long flags;
++	long ret;
+ 
+ 	UK_ASSERT(a != NULL);
+ 	b = (struct uk_bbpalloc *)&a->priv;
+ 
+-	return (long) b->nr_free_pages;
++	/* nr_free_pages moves with every alloc and free. Read it
++	 * under the lock so the answer cannot be a torn update.
++	 * [Ticket 5bec1639dc] */
++	flags = bbuddy_lock(b);
++	ret = (long) b->nr_free_pages;
++	bbuddy_unlock(b, flags);
++
++	return ret;
  }
  
 -static int bbuddy_addmem(struct uk_alloc *a, void *base, size_t len)
@@ -748,7 +897,7 @@ index 3e39480..8516782 100644
  {
  	struct uk_bbpalloc *b;
  	struct uk_bbpalloc_memr *memr;
-@@ -633,7 +678,20 @@ static int bbuddy_addmem(struct uk_alloc *a, void *base, size_t len)
+@@ -633,7 +713,20 @@ static int bbuddy_addmem(struct uk_alloc *a, void *base, size_t len)
  	return 0;
  }
  
@@ -756,42 +905,43 @@ index 3e39480..8516782 100644
 +static int bbuddy_addmem(struct uk_alloc *a, void *base, size_t len)
 +{
 +	struct uk_bbpalloc *b;
++	unsigned long flags;
 +	int ret;
 +
 +	b = (struct uk_bbpalloc *)&a->priv;
-+	bbuddy_lock(b);
++	flags = bbuddy_lock(b);
 +	ret = bbuddy_addmem_nolock(a, base, len);
-+	bbuddy_unlock(b);
++	bbuddy_unlock(b, flags);
 +	return ret;
 +}
 +
-+static struct uk_alloc *bbuddy_init(void *base, size_t len,
-+				   unsigned int shared)
++static struct uk_alloc *bbuddy_init(void *base, size_t len)
  {
  	struct uk_alloc *a;
  	struct uk_bbpalloc *b;
-@@ -665,6 +723,8 @@ struct uk_alloc *uk_allocbbuddy_init(void *base, size_t len)
+@@ -665,6 +758,7 @@ struct uk_alloc *uk_allocbbuddy_init(void *base, size_t len)
  	for (i = 0; i < FREELIST_SIZE; i++)
  		UK_INIT_HLIST_HEAD(&b->free_head[i]);
  	b->memr_head = NULL;
-+	b->shared = shared;
 +	b->lock = 0;
  
  	/* initialize and register allocator interface */
  	uk_alloc_init_palloc(a, bbuddy_palloc, bbuddy_pfree,
-@@ -678,3 +738,13 @@ struct uk_alloc *uk_allocbbuddy_init(void *base, size_t len)
+@@ -678,3 +772,15 @@ struct uk_alloc *uk_allocbbuddy_init(void *base, size_t len)
  
  	return a;
  }
 +
 +struct uk_alloc *uk_allocbbuddy_init(void *base, size_t len)
 +{
-+	return bbuddy_init(base, len, 0);
++	return bbuddy_init(base, len);
 +}
 +
 +struct uk_alloc *uk_allocbbuddy_init_shared(void *base, size_t len)
 +{
-+	return bbuddy_init(base, len, 1);
++	/* All instances lock now. Keep this entry point so existing
++	 * call sites keep building. [Ticket 5bec1639dc] */
++	return uk_allocbbuddy_init(base, len);
 +}
 diff --git a/lib/ukallocbbuddy/exportsyms.uk b/lib/ukallocbbuddy/exportsyms.uk
 index ee41a2a..6879548 100644
@@ -802,17 +952,18 @@ index ee41a2a..6879548 100644
 +uk_allocbbuddy_init_shared
  
 diff --git a/lib/ukallocbbuddy/include/uk/allocbbuddy.h b/lib/ukallocbbuddy/include/uk/allocbbuddy.h
-index 3d7558b..3f440a5 100644
+index 3d7558b..1dd97a7 100644
 --- a/lib/ukallocbbuddy/include/uk/allocbbuddy.h
 +++ b/lib/ukallocbbuddy/include/uk/allocbbuddy.h
-@@ -42,6 +42,13 @@ extern "C" {
+@@ -42,6 +42,14 @@ extern "C" {
  
  struct uk_alloc *uk_allocbbuddy_init(void *base, size_t len);
  
 +/*
-+ * Same as uk_allocbbuddy_init() but marks the instance as shared between
-+ * cores. All allocation operations take an internal spinlock. Use this for
-+ * an allocator that more than one core uses (for example the default heap).
++ * Same as uk_allocbbuddy_init(). Every bbuddy instance now takes an
++ * internal lock with interrupts off on every allocation operation, so
++ * an instance may serve several cores. Keep this entry point for
++ * source compatibility. [Ticket 5bec1639dc]
 + */
 +struct uk_alloc *uk_allocbbuddy_init_shared(void *base, size_t len);
 +
@@ -820,10 +971,10 @@ index 3d7558b..3f440a5 100644
  }
  #endif
 diff --git a/lib/ukboot/Config.uk b/lib/ukboot/Config.uk
-index cee02cb..e321b56 100644
+index cee02cb..02b49be 100644
 --- a/lib/ukboot/Config.uk
 +++ b/lib/ukboot/Config.uk
-@@ -144,6 +144,18 @@ config LIBUKBOOT_HEAP_BASE
+@@ -144,6 +144,21 @@ config LIBUKBOOT_HEAP_BASE
  	depends on LIBUKPAGING
  	depends on LIBUKBOOT_INITALLOC
  
@@ -833,7 +984,10 @@ index cee02cb..e321b56 100644
 +	depends on LIBUKBOOT_INITALLOC
 +	help
 +	  Split the largest free memory region at boot into N-1
-+	  partitions (N = CPU max count). Each non-boot core can then
++	  partitions. N is the number of CPUs that the platform
++	  presents. On x86_64 with MADT parsing enabled, the count
++	  comes from the ACPI MADT. Otherwise it is the CPU max count.
++	  Each non-boot core can then
 +	  run a standalone allocator instance on its own partition. The
 +	  boot core keeps the remaining region as the default allocator.
 +	  This enables a run-to-completion design where each core
@@ -843,7 +997,7 @@ index cee02cb..e321b56 100644
  # initialized. The check for !LIBUKBOOT_INITNOSCHED is not sufficient, as
  # the option is also not available if !LIBUKBOOT_INITALLOC is set. The
 diff --git a/lib/ukboot/boot.c b/lib/ukboot/boot.c
-index 0cd058c..1092418 100644
+index 0cd058c..dae01a2 100644
 --- a/lib/ukboot/boot.c
 +++ b/lib/ukboot/boot.c
 @@ -52,6 +52,9 @@
@@ -877,7 +1031,7 @@ index 0cd058c..1092418 100644
  #include "init.h"
  
  extern char **boot_argv;
-@@ -117,6 +127,123 @@ struct uk_semaphore main_sema;
+@@ -117,6 +127,183 @@ struct uk_semaphore main_sema;
  static struct uk_vas kernel_vas;
  #endif /* CONFIG_LIBUKBOOT_HEAP_BASE && CONFIG_LIBUKVMEM */
  
@@ -902,6 +1056,30 @@ index 0cd058c..1092418 100644
 +/* A per-core partition smaller than this size is not useful. */
 +#define UK_PERCORE_HEAP_MIN_SIZE	(16UL << 20)
 +
++#if CONFIG_LIBUKACPI && CONFIG_ARCH_X86_64 &&				\
++	CONFIG_LIBUKACPI_MADT_FILL_CPU_IDMAP
++#include <uk/acpi/madt.h>
++#endif
++
++/*
++ * Number of cores to carve partitions for. The MADT fill entry runs
++ * from the early boot table, before heap_init(). So the ACPI CPU
++ * count is known here on x86_64. Fall back to the configured maximum
++ * count when ACPI is not available. [Ticket 9a037affad]
++ */
++static unsigned int percore_heap_ncores(void)
++{
++	unsigned int n = CONFIG_UKPLAT_CPU_MAXCOUNT;
++
++#if CONFIG_LIBUKACPI && CONFIG_ARCH_X86_64 &&				\
++	CONFIG_LIBUKACPI_MADT_FILL_CPU_IDMAP
++	if (uk_acpi_present_cpu_count > 0 &&
++	    uk_acpi_present_cpu_count < n)
++		n = uk_acpi_present_cpu_count;
++#endif
++	return n;
++}
++
 +/*
 + * Carve one partition from the largest free memory region for each
 + * non-boot core. This function must run before uk_alloc_init() in
@@ -912,7 +1090,7 @@ index 0cd058c..1092418 100644
 +{
 +	struct ukplat_memregion_desc *md;
 +	struct ukplat_memregion_desc *biggest = NULL;
-+	unsigned int ncores = CONFIG_UKPLAT_CPU_MAXCOUNT;
++	unsigned int ncores = percore_heap_ncores();
 +	unsigned int i;
 +	__sz part;
 +
@@ -956,11 +1134,47 @@ index 0cd058c..1092418 100644
 +			(unsigned long)part, (unsigned int)i);
 +	}
 +
++	if (i < ncores) {
++		/*
++		 * Allocation failed before carving partitions for all
++		 * non-boot cores. Unwind partial carve and return the
++		 * reserved memory to the default heap. [Ticket b1326f22d2]
++		 */
++		struct ukplat_bootinfo *bi = ukplat_bootinfo_get();
++		unsigned int j;
++		int r;
++
++		uk_pr_warn("ukboot: per-core heap: carve failed for core %u of %u; unwinding\n",
++			   i, ncores);
++
++		for (j = 0; j < i - 1; j++) {
++			__uptr pbase = percore_heap_parts[j].base;
++			struct ukplat_memregion_desc *mrd;
++
++			for (r = 0; r < ukplat_memregion_count(); r++) {
++				if (ukplat_memregion_get(r, &mrd) == 0 &&
++				    mrd->pbase == pbase &&
++				    mrd->type == UKPLAT_MEMRT_RESERVED) {
++					mrd->type = UKPLAT_MEMRT_FREE;
++					mrd->flags = UKPLAT_MEMRF_READ |
++						     UKPLAT_MEMRF_WRITE;
++					break;
++				}
++			}
++			percore_heap_parts[j].base = 0;
++			percore_heap_parts[j].len = 0;
++		}
++		percore_heap_count = 0;
++		if (bi)
++			ukplat_memregion_list_coalesce(&bi->mrds);
++	}
++
 +	if (percore_heap_count) {
 +		uk_pr_info("ukboot: per-core heap: %u partition(s) "
-+			  "of %lu bytes; core 0 keeps the default region\n",
++			  "of %lu bytes for %u core(s); "
++			  "core 0 keeps the default region\n",
 +			(unsigned int)percore_heap_count,
-+			(unsigned long)part);
++			(unsigned long)part, ncores);
 +	} else {
 +		uk_pr_info("ukboot: per-core heap: no partition carved\n");
 +	}
@@ -1001,7 +1215,7 @@ index 0cd058c..1092418 100644
  static struct uk_alloc *heap_init()
  {
  	struct uk_alloc *a = NULL;
-@@ -161,8 +288,8 @@ static struct uk_alloc *heap_init()
+@@ -161,8 +348,8 @@ static struct uk_alloc *heap_init()
  	if (unlikely(rc))
  		return NULL;
  
@@ -1012,7 +1226,7 @@ index 0cd058c..1092418 100644
  	if (unlikely(!a))
  		return NULL;
  
-@@ -199,8 +326,8 @@ static struct uk_alloc *heap_init()
+@@ -199,8 +386,8 @@ static struct uk_alloc *heap_init()
  	if (unlikely(rc))
  		return NULL;
  
@@ -1023,7 +1237,7 @@ index 0cd058c..1092418 100644
  #endif /* !CONFIG_LIBUKVMEM */
  #else /* CONFIG_LIBUKBOOT_HEAP_BASE */
  	/* Paging is disabled so we still have the static boot page table set
-@@ -210,6 +337,13 @@ static struct uk_alloc *heap_init()
+@@ -210,6 +397,13 @@ static struct uk_alloc *heap_init()
  	 * again with the next region. As soon we have an allocator, we simply
  	 * add every subsequent region to it.
  	 */
@@ -1037,7 +1251,7 @@ index 0cd058c..1092418 100644
  	ukplat_memregion_foreach(&md, UKPLAT_MEMRT_FREE, 0, 0) {
  		UK_ASSERT_VALID_FREE_MRD(md);
  
-@@ -224,7 +358,7 @@ static struct uk_alloc *heap_init()
+@@ -224,7 +418,7 @@ static struct uk_alloc *heap_init()
  			    );
  
  		if (!a)
@@ -1098,7 +1312,7 @@ index 8e78944..591ae7b 100644
  }
  #endif
 diff --git a/lib/ukconsole/console.c b/lib/ukconsole/console.c
-index 9c06197..743e6c0 100644
+index 9c06197..d6c227f 100644
 --- a/lib/ukconsole/console.c
 +++ b/lib/ukconsole/console.c
 @@ -6,6 +6,7 @@
@@ -1109,7 +1323,7 @@ index 9c06197..743e6c0 100644
  #include <uk/list.h>
  #include <uk/console.h>
  #include <uk/console/driver.h>
-@@ -39,6 +40,18 @@ __u16 uk_console_count(void)
+@@ -39,9 +40,23 @@ __u16 uk_console_count(void)
  	return uk_console_device_count;
  }
  
@@ -1120,18 +1334,24 @@ index 9c06197..743e6c0 100644
 + * messages interleave byte for byte, and the run scripts cannot read
 + * their gate markers or a crash dump. [Ticket 3dc1f3f6b6]
 + *
-+ * Caveat: uk_printk from an interrupt handler on a core that already
-+ * holds this lock deadlocks. Handlers must not print.
++ * The lock is taken with interrupts off. A handler that prints on a core
++ * that already holds the lock would otherwise spin forever. [Ticket
++ * f9d24435b8]
 + */
 +static __spinlock uk_console_out_lock = UKARCH_SPINLOCK_INITIALIZER();
 +
  __ssz uk_console_out(const char *buf, __sz len)
  {
  	struct uk_console *dev = __NULL;
-@@ -49,12 +62,16 @@ __ssz uk_console_out(const char *buf, __sz len)
++	unsigned long flags;
+ 
+ 	if (unlikely(!len))
+ 		return 0;
+@@ -49,15 +64,46 @@ __ssz uk_console_out(const char *buf, __sz len)
  	if (unlikely(!buf))
  		return -EINVAL;
  
++	flags = uk_lcpu_save_irqf();
 +	ukarch_spin_lock(&uk_console_out_lock);
 +
  	/* Output to all STDOUT devices */
@@ -1141,23 +1361,89 @@ index 9c06197..743e6c0 100644
  	}
  
 +	ukarch_spin_unlock(&uk_console_out_lock);
++	uk_lcpu_restore_irqf(flags);
 +
  	return len;
  }
  
++/*
++ * Break the console lock when a crash starts. Only the core that performs
++ * the crash dump calls this, before it prints. The function tries the lock
++ * with a short bound. If the holder does not release in time, the function
++ * assumes the holder died with the lock and forces it open. The crash dump
++ * then reaches the serial port instead of hanging silently. A live holder
++ * finishes its write and releases. Its release is one store, so it only
++ * unlocks what the crash core took. [Ticket f9d24435b8]
++ */
++#define UK_CONSOLE_BREAK_TRIES 100000u
++
++void uk_console_break_lock(void)
++{
++	unsigned int tries;
++
++	for (tries = 0; tries < UK_CONSOLE_BREAK_TRIES; tries++) {
++		if (ukarch_spin_trylock(&uk_console_out_lock)) {
++			ukarch_spin_unlock(&uk_console_out_lock);
++			return;
++		}
++		uk_arch_spinwait();
++	}
++	ukarch_spin_unlock(&uk_console_out_lock);
++}
++
+ __ssz uk_console_in(char *buf, __sz len)
+ {
+ 	struct uk_console *dev = __NULL;
+diff --git a/lib/ukconsole/exportsyms.uk b/lib/ukconsole/exportsyms.uk
+index f21cdcf..d659262 100644
+--- a/lib/ukconsole/exportsyms.uk
++++ b/lib/ukconsole/exportsyms.uk
+@@ -2,6 +2,7 @@ uk_console_get
+ uk_console_out
+ uk_console_in
+ uk_console_out_direct
++uk_console_break_lock
+ uk_console_in_direct
+ uk_console_count
+ uk_console_register
+diff --git a/lib/ukconsole/include/uk/console.h b/lib/ukconsole/include/uk/console.h
+index 9b1d8c9..f606ccb 100644
+--- a/lib/ukconsole/include/uk/console.h
++++ b/lib/ukconsole/include/uk/console.h
+@@ -55,6 +55,16 @@ __u16 uk_console_count(void);
+  */
+ __ssz uk_console_out(const char *buf, __sz len);
+ 
++/**
++ * Break the console write lock when a crash starts.
++ *
++ * Only the core that performs the crash dump calls this, before it
++ * prints. The function tries the lock with a short bound and forces it
++ * open if the holder does not release. This keeps the crash dump moving
++ * when a core died holding the lock.
++ */
++void uk_console_break_lock(void);
++
+ /**
+  * Read bytes from the STDIN console device(s).
+  *
 diff --git a/lib/ukdebug/crash.c b/lib/ukdebug/crash.c
-index 39757f3..2ea8c0d 100644
+index 39757f3..43a4372 100644
 --- a/lib/ukdebug/crash.c
 +++ b/lib/ukdebug/crash.c
-@@ -9,6 +9,7 @@
+@@ -9,7 +9,11 @@
  #include <stddef.h>
  
  #include <uk/config.h>
 +#include <uk/atomic.h>
  #include <uk/crash.h>
++#if defined(CONFIG_LIBUKCONSOLE) && CONFIG_LIBUKCONSOLE
++#include <uk/console.h>
++#endif /* CONFIG_LIBUKCONSOLE */
  #include <uk/essentials.h>
  #include <uk/event.h>
-@@ -86,10 +87,10 @@ __noreturn void _uk_crash(struct uk_lcpu_regs *regs,
+ #include <uk/lcpu.h>
+@@ -86,10 +90,10 @@ __noreturn void _uk_crash(struct uk_lcpu_regs *regs,
  			  struct uk_crash_descr *descr)
  {
  	struct uk_crash_event_param param;
@@ -1170,7 +1456,7 @@ index 39757f3..2ea8c0d 100644
  
  	UK_ASSERT(regs);
  	UK_ASSERT(descr);
-@@ -98,18 +99,27 @@ __noreturn void _uk_crash(struct uk_lcpu_regs *regs,
+@@ -98,18 +102,38 @@ __noreturn void _uk_crash(struct uk_lcpu_regs *regs,
  	uk_preempt_disable();
  	uk_lcpu_except_push_nested();
  
@@ -1201,6 +1487,17 @@ index 39757f3..2ea8c0d 100644
  	}
 -#endif /* HAVE_SMP */
 +#endif /* CONFIG_HAVE_SMP */
++
++#if defined(CONFIG_LIBUKCONSOLE) && CONFIG_LIBUKCONSOLE
++	/*
++	 * A core can crash while it holds the console lock. That
++	 * includes a fault inside uk_console_out itself. Break the
++	 * lock so this dump reaches the serial port. Without this the
++	 * dump spins on the lock and the gate log never shows the
++	 * failure. [Ticket f9d24435b8]
++	 */
++	uk_console_break_lock();
++#endif /* CONFIG_LIBUKCONSOLE */
  
  #if CONFIG_LIBUKDEBUG_CRASH_SCREEN
  	crash_printk("Unikraft Crash - " STRINGIFY(UK_CODENAME)
@@ -1302,10 +1599,10 @@ index d6af82d..601ad46 100644
  
 diff --git a/plat/kvm/x86/lcpu.c b/plat/kvm/x86/lcpu.c
 new file mode 100644
-index 0000000..14cda71
+index 0000000..753d4bd
 --- /dev/null
 +++ b/plat/kvm/x86/lcpu.c
-@@ -0,0 +1,350 @@
+@@ -0,0 +1,480 @@
 +/* SPDX-License-Identifier: BSD-3-Clause */
 +/*
 + * KVM x86_64 platform: secondary CPU (AP) bring-up.
@@ -1325,8 +1622,10 @@ index 0000000..14cda71
 +
 +#include <uk/arch/util.h>
 +#include <uk/arch/x86_64.h>
++#include <uk/atomic.h>
 +#include <uk/essentials.h>
 +#include <uk/print.h>
++#include <uk/lcpu.h>
 +#include <uk/lcpu/pm.h>
 +#include <uk/pcpuvar.h>
 +#include <uk/prio.h>
@@ -1399,19 +1698,44 @@ index 0000000..14cda71
 +	return 0;
 +}
 +
-+static inline void xapic_write_icr(__u32 lo, __u64 dest)
++/*
++ * Bound for one ICR wait. The delivery-status bit clears as soon as
++ * the local APIC accepts the write. One hundred milliseconds per
++ * wait covers a slow hypervisor. A hypervisor that never clears the
++ * bit must not hang boot. [Ticket f05cbd814a]
++ */
++#define UK_XAPIC_ICR_TIMEOUT_US		100000u
++
++/* Wait until the delivery-status bit (12) of ICR-low is clear.
++ * @return 0 on accept, -ETIMEDOUT if the bit stays set. */
++static int xapic_icr_wait(volatile const __u32 *icr_lo)
++{
++	unsigned int us;
++
++	for (us = 0; us < UK_XAPIC_ICR_TIMEOUT_US; us++) {
++		if (!(*icr_lo & (1u << 12)))
++			return 0;
++		uk_arch_x86_64_spinwait();
++		udelay(1);
++	}
++
++	return -ETIMEDOUT;
++}
++
++static inline int xapic_write_icr(__u32 lo, __u64 dest)
 +{
 +	volatile __u32 *icr_hi = (volatile __u32 *)(apic_mmio_base + 0x310);
 +	volatile __u32 *icr_lo = (volatile __u32 *)(apic_mmio_base + 0x300);
++	int rc;
 +
-+	while (*icr_lo & (1u << 12))
-+		uk_arch_x86_64_spinwait();
++	rc = xapic_icr_wait(icr_lo);
++	if (unlikely(rc))
++		return rc;
 +
 +	*icr_hi = ((__u32)dest) << 24;
 +	*icr_lo = lo;
 +
-+	while (*icr_lo & (1u << 12))
-+		uk_arch_x86_64_spinwait();
++	return xapic_icr_wait(icr_lo);
 +}
 +
 +static int apic_send_sipi(__u64 addr, __u64 dest)
@@ -1427,8 +1751,7 @@ index 0000000..14cda71
 +		    UK_ARCH_X86_64_APIC_ICR_DMODE_SUP |
 +		    ((addr >> __PAGE_SHIFT) & UK_ARCH_X86_64_APIC_ICR_VECTOR_MASK);
 +
-+	xapic_write_icr(eax, dest);
-+	return 0;
++	return xapic_write_icr(eax, dest);
 +}
 +
 +static int apic_send_iipi(__u64 dest)
@@ -1443,8 +1766,7 @@ index 0000000..14cda71
 +		    UK_ARCH_X86_64_APIC_ICR_DESTMODE_PHYSICAL |
 +		    UK_ARCH_X86_64_APIC_ICR_DMODE_INIT;
 +
-+	xapic_write_icr(eax, dest);
-+	return 0;
++	return xapic_write_icr(eax, dest);
 +}
 +
 +#define apic_send_iipi_deassert() do {} while (0)
@@ -1565,10 +1887,32 @@ index 0000000..14cda71
 +}
 +#endif /* CONFIG_LIBUKBOOT */
 +
++/*
++ * The SIPI vector holds the startup page number of the trampoline.
++ * Reject a zero address, an address that is not page aligned, and an
++ * address at or above 1 MiB. A bad vector would send the AP to a
++ * wrong real-mode address. [Ticket f05cbd814a]
++ */
++static int sipi_vector_check(__u64 addr)
++{
++	if (addr < __PAGE_SIZE || addr >= 0x100000ULL ||
++	    (addr & (__PAGE_SIZE - 1)))
++		return -EINVAL;
++
++	return 0;
++}
++
 +static int kvm_x86_lcpu_start(__u64 idx)
 +{
++	int rc;
++
 +	/* Send INIT IPI */
-+	apic_send_iipi(uk_pcpuvar_lval(idx, uk_pcpuvar_cpu_id));
++	rc = apic_send_iipi(uk_pcpuvar_lval(idx, uk_pcpuvar_cpu_id));
++	if (unlikely(rc)) {
++		uk_pr_err("kvm: INIT IPI to AP 0x%lx failed: %d\n",
++			  uk_pcpuvar_lval(idx, uk_pcpuvar_cpu_id), rc);
++		return rc;
++	}
 +
 +	/* Deassert */
 +	apic_send_iipi_deassert();
@@ -1576,11 +1920,27 @@ index 0000000..14cda71
 +	return 0;
 +}
 +
++/*
++ * One SIPI round plus the trampoline run must finish fast. One
++ * second per AP is far above any real boot time and still ends the
++ * wait with a clear error. [Ticket f05cbd814a]
++ */
++#define UK_AP_ONLINE_TIMEOUT_MS		1000
++
 +#if CONFIG_HAVE_CPU_MULTI_PHASE_STARTUP
 +static int kvm_x86_lcpu_post_start(const __u64 lcpuidx[], unsigned int *num)
 +{
 +	__u64 id, this_cpu_id = uk_pcpuvar_current_get(uk_pcpuvar_cpu_id);
 +	unsigned int i, j;
++	int rc = 0;
++
++	if (unlikely(sipi_vector_check(
++			     uk_plat_native_x86_64_start16_addr) != 0)) {
++		uk_pr_err("GATE_FAIL: kvm: invalid SIPI vector 0x%lx; AP start refused\n",
++			  (unsigned long)
++			  uk_plat_native_x86_64_start16_addr);
++		return -EINVAL;
++	}
 +
 +	/* wait 10 msec (according to Intel manual 8.4.4.1) */
 +	mdelay(10);
@@ -1592,14 +1952,60 @@ index 0000000..14cda71
 +
 +		for (j = 0; j < 2; j++) {
 +			/* Send STARTUP IPI */
-+			apic_send_sipi(uk_plat_native_x86_64_start16_addr, id);
++			rc = apic_send_sipi(uk_plat_native_x86_64_start16_addr,
++					    id);
++			if (unlikely(rc)) {
++				uk_pr_err("GATE_FAIL: kvm: SIPI to AP 0x%lx failed: %d\n",
++					  id, rc);
++				return rc;
++			}
 +
 +			/* wait 200 usec (according to Intel manual 8.4.4.1) */
 +			udelay(200);
 +		}
 +	}
 +
-+	return 0;
++	/*
++	 * Check that every AP came online. On the AP, uk_lcpu_init
++	 * sets the per-CPU state to a busy state before the AP entry
++	 * runs. Retry SIPI at mid-timeout if the AP has not come online.
++	 * A core still offline after the timeout never started;
++	 * print GATE_FAIL naming the AP and mark it halted.
++	 * [Ticket f05cbd814a] [Ticket dd4a8c64ea]
++	 */
++	for (i = 0; i < *num; i++) {
++		struct uk_lcpu *lcpu;
++		unsigned int ms;
++		int retried = 0;
++
++		id = uk_pcpuvar_lval(lcpuidx[i], uk_pcpuvar_cpu_id);
++		if (id == this_cpu_id)
++			continue;
++
++		lcpu = &uk_pcpuvar_lval(lcpuidx[i], uk_lcpus);
++		for (ms = 0; ms < UK_AP_ONLINE_TIMEOUT_MS; ms++) {
++			if (uk_lcpu_state_is_online(uk_load_n(&lcpu->state)))
++				break;
++			if (!retried && ms >= (UK_AP_ONLINE_TIMEOUT_MS / 2)) {
++				/* Retry SIPI once before giving up */
++				apic_send_sipi(uk_plat_native_x86_64_start16_addr, id);
++				retried = 1;
++			}
++			mdelay(1);
++		}
++
++		if (unlikely(!uk_lcpu_state_is_online(
++				     uk_load_n(&lcpu->state)))) {
++			uk_pr_err("GATE_FAIL: kvm: AP 0x%lx did not come online within %d ms\n",
++				  id, UK_AP_ONLINE_TIMEOUT_MS);
++			lcpu->state = UK_LCPU_STATE_HALTED;
++			lcpu->error_code = -ETIMEDOUT;
++			if (!rc)
++				rc = -ETIMEDOUT;
++		}
++	}
++
++	return rc;
 +}
 +#endif /* CONFIG_HAVE_CPU_MULTI_PHASE_STARTUP */
 +#endif /* CONFIG_HAVE_SMP */
@@ -1641,16 +2047,37 @@ index 0000000..14cda71
 +	.halt_irq = kvm_x86_lcpu_halt_irq,
 +};
 +
++#if CONFIG_HAVE_SMP
++/*
++ * Used when the AP start setup fails. Without .start,
++ * uk_lcpu_start() returns -ENODEV and no AP receives an INIT or a
++ * SIPI. The core keeps its halt operations, so boot continues.
++ * [Ticket f05cbd814a]
++ */
++static const struct uk_lcpu_pm_ops kvm_x86_pm_ops_noap = {
++	.halt = kvm_x86_lcpu_halt,
++	.halt_irq = kvm_x86_lcpu_halt_irq,
++};
++#endif /* CONFIG_HAVE_SMP */
++
 +__isr static
 +int kvm_x86_lcpu_pm_ops_register(struct ukplat_bootinfo *bi __unused)
 +{
++#if CONFIG_HAVE_SMP
++	if (apic_mode_detect()) {
++		uk_pr_err("kvm: local APIC not ready; SMP start disabled\n");
++		return uk_lcpu_pm_ops_register(&kvm_x86_pm_ops_noap);
++	}
++#endif
 +#if CONFIG_LIBUKBOOT
-+	if (boot_memregion_alloc_sipi_vect(bi) < 0)
++	if (boot_memregion_alloc_sipi_vect(bi) < 0) {
++#if CONFIG_HAVE_SMP
++		uk_pr_err("kvm: failed to allocate SIPI vector trampoline; SMP start disabled\n");
++		return uk_lcpu_pm_ops_register(&kvm_x86_pm_ops_noap);
++#else
 +		uk_pr_warn("kvm: failed to allocate SIPI vector trampoline\n");
 +#endif
-+#if CONFIG_HAVE_SMP
-+	if (apic_mode_detect())
-+		uk_pr_warn("kvm: local APIC not ready; SMP start will fail\n");
++	}
 +#endif
 +	return uk_lcpu_pm_ops_register(&kvm_x86_pm_ops);
 +}

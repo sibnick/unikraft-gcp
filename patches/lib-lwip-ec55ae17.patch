@@ -88,7 +88,23 @@ index 710c160..0ec529a 100644
  #else  /* CONFIG_LWIP_NOTHREADS */
  #define NO_SYS 0
  #define LWIP_NETIF_LOOPBACK_MULTITHREADING 1
-@@ -253,6 +269,9 @@ void sys_free(void *ptr);
+@@ -201,7 +217,14 @@ void sys_free(void *ptr);
+ #define TCP_SNDLOWAT (4 * TCP_MSS)
+ #define TCP_SND_QUEUELEN (2 * (TCP_SND_BUF) / (TCP_MSS))
+ #define TCP_QUEUE_OOSEQ 4
+-#define MEMP_NUM_TCP_SEG ((MEMP_NUM_TCP_PCB) * ((TCP_SND_QUEUELEN) / 5))
++/*
++ * MEMP_NUM_TCP_SEG sizes the pool of struct tcp_seg. struct memp_desc.num
++ * is u16_t, so any count above 65535 overflows and silently truncates.
++ * Cap the count at 65535 with a plain ternary for preprocessor evaluation.
++ * [Ticket 150d621866]
++ */
++#define MEMP_NUM_TCP_SEG ((((MEMP_NUM_TCP_PCB) * ((TCP_SND_QUEUELEN) / 5)) > 65535) ? \
++	65535 : ((MEMP_NUM_TCP_PCB) * ((TCP_SND_QUEUELEN) / 5)))
+ #define MEMP_NUM_FRAG_PBUF 32
+ 
+ #endif /* LWIP_TCP */
+@@ -253,6 +276,9 @@ void sys_free(void *ptr);
  
  /* enable SO_REUSEADDR option */
  #define SO_REUSE 1
@@ -98,7 +114,7 @@ index 710c160..0ec529a 100644
  #endif /* LWIP_SOCKET */
  
  /**
-@@ -289,8 +308,13 @@ void sys_free(void *ptr);
+@@ -289,17 +315,32 @@ void sys_free(void *ptr);
   * this at the very last point in this configuration file.
   */
  #ifndef PBUF_POOL_SIZE
@@ -114,9 +130,18 @@ index 710c160..0ec529a 100644
  #endif
  #ifndef PBUF_POOL_BUFSIZE
  /* smallest PBUF_POOL_BUFSIZE which satisfies TCP_WND < PBUF_POOL_SIZE * (PBUF_POOL_BUFSIZE - protocol headers) */
-@@ -299,7 +323,10 @@ void sys_free(void *ptr);
+ #define PBUF_POOL_BUFSIZE ((TCP_WND / PBUF_POOL_SIZE) + (PBUF_LINK_ENCAPSULATION_HLEN + PBUF_LINK_HLEN + PBUF_IP_HLEN + PBUF_TRANSPORT_HLEN) + 1)
+ #endif
  #ifndef MEMP_NUM_PBUF
- #define MEMP_NUM_PBUF ((MEMP_NUM_TCP_PCB * (TCP_SND_QUEUELEN)) / 2)
+-#define MEMP_NUM_PBUF ((MEMP_NUM_TCP_PCB * (TCP_SND_QUEUELEN)) / 2)
++/*
++ * MEMP_NUM_PBUF sizes the pool of ROM and REF pbufs. struct memp_desc.num
++ * is u16_t, so any count above 65535 overflows and silently truncates.
++ * Cap the count at 65535 with a plain ternary for preprocessor evaluation.
++ * [Ticket 150d621866]
++ */
++#define MEMP_NUM_PBUF (((((MEMP_NUM_TCP_PCB) * (TCP_SND_QUEUELEN)) / 2) > 65535) ? \
++	65535 : (((MEMP_NUM_TCP_PCB) * (TCP_SND_QUEUELEN)) / 2))
  #endif
 +#if CONFIG_LWIP_THREADS
 +/* The input message pool is only used by the threaded stack input queue */

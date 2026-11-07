@@ -13,6 +13,13 @@
 #define GVE_PCI_DEVICE_ID		0x0042
 
 /*
+ * x86_64 base page size in bytes. The driver allocates and
+ * translates device buffers at this granularity. gve_main.c uses
+ * the same macro for its allocator and page-table arithmetic.
+ */
+#define GVE_PAGE_SIZE			4096ULL
+
+/*
  * BAR0 register layout (big-endian fields). Natural alignment
  * already reproduces the hardware offsets, so the struct stays
  * unpacked: passing &reg_bar0->member to the mmio helpers then
@@ -1041,6 +1048,37 @@ static inline int gve_qpl_within_limit(uint64_t total, uint64_t num_pages,
 	return (total + num_pages) <= max_pages;
 }
 
+/*
+ * Decide whether one page-table translation result can be a device
+ * DMA address for a driver buffer. uk_paging_virt_to_phys() reports
+ * an unmapped address through an assert in debug builds. A release
+ * build reads whatever the entry holds: a missing mapping comes back
+ * as the page offset alone, and an all-ones entry comes back as the
+ * all-ones word. A unikraft heap frame is never physical page 0, so
+ * both values indicate a failed translation. Return 1 when the
+ * caller may use the address. Ticket dd5b22a059.
+ */
+static inline int gve_dma_paddr_is_valid(uint64_t paddr)
+{
+	return (paddr >= GVE_PAGE_SIZE) && (paddr != ~0ULL);
+}
+
+/*
+ * Decide whether two neighboring virtual pages are neighboring
+ * physical frames. prev is the device address of one page start,
+ * next the device address of the page immediately after it. The
+ * driver may describe a buffer with one DMA address only when every
+ * page of the buffer follows the previous one with no gap. That is
+ * the rule the core uksglist code applies when it counts segments.
+ * The unsigned subtraction wraps on a reversed pair, so a bogus
+ * next value fails. Return 1 when the frames are adjacent. Ticket
+ * dd5b22a059.
+ */
+static inline int gve_dma_pages_adjacent(uint64_t prev, uint64_t next)
+{
+	return (next - prev) == GVE_PAGE_SIZE;
+}
+
 #define GVE_BAR_WINDOW_SIZE	(1ULL << 30)	/* one 1 GiB PDPT window */
 
 /*
@@ -1157,6 +1195,118 @@ static inline uint32_t gve_ntfy_cap(uint32_t want, uint32_t counters)
  * dispatcher thread, and the stack all run in this unikernel.
  */
 #define GVE_MSI_ADDR_LO			0xfee00000U
+
+/*
+ * Static platform IRQ boundary (ticket d9cdb2c635).
+ * IRQs below 17 belong to legacy or platform devices (PIT 0, IPI 13
+ * and 14, LAPIC timer 16). The MSI-X pool must skip them.
+ */
+#define GVE_MSIX_MIN_IRQ		17U
+#define GVE_MSIX_MAX_SKIPPED_IRQS	17U
+
+/*
+ * MSI-X IRQ reservation logic (ticket d9cdb2c635).
+ * Reserve want IRQs, skipping platform static IRQs below GVE_MSIX_MIN_IRQ.
+ * Skipped IRQs stay retained in a temporary buffer until the reservation
+ * completes or fails. A first-fit allocator then does not loop on the same
+ * low IRQ.
+ */
+static inline int gve_msix_reserve_irqs(uint16_t *pool, uint32_t want,
+					int (*alloc_fn)(unsigned int *irq, void *arg),
+					void (*free_fn)(unsigned int *irq, void *arg),
+					void *arg)
+{
+	unsigned int skipped[GVE_MSIX_MAX_SKIPPED_IRQS];
+	uint32_t num_skipped = 0U;
+	uint32_t i, j;
+	int rc = 0;
+
+	for (i = 0; i < want; i++) {
+		for (;;) {
+			unsigned int irq = 0U;
+
+			if (alloc_fn(&irq, arg) != 0) {
+				rc = -1;
+				goto out_cleanup;
+			}
+			if (irq >= GVE_MSIX_MIN_IRQ) {
+				pool[i] = (uint16_t)(irq + 1U);
+				break;
+			}
+			if (num_skipped >= GVE_MSIX_MAX_SKIPPED_IRQS) {
+				free_fn(&irq, arg);
+				rc = -1;
+				goto out_cleanup;
+			}
+			skipped[num_skipped++] = irq;
+		}
+	}
+
+out_cleanup:
+	for (j = 0; j < num_skipped; j++)
+		free_fn(&skipped[j], arg);
+
+	if (rc != 0) {
+		for (j = 0; j < i; j++) {
+			unsigned int irq;
+
+			if (pool[j] == 0U)
+				continue;
+			irq = pool[j] - 1U;
+			free_fn(&irq, arg);
+			pool[j] = 0U;
+		}
+	}
+	return rc;
+}
+
+/*
+ * Unwind actions for the MSI-X probe error path (ticket 0005e7ce7e).
+ * An entry of the IRQ pool stores irq + 1, and 0 means the entry
+ * holds nothing. The enable bit lives in the MSI-X capability
+ * control word.
+ */
+#define GVE_MSIX_UNWIND_IRQS		(1U << 0)	/* free pool irqs */
+#define GVE_MSIX_UNWIND_CTRL		(1U << 1)	/* clear the enable bit */
+
+/*
+ * Decide what the MSI-X error path must unwind for one device
+ * state. The pool array records the held irqs, and ctrl_on says
+ * whether the probe wrote the MSI-X enable bit. The reservation
+ * path and the teardown path share these flags, so an early stop in
+ * the pool loop and the probe error path release exactly what the
+ * probe took. Return the flag set.
+ */
+static inline unsigned int gve_msix_unwind_flags(const uint16_t *pool,
+						 uint32_t pool_len,
+						 int ctrl_on)
+{
+	unsigned int flags = 0U;
+	uint32_t i;
+
+	for (i = 0; i < pool_len; i++) {
+		if (pool[i] != 0U) {
+			flags |= GVE_MSIX_UNWIND_IRQS;
+			break;
+		}
+	}
+	if (ctrl_on != 0)
+		flags |= GVE_MSIX_UNWIND_CTRL;
+	return flags;
+}
+
+/*
+ * Decide whether thread context must report MSI-X RX events. The ISR
+ * only counts events: printing from interrupt context can deadlock on
+ * the console lock (ticket cc8e850241). The receive path calls this
+ * helper with the per-queue event count and the marker flag. Return 1
+ * when events arrived and the gate marker has not printed yet. The
+ * caller then claims the one-shot print with an atomic exchange.
+ */
+static inline int gve_msix_marker_due(uint32_t events, uint8_t marker_done)
+{
+	return (events != 0U) && (marker_done == 0U);
+}
 
 /*
  * DQO IRQ doorbell values. The device masks a notification block when

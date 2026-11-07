@@ -1,6 +1,8 @@
+diff --git a/Config.uk b/Config.uk
+index 5603556..0b11d08 100644
 --- a/Config.uk
 +++ b/Config.uk
-@@ -374,6 +374,27 @@
+@@ -374,6 +374,27 @@ config LWIP_UKNETDEV_POLLRX
  		delivery is the pattern every proven cloud gate uses.
  		Ticket 4ecf9dcedf.
  
@@ -28,9 +30,11 @@
  menuconfig LWIP_DEBUG
  	bool "Debug messages"
  	default n
+diff --git a/Makefile.uk b/Makefile.uk
+index 9cca88c..9ccec75 100644
 --- a/Makefile.uk
 +++ b/Makefile.uk
-@@ -75,6 +75,10 @@
+@@ -75,6 +75,10 @@ CINCLUDES-$(CONFIG_LIBLWIP)   += $(LIBLWIP_COMMON_INCLUDES-y)
  CXXINCLUDES-$(CONFIG_LIBLWIP) += $(LIBLWIP_COMMON_INCLUDES-y)
  $(eval $(call uknetdev_scratch_mem,$(CONFIG_LWIP_UKNETDEV_SCRATCH)))
  
@@ -41,7 +45,7 @@
  ################################################################################
  # Library flags
  ################################################################################
-@@ -135,6 +139,8 @@
+@@ -135,6 +139,8 @@ LIBLWIP_SRCS-$(CONFIG_LWIP_SOCKET) += $(LIBLWIP_EXTRACTED)/api/sockets.c
  LIBLWIP_SRCS-y += $(LIBLWIP_EXTRACTED)/netif/ethernet.c
  LIBLWIP_SRCS-$(CONFIG_LWIP_UKNETDEV) += $(LIBLWIP_BASE)/netbuf.c|unikraft
  LIBLWIP_SRCS-$(CONFIG_LWIP_UKNETDEV) += $(LIBLWIP_BASE)/uknetdev.c|unikraft
@@ -50,9 +54,12 @@
  
  ################################################################################
  # IPv4
+diff --git a/staticarp.c b/staticarp.c
+new file mode 100644
+index 0000000..74c774a
 --- /dev/null
 +++ b/staticarp.c
-@@ -0,0 +1,124 @@
+@@ -0,0 +1,147 @@
 +/* SPDX-License-Identifier: BSD-3-Clause */
 +/*
 + * Static ARP entries for boot-declared peers (unikraft-gcp ticket
@@ -101,15 +108,21 @@
 +
 +static int ukg_staticarp_installed;
 +
-+/* Map every boot-declared peer to the encoded gateway MAC. Runs once;
-+ * entries are global to the ARP table, so a later netif change cannot
-+ * invalidate them, and etharp_add_static_entry() is idempotent. */
++/* Map every boot-declared peer to the encoded gateway MAC. The flag
++ * sticks only when every entry succeeded. A full ARP table makes
++ * etharp_add_static_entry() fail, so the code waits for the next netif
++ * event and retries then. Entries with an unparsable address are a
++ * fixed configuration mistake: the code reports one warning and drops
++ * them, so a retry does not repeat the message. Entries are global to
++ * the ARP table, so a later netif change cannot invalidate them, and
++ * etharp_add_static_entry() is idempotent. Ticket 5b7ed0ad6d. */
 +static void ukg_staticarp_install(struct netif *nf)
 +{
 +	const ip4_addr_t *gw;
 +	struct eth_addr gw_mac;
 +	ip4_addr_t peer;
 +	int i;
++	int pending = 0;
 +	err_t err;
 +
 +	if (ukg_staticarp_installed || !nf)
@@ -132,6 +145,7 @@
 +		if (ip4addr_aton(staticarp[i], &peer) != 1) {
 +			uk_pr_warn("staticarp: unparsable peer %s\n",
 +				   staticarp[i]);
++			staticarp[i] = NULL; /* do not retry a bad value */
 +			continue;
 +		}
 +		err = etharp_add_static_entry(&peer, &gw_mac);
@@ -140,11 +154,14 @@
 +				   staticarp[i], gw_mac.addr[2],
 +				   gw_mac.addr[3], gw_mac.addr[4],
 +				   gw_mac.addr[5]);
-+		else
-+			uk_pr_warn("staticarp: entry for %s failed (%d)\n",
++		else {
++			uk_pr_warn("staticarp: entry for %s failed (%d), retry on the next netif event\n",
 +				   staticarp[i], (int) err);
++			pending++;
++		}
 +	}
-+	ukg_staticarp_installed = 1;
++	if (pending == 0)
++		ukg_staticarp_installed = 1;
 +}
 +
 +static void ukg_staticarp_cb(struct netif *nf, netif_nsc_reason_t reason,
@@ -163,6 +180,19 @@
 +
 +static int ukg_staticarp_init(struct uk_init_ctx *ictx __unused)
 +{
++	/*
++	 * The libparam array fills slots in order, so a used last slot
++	 * means at least UKG_STATICARP_MAXPEERS peers were declared.
++	 * libparam drops any further lwip.staticarp= value with no view
++	 * for the library. ukboot also clears the boot cmdline from the
++	 * boot info before library init calls run, so the exact declared
++	 * count cannot be recovered here. Warn when the array is full:
++	 * that is exactly the case where the code can drop a peer in
++	 * silence. Ticket 5b7ed0ad6d.
++	 */
++	if (staticarp[UKG_STATICARP_MAXPEERS - 1] != NULL)
++		uk_pr_warn("staticarp: all %d peer slots are used: extra lwip.staticarp= values on the command line have no effect\n",
++			   UKG_STATICARP_MAXPEERS);
 +	netif_add_ext_callback(&ukg_staticarp, ukg_staticarp_cb);
 +	/* liblwip_init (library init priority 0) already applied a
 +	 * static netdev.ip address before this call runs, so the

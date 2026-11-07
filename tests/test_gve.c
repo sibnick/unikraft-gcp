@@ -2,8 +2,9 @@
 /*
  * Host unit tests for Google Virtual Ethernet (gVNIC) protocol structures,
  * Admin Queue command builders, GQI/DQO descriptor ring logic, TX free-slot
- * accounting, chain bound checks, RX tailroom decisions, and refill
- * doorbell thresholds.
+ * accounting, chain bound checks, RX tailroom decisions, refill doorbell
+ * thresholds, the MSI-X marker decision and unwind flags, and the device
+ * DMA translation checks.
  */
 
 #include <stdio.h>
@@ -846,6 +847,254 @@ static void test_itr_arm_value_dqo(void)
 	assert(gve_itr_arm_value_dqo(2U << 17) == GVE_ITR_ENABLE_BIT_DQO);
 }
 
+/*
+ * MSI-X gate-marker decision. The ISR only counts events now:
+ * printing from interrupt context can deadlock on the console lock.
+ * The receive path consults this helper before claiming the one-shot
+ * print. Ticket cc8e850241.
+ */
+static void test_msix_marker_due(void)
+{
+	/* No events yet: nothing to report. */
+	assert(!gve_msix_marker_due(0U, 0U));
+	/* Events and the marker not printed: report. */
+	assert(gve_msix_marker_due(1U, 0U));
+	assert(gve_msix_marker_due(4096U, 0U));
+	/* Marker already printed: stay quiet even with events. */
+	assert(!gve_msix_marker_due(1U, 1U));
+	assert(!gve_msix_marker_due(100U, 1U));
+	/* Zero events after the print: quiet. */
+	assert(!gve_msix_marker_due(0U, 1U));
+	/* Counters are plain uint32 event counts, so the helper must
+	   not treat a power-of-two count specially any more. */
+	assert(gve_msix_marker_due(2U, 0U));
+	assert(gve_msix_marker_due(1024U, 0U));
+}
+
+/*
+ * Device DMA translation checks. uk_paging_virt_to_phys cannot
+ * report a failed walk in a release build: a missing mapping comes
+ * back as the page offset alone, and non-contiguous heap frames
+ * would make the device touch the wrong guest memory. The driver
+ * rejects both cases before programming a descriptor. Ticket
+ * dd5b22a059.
+ */
+static void test_dma_translation(void)
+{
+	/* The page constant is shared with the driver translation. */
+	assert(GVE_PAGE_SIZE == 4096ULL);
+
+	/* A translation below one page means the walk found nothing:
+	   an absent entry reads zero, so the result is the offset. */
+	assert(!gve_dma_paddr_is_valid(0ULL));
+	assert(!gve_dma_paddr_is_valid(1ULL));
+	assert(!gve_dma_paddr_is_valid(GVE_PAGE_SIZE - 1ULL));
+	/* The all-ones word is the other bogus entry value. */
+	assert(!gve_dma_paddr_is_valid(~0ULL));
+
+	/* Frame 1 and above are usable device addresses. The unikraft
+	   heap never lives in physical page 0. */
+	assert(gve_dma_paddr_is_valid(GVE_PAGE_SIZE));
+	assert(gve_dma_paddr_is_valid(GVE_PAGE_SIZE + 0x800ULL));
+	/* The 16 GiB heap base translates into valid range. */
+	assert(gve_dma_paddr_is_valid(0x400000000ULL));
+
+	/* Adjacent frames: the only layout one DMA address may
+	   describe. */
+	assert(gve_dma_pages_adjacent(0x1000ULL, 0x2000ULL));
+	assert(gve_dma_pages_adjacent(0x400000000ULL, 0x400001000ULL));
+	/* Same frame twice, a gap, or a reversed pair: refuse. */
+	assert(!gve_dma_pages_adjacent(0x1000ULL, 0x1000ULL));
+	assert(!gve_dma_pages_adjacent(0x1000ULL, 0x3000ULL));
+	assert(!gve_dma_pages_adjacent(0x3000ULL, 0x1000ULL));
+	/* Bogus walk results (zero page, garbage) never sit exactly
+	   one page after a valid address. */
+	assert(!gve_dma_pages_adjacent(0x400001000ULL, 0x800ULL));
+	assert(!gve_dma_pages_adjacent(0x400001000ULL, ~0ULL));
+	/* Offsets inside a frame break adjacency the same way: the
+	   device address of a page start is frame-aligned. */
+	assert(!gve_dma_pages_adjacent(0x1000ULL, 0x2800ULL));
+}
+
+/*
+ * MSI-X probe unwind flags. The reservation and the release must
+ * match: the pool stores irq + 1, and the control-word flag tracks
+ * the MSI-X enable bit. Ticket 0005e7ce7e.
+ */
+static void test_msix_unwind_flags(void)
+{
+	uint16_t pool[5];
+
+	memset(pool, 0, sizeof(pool));
+	/* Fresh probe: nothing taken, nothing to unwind. */
+	assert(gve_msix_unwind_flags(pool, 5U, 0) == 0U);
+
+	/* Enable bit written, no irq yet: the pool loop failed on the
+	   first allocation, so only the control word needs a clear. */
+	assert(gve_msix_unwind_flags(pool, 5U, 1) == GVE_MSIX_UNWIND_CTRL);
+
+	/* Full pool: free the irqs and clear the bit. Entries store
+	   irq + 1, so held entries hold at least one. */
+	pool[0] = 18U;	/* irq 17 */
+	pool[1] = 19U;
+	pool[2] = 20U;
+	pool[3] = 21U;
+	pool[4] = 22U;
+	assert(gve_msix_unwind_flags(pool, 5U, 1) ==
+	       (GVE_MSIX_UNWIND_IRQS | GVE_MSIX_UNWIND_CTRL));
+
+	/* Partial pool: the allocation stopped early. Both sides must
+	   still unwind: the held irqs and the enable bit. */
+	pool[4] = 0U;
+	assert(gve_msix_unwind_flags(pool, 5U, 1) ==
+	       (GVE_MSIX_UNWIND_IRQS | GVE_MSIX_UNWIND_CTRL));
+
+	/* After the teardown zeroes the pool and clears the control
+	   flag, a second unwind is a no-op. */
+	memset(pool, 0, sizeof(pool));
+	assert(gve_msix_unwind_flags(pool, 5U, 0) == 0U);
+
+	/* Held irqs alone: the irq flag is independent of the
+	   control-word state. */
+	pool[2] = 18U;
+	assert(gve_msix_unwind_flags(pool, 5U, 0) == GVE_MSIX_UNWIND_IRQS);
+}
+
+/*
+ * MSI-X first-fit allocator reservation (ticket d9cdb2c635).
+ * A first-fit allocator returns the lowest free IRQ.
+ * Retain skipped low IRQs (< 17) during allocation to prevent
+ * an infinite loop. Free them after the loop completes.
+ */
+struct mock_irq_allocator {
+	uint64_t bitmap;
+	uint32_t alloc_calls;
+	uint32_t free_calls;
+	uint32_t max_allocatable;
+	uint32_t freed_irqs[64];
+	uint32_t num_freed;
+};
+
+static int mock_first_fit_alloc(unsigned int *irq, void *arg)
+{
+	struct mock_irq_allocator *m = (struct mock_irq_allocator *)arg;
+	uint32_t i;
+
+	m->alloc_calls++;
+	for (i = 0; i <= m->max_allocatable && i < 64U; i++) {
+		if ((m->bitmap & (1ULL << i)) == 0ULL) {
+			m->bitmap |= (1ULL << i);
+			*irq = i;
+			return 0;
+		}
+	}
+	return -1;
+}
+
+static void mock_first_fit_free(unsigned int *irq, void *arg)
+{
+	struct mock_irq_allocator *m = (struct mock_irq_allocator *)arg;
+	unsigned int val = *irq;
+
+	m->free_calls++;
+	assert(val < 64U);
+	assert((m->bitmap & (1ULL << val)) != 0ULL);
+	m->bitmap &= ~(1ULL << val);
+	if (m->num_freed < 64U)
+		m->freed_irqs[m->num_freed++] = val;
+}
+
+static void test_msix_first_fit_reservation(void)
+{
+	struct mock_irq_allocator mock;
+	uint16_t pool[8];
+	uint32_t k;
+
+	/*
+	 * Scenario 1: Low IRQs 0..16 are initially free.
+	 * The allocator returns 0 first. The reservation holds
+	 * 0..16, allocates 17..20, and frees 0..16 back.
+	 */
+	memset(&mock, 0, sizeof(mock));
+	memset(pool, 0, sizeof(pool));
+	mock.max_allocatable = 31U;
+
+	assert(gve_msix_reserve_irqs(pool, 4U, mock_first_fit_alloc,
+				     mock_first_fit_free, &mock) == 0);
+
+	/* Pool holds IRQs 17, 18, 19, 20 stored as irq + 1. */
+	assert(pool[0] == 18U);
+	assert(pool[1] == 19U);
+	assert(pool[2] == 20U);
+	assert(pool[3] == 21U);
+	assert(pool[4] == 0U);
+
+	/* Exactly 17 static IRQs were skipped and then freed. */
+	assert(mock.num_freed == 17U);
+	for (k = 0; k < 17U; k++)
+		assert((mock.bitmap & (1ULL << k)) == 0ULL);
+
+	/* Only IRQs 17..20 remain allocated in the bitmap. */
+	assert(mock.bitmap == ((1ULL << 17) | (1ULL << 18) |
+			       (1ULL << 19) | (1ULL << 20)));
+
+	/* Total alloc calls: 17 skipped plus 4 pool equals 21. */
+	assert(mock.alloc_calls == 21U);
+	assert(mock.free_calls == 17U);
+
+	/*
+	 * Scenario 2: Static IRQs 0..16 are already allocated.
+	 * The allocator returns 17 immediately.
+	 */
+	memset(&mock, 0, sizeof(mock));
+	memset(pool, 0, sizeof(pool));
+	mock.max_allocatable = 31U;
+	mock.bitmap = 0x1ffffULL;
+
+	assert(gve_msix_reserve_irqs(pool, 2U, mock_first_fit_alloc,
+				     mock_first_fit_free, &mock) == 0);
+	assert(pool[0] == 18U);
+	assert(pool[1] == 19U);
+	assert(mock.num_freed == 0U);
+	assert(mock.alloc_calls == 2U);
+	assert(mock.free_calls == 0U);
+
+	/*
+	 * Scenario 3: Allocator runs out of IRQs during reservation.
+	 * Both skipped and pool IRQs unwind cleanly.
+	 */
+	memset(&mock, 0, sizeof(mock));
+	memset(pool, 0, sizeof(pool));
+	mock.max_allocatable = 18U;
+
+	assert(gve_msix_reserve_irqs(pool, 4U, mock_first_fit_alloc,
+				     mock_first_fit_free, &mock) != 0);
+
+	/* All IRQs unwound. The bitmap is completely clean. */
+	assert(mock.bitmap == 0ULL);
+	for (k = 0; k < 4U; k++)
+		assert(pool[k] == 0U);
+
+	/*
+	 * Scenario 4: Bound check on static IRQ limit.
+	 * An immediate free causes an infinite loop with first fit.
+	 * Demonstrate the first-fit repeat behavior on immediate free.
+	 */
+	{
+		unsigned int test_irq = 999U;
+
+		mock.bitmap = 0ULL;
+		mock.num_freed = 0U;
+		assert(mock_first_fit_alloc(&test_irq, &mock) == 0);
+		assert(test_irq == 0U);
+		mock_first_fit_free(&test_irq, &mock);
+		/* Immediate free returns 0 again on the next call. */
+		assert(mock_first_fit_alloc(&test_irq, &mock) == 0);
+		assert(test_irq == 0U);
+		mock_first_fit_free(&test_irq, &mock);
+	}
+}
+
 int main(void)
 {
 	test_adminq_configure_resources();
@@ -876,6 +1125,10 @@ int main(void)
 	test_rss_lut_fill();
 	test_rss_key_fill();
 	test_itr_arm_value_dqo();
+	test_msix_marker_due();
+	test_dma_translation();
+	test_msix_unwind_flags();
+	test_msix_first_fit_reservation();
 	printf("test_gve: all unit tests passed\n");
 	return 0;
 }

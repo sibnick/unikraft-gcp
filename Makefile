@@ -26,6 +26,9 @@ test-host:
 	@cc -Wall -Wextra -Werror -std=c11 -Idrivers/gve/include tests/test_gve.c -o /tmp/test_gve
 	@/tmp/test_gve
 	@rm -f /tmp/test_gve
+	@cc -Wall -Wextra -Werror -std=c11 -Isamples/common tests/test_http_close.c -o /tmp/test_http_close
+	@/tmp/test_http_close
+	@rm -f /tmp/test_http_close
 	@bash tests/test_evidence_store.sh
 	@bash tests/test_gate_logic.sh
 	@bash tests/test_ab_report.sh

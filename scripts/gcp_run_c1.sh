@@ -50,6 +50,29 @@ MACHINE_TYPE="${MACHINE_TYPE:-c3-standard-4}"
 CLIENT_MACHINE="${UKG_CLIENT_MACHINE:-e2-standard-2}"
 UBUNTU_FAMILY="${UKG_UBUNTU_FAMILY:-ubuntu-2404-lts-amd64}"
 UBUNTU_PROJECT="${UKG_UBUNTU_PROJECT:-ubuntu-os-cloud}"
+UBUNTU_IMAGE="${UKG_UBUNTU_IMAGE:-}"
+
+# If UKG_UBUNTU_IMAGE is not set, resolve the latest image from the family.
+# This records the exact base image version for the run.
+if [ -z "${UBUNTU_IMAGE}" ] && command -v gcloud >/dev/null 2>&1; then
+    RESOLVED_IMAGE="$(gcloud compute images describe-from-family "${UBUNTU_FAMILY}" --project="${UBUNTU_PROJECT}" --format="value(name)" 2>/dev/null || true)"
+    if [ -n "${RESOLVED_IMAGE}" ]; then
+        UBUNTU_IMAGE="${RESOLVED_IMAGE}"
+    fi
+fi
+
+# Pinned guest package versions. The A/B baseline must not drift
+# between runs, so the startup scripts install these exact versions.
+# Sibling package nginx-common must match the nginx version.
+# The defaults are Ubuntu 24.04 LTS (noble) release versions. Update
+# them together with UKG_UBUNTU_FAMILY, or pass a per-run override.
+# Each guest prints its installed version to the serial log, so the
+# stored evidence names the exact packages. Acquire::Retries keeps a
+# flaky apt mirror from failing the gate after billable time.
+# Tickets 1a21e263ad and ca3a596670.
+WRK_VERSION="${UKG_WRK_VERSION:-4.1.0-4build2}"
+NGINX_VERSION="${UKG_NGINX_VERSION:-1.24.0-2ubuntu7}"
+NGINX_COMMON_VERSION="${UKG_NGINX_COMMON_VERSION:-${NGINX_VERSION}}"
 
 # Smoke sweep parameters. The full matrix run overrides these.
 WRK_THREADS="${UKG_WRK_THREADS:-2}"
@@ -74,12 +97,11 @@ COMBINED_LOG="$(ukg_mk_serial_log "${UKG_RUN}")"
 
 # Guest startup scripts, rendered below and passed through instance
 # metadata. Placeholders keep them readable as literal templates.
-LOG_DIR="${UKG_LOG_DIR:-/tmp/opencode}"
-mkdir -p "${LOG_DIR}"
-CLI_SCRIPT="$(mktemp "${LOG_DIR}/${UKG_RUN}-cli-startup-XXXXXX.sh")"
+# The helper places them in the private per-user log directory.
+CLI_SCRIPT="$(ukg_mk_startup_script "${UKG_RUN}" cli)"
 SRV_SCRIPT=""
 if [ "${UKG_TARGET}" = "linux" ]; then
-    SRV_SCRIPT="$(mktemp "${LOG_DIR}/${UKG_RUN}-srv-startup-XXXXXX.sh")"
+    SRV_SCRIPT="$(ukg_mk_startup_script "${UKG_RUN}" srv)"
 fi
 
 # Evidence contract wiring, same as the B3 script.
@@ -101,7 +123,9 @@ echo "Run ID:       ${UKG_RUN}"
 echo "Server:       ${SRV_NAME} (${SRV_IP})"
 echo "Client:       ${CLI_NAME} (${CLI_IP})"
 echo "Subnet:       ${SUBNET}"
+echo "Image:        family=${UBUNTU_FAMILY} project=${UBUNTU_PROJECT} image=${UBUNTU_IMAGE:-latest}"
 echo "wrk:          -t${WRK_THREADS} -c${WRK_CONNS} -d${WRK_DURATION}s --latency"
+echo "Packages:     wrk=${WRK_VERSION} nginx=${NGINX_VERSION} nginx-common=${NGINX_COMMON_VERSION}"
 echo "Logs:         ${SRV_LOG} ${CLI_LOG} ${COMBINED_LOG}"
 echo "=================================================="
 
@@ -126,6 +150,17 @@ cat >"${CLI_SCRIPT}" <<'CLI_EOF'
 # C1 wrk benchmark client (run @@RUN@@). Ticket 4c76b4d84d.
 exec > /dev/console 2>&1
 echo "C1CLIENT start run=@@RUN@@ target=@@TARGET@@ threads=@@THREADS@@ connections=@@CONNS@@ duration=@@DURATION@@s"
+GCP_IMAGE="unknown"
+if command -v curl >/dev/null 2>&1; then
+    GCP_IMAGE="$(curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/image 2>/dev/null || echo "unknown")"
+elif command -v wget >/dev/null 2>&1; then
+    GCP_IMAGE="$(wget -qO- --header="Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/image 2>/dev/null || echo "unknown")"
+fi
+OS_RELEASE="unknown"
+if [ -f /etc/os-release ]; then
+    OS_RELEASE="$(. /etc/os-release && echo "${VERSION:-unknown}")"
+fi
+echo "BASE_IMAGE family=@@UBUNTU_FAMILY@@ project=@@UBUNTU_PROJECT@@ image=@@UBUNTU_IMAGE@@ actual=${GCP_IMAGE} os=${OS_RELEASE}"
 TARGET="@@TARGET@@"
 PORT=80
 READY=0
@@ -142,16 +177,17 @@ if [ "${READY}" != "1" ]; then
     exit 1
 fi
 export DEBIAN_FRONTEND=noninteractive
-if ! apt-get update -qq; then
+if ! apt-get update -qq -o Acquire::Retries=5; then
     echo "GATE_HTTP_BENCH_FAIL: apt-get update failed"
     poweroff
     exit 1
 fi
-if ! apt-get install -y -qq wrk; then
-    echo "GATE_HTTP_BENCH_FAIL: could not install wrk"
+if ! apt-get install -y -qq -o Acquire::Retries=5 "wrk=@@WRK_VERSION@@"; then
+    echo "GATE_HTTP_BENCH_FAIL: could not install pinned wrk=@@WRK_VERSION@@. Set UKG_WRK_VERSION to a version this image offers."
     poweroff
     exit 1
 fi
+dpkg-query -W -f='PKG wrk ${Version}\n' wrk
 echo "WRK_BEGIN"
 wrk -t@@THREADS@@ -c@@CONNS@@ -d@@DURATION@@s --latency "http://${TARGET}:${PORT}/" 2>&1 | tee /tmp/wrk-report.txt
 echo "WRK_END"
@@ -168,11 +204,15 @@ fi
 poweroff
 CLI_EOF
 sed -i \
-    -e "s|@@RUN@@|${UKG_RUN}|g" \
-    -e "s|@@TARGET@@|${SRV_IP}|g" \
-    -e "s|@@THREADS@@|${WRK_THREADS}|g" \
-    -e "s|@@CONNS@@|${WRK_CONNS}|g" \
-    -e "s|@@DURATION@@|${WRK_DURATION}|g" \
+    -e "s|@@RUN@@|$(ukg_escape_sed "${UKG_RUN}")|g" \
+    -e "s|@@TARGET@@|$(ukg_escape_sed "${SRV_IP}")|g" \
+    -e "s|@@THREADS@@|$(ukg_escape_sed "${WRK_THREADS}")|g" \
+    -e "s|@@CONNS@@|$(ukg_escape_sed "${WRK_CONNS}")|g" \
+    -e "s|@@DURATION@@|$(ukg_escape_sed "${WRK_DURATION}")|g" \
+    -e "s|@@WRK_VERSION@@|$(ukg_escape_sed "${WRK_VERSION}")|g" \
+    -e "s|@@UBUNTU_FAMILY@@|$(ukg_escape_sed "${UBUNTU_FAMILY}")|g" \
+    -e "s|@@UBUNTU_PROJECT@@|$(ukg_escape_sed "${UBUNTU_PROJECT}")|g" \
+    -e "s|@@UBUNTU_IMAGE@@|$(ukg_escape_sed "${UBUNTU_IMAGE}")|g" \
     "${CLI_SCRIPT}"
 
 # 3. Render the nginx baseline server script for the linux flavor.
@@ -184,15 +224,28 @@ if [ "${UKG_TARGET}" = "linux" ]; then
 # C1 nginx baseline server (run @@RUN@@). Ticket 4c76b4d84d.
 exec > /dev/console 2>&1
 echo "C1SERVER nginx baseline run=@@RUN@@"
+GCP_IMAGE="unknown"
+if command -v curl >/dev/null 2>&1; then
+    GCP_IMAGE="$(curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/image 2>/dev/null || echo "unknown")"
+elif command -v wget >/dev/null 2>&1; then
+    GCP_IMAGE="$(wget -qO- --header="Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/image 2>/dev/null || echo "unknown")"
+fi
+OS_RELEASE="unknown"
+if [ -f /etc/os-release ]; then
+    OS_RELEASE="$(. /etc/os-release && echo "${VERSION:-unknown}")"
+fi
+echo "BASE_IMAGE family=@@UBUNTU_FAMILY@@ project=@@UBUNTU_PROJECT@@ image=@@UBUNTU_IMAGE@@ actual=${GCP_IMAGE} os=${OS_RELEASE}"
 export DEBIAN_FRONTEND=noninteractive
-if ! apt-get update -qq; then
+if ! apt-get update -qq -o Acquire::Retries=5; then
     echo "GATE_NGINX_FAIL: apt-get update failed"
     exit 1
 fi
-if ! apt-get install -y -qq nginx; then
-    echo "GATE_NGINX_FAIL: nginx install failed"
+if ! apt-get install -y -qq -o Acquire::Retries=5 "nginx=@@NGINX_VERSION@@" "nginx-common=@@NGINX_COMMON_VERSION@@"; then
+    echo "GATE_NGINX_FAIL: could not install pinned nginx=@@NGINX_VERSION@@ nginx-common=@@NGINX_COMMON_VERSION@@. Set UKG_NGINX_VERSION to a version this image offers."
     exit 1
 fi
+dpkg-query -W -f='PKG nginx ${Version}\n' nginx
+dpkg-query -W -f='PKG nginx-common ${Version}\n' nginx-common
 if ! systemctl enable --now nginx; then
     echo "GATE_NGINX_FAIL: nginx did not start"
     exit 1
@@ -204,8 +257,14 @@ if ! systemctl is-active --quiet nginx; then
 fi
 echo "GATE_NGINX_UP"
 SRV_EOF
-    sed -e "s|@@RUN@@|${UKG_RUN}|g" "${SRV_SCRIPT}" >"${SRV_SCRIPT}.tmp"
-    mv -f "${SRV_SCRIPT}.tmp" "${SRV_SCRIPT}"
+    sed -i \
+        -e "s|@@RUN@@|$(ukg_escape_sed "${UKG_RUN}")|g" \
+        -e "s|@@NGINX_VERSION@@|$(ukg_escape_sed "${NGINX_VERSION}")|g" \
+        -e "s|@@NGINX_COMMON_VERSION@@|$(ukg_escape_sed "${NGINX_COMMON_VERSION}")|g" \
+        -e "s|@@UBUNTU_FAMILY@@|$(ukg_escape_sed "${UBUNTU_FAMILY}")|g" \
+        -e "s|@@UBUNTU_PROJECT@@|$(ukg_escape_sed "${UBUNTU_PROJECT}")|g" \
+        -e "s|@@UBUNTU_IMAGE@@|$(ukg_escape_sed "${UBUNTU_IMAGE}")|g" \
+        "${SRV_SCRIPT}"
 fi
 
 # 4. Internal firewall rule. Open only what the gate needs: TCP 80
@@ -260,14 +319,19 @@ ukg_c1_create_srv() {
             --tags=ukg-vm \
             --labels="run=${UKG_RUN}"
     else
+        local image_args=()
+        if [ -n "${UBUNTU_IMAGE}" ]; then
+            image_args=(--image="${UBUNTU_IMAGE}" --image-project="${UBUNTU_PROJECT}")
+        else
+            image_args=(--image-family="${UBUNTU_FAMILY}" --image-project="${UBUNTU_PROJECT}")
+        fi
         gcloud compute instances create "${SRV_NAME}" \
             --zone="${z}" \
             --project="${GCP_PROJECT}" \
             --machine-type="${MACHINE_TYPE}" \
             --boot-disk-type=pd-balanced \
             --network-interface="nic-type=GVNIC,private-network-ip=${SRV_IP}" \
-            --image-family="${UBUNTU_FAMILY}" \
-            --image-project="${UBUNTU_PROJECT}" \
+            "${image_args[@]}" \
             --metadata-from-file="startup-script=${SRV_SCRIPT}" \
             --tags=ukg-vm \
             --labels="run=${UKG_RUN}"
@@ -280,14 +344,19 @@ ukg_c1_create_srv() {
 # public ingress rule.
 ukg_c1_create_cli() {
     local z="$1"
+    local image_args=()
+    if [ -n "${UBUNTU_IMAGE}" ]; then
+        image_args=(--image="${UBUNTU_IMAGE}" --image-project="${UBUNTU_PROJECT}")
+    else
+        image_args=(--image-family="${UBUNTU_FAMILY}" --image-project="${UBUNTU_PROJECT}")
+    fi
     gcloud compute instances create "${CLI_NAME}" \
         --zone="${z}" \
         --project="${GCP_PROJECT}" \
         --machine-type="${CLIENT_MACHINE}" \
         --boot-disk-type=pd-balanced \
         --network-interface="nic-type=GVNIC,private-network-ip=${CLI_IP}" \
-        --image-family="${UBUNTU_FAMILY}" \
-        --image-project="${UBUNTU_PROJECT}" \
+        "${image_args[@]}" \
         --metadata-from-file="startup-script=${CLI_SCRIPT}" \
         --tags=ukg-vm \
         --labels="run=${UKG_RUN}"

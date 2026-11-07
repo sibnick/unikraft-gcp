@@ -60,6 +60,7 @@
 #include "netif/uknetdev.h"
 #include "lwip_percore.h"
 #include "idlebackoff.h"
+#include "../common/http_close.h"
 
 #define MC_MAX_WORKERS CONFIG_UKPLAT_CPU_MAXCOUNT
 #define MC_RECVBUF_SIZE 4096
@@ -357,16 +358,25 @@ static int handle_readable(struct worker_ctx *w, int fd)
 		w->recv_buf[r] = '\0';
 		w->req_count++;
 
-		if (fd < MAX_TRACKED_FDS) {
-			w->resp_pending[fd] = (uint32_t)http_resp_len;
-			if (send_pending_response(w, fd) < 0)
-				return -1;
-		} else {
-			send(fd, http_response, http_resp_len, 0);
+		if (fd >= MAX_TRACKED_FDS) {
+			/*
+			 * This fd has no slot in resp_pending, so the
+			 * worker cannot finish a response that a send()
+			 * left partial. A short reply would sit on a
+			 * keep-alive connection and corrupt the next
+			 * response. Close instead: the client sees an
+			 * end of stream, not a broken byte stream. The
+			 * old code called send() once and dropped the
+			 * result. Ticket 5f45856dfe.
+			 */
+			return -1;
 		}
 
-		if (strstr(w->recv_buf, "Connection: close") != NULL ||
-		    strstr(w->recv_buf, "connection: close") != NULL)
+		w->resp_pending[fd] = (uint32_t)http_resp_len;
+		if (send_pending_response(w, fd) < 0)
+			return -1;
+
+		if (ukg_http_wants_close(w->recv_buf))
 			return -1;
 		return 0;
 	}

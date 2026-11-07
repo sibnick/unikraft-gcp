@@ -26,6 +26,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+#include "../common/ukarg.h"
+
 #if defined(__linux__)
 #include <sched.h>
 #include <pthread.h>
@@ -36,6 +38,29 @@
 #define DEFAULT_COUNT 10000
 #define DEFAULT_PKT_SIZE 64
 #define RECV_TIMEOUT_MS 200
+
+/*
+ * Upper bounds for the command line. Ticket 3a53a6f5d4.
+ *
+ * MAX_PROBE_COUNT: one uint64_t latency sample per probe. Ten
+ * million probes need 80 MB for the sample array. The bound also
+ * stops count * sizeof(uint64_t) from wrapping into a small malloc
+ * that the probe loop then overruns.
+ *
+ * MAX_PKT_LEN: the UDP payload limit. A larger datagram can never
+ * leave as one datagram. pkt_len + 128 for the receive buffer also
+ * cannot wrap with this bound.
+ *
+ * MAX_RATE_PPS: one packet per nanosecond is the fastest real rate.
+ * A larger value only makes the computed send interval 0.
+ *
+ * MAX_CORE_ID: the highest CPU id the glibc cpuset type holds. A
+ * larger id makes CPU_SET write past the end of that type.
+ */
+#define MAX_PROBE_COUNT 10000000ULL
+#define MAX_PKT_LEN 65507U
+#define MAX_RATE_PPS 1000000000ULL
+#define MAX_CORE_ID 1023U
 
 struct __attribute__((packed)) probe_pkt {
 	uint64_t seq;
@@ -84,13 +109,15 @@ static void print_usage(const char *prog)
 	printf("  -p, --port <port>        Server UDP port (default: %d)\n",
 	       DEFAULT_PORT);
 	printf("  -n, --count <num>        Number of packets to probe "
-	       "(default: %d)\n",
-	       DEFAULT_COUNT);
+	       "(default: %d, max: %llu)\n",
+	       DEFAULT_COUNT, (unsigned long long)MAX_PROBE_COUNT);
 	printf(
-	    "  -l, --len <bytes>        Packet length in bytes (default: %d)\n",
-	    DEFAULT_PKT_SIZE);
+	    "  -l, --len <bytes>        Packet length in bytes (default: %d, "
+	    "max: %u)\n",
+	    DEFAULT_PKT_SIZE, MAX_PKT_LEN);
 	printf("  -r, --rate <pps>         Target send rate (pps, 0 = "
-	       "unthrottled)\n");
+	       "unthrottled, max: %llu)\n",
+	       (unsigned long long)MAX_RATE_PPS);
 	printf(
 	    "  -c, --core <id>          Pin client process to CPU core ID\n");
 	printf("  -h, --help               Show this help message\n");
@@ -122,37 +149,74 @@ int main(int argc, char *argv[])
 		case 's':
 			server_ip = optarg;
 			break;
-		case 'p':
-			port = atoi(optarg);
-			if (port <= 0 || port > 65535) {
-				fprintf(stderr, "Error: Invalid port %s\n",
+		case 'p': {
+			uint64_t p;
+
+			if (ukarg_u64(optarg, 1, 65535, &p) != 0) {
+				fprintf(stderr,
+					"Error: Port must be 1..65535: '%s'\n",
 					optarg);
 				return EXIT_FAILURE;
 			}
+			port = (int)p;
 			break;
-		case 'n':
-			count = (uint64_t)strtoull(optarg, NULL, 10);
-			if (count == 0) {
-				fprintf(stderr, "Error: Count must be > 0\n");
+		}
+		case 'n': {
+			uint64_t probes;
+
+			if (ukarg_u64(optarg, 1, MAX_PROBE_COUNT, &probes) !=
+			    0) {
+				fprintf(stderr,
+					"Error: Count must be 1..%llu: '%s'\n",
+					(unsigned long long)MAX_PROBE_COUNT,
+					optarg);
 				return EXIT_FAILURE;
 			}
+			count = probes;
 			break;
-		case 'l':
-			pkt_len = (size_t)strtoul(optarg, NULL, 10);
-			if (pkt_len < sizeof(struct probe_pkt)) {
-				fprintf(
-				    stderr,
-				    "Error: Minimum packet size is %zu bytes\n",
-				    sizeof(struct probe_pkt));
+		}
+		case 'l': {
+			uint64_t len;
+
+			if (ukarg_u64(optarg, sizeof(struct probe_pkt),
+				      MAX_PKT_LEN,
+				      &len) != 0) {
+				fprintf(stderr,
+					"Error: Packet length must be "
+					"%zu..%u bytes: '%s'\n",
+					sizeof(struct probe_pkt), MAX_PKT_LEN,
+					optarg);
 				return EXIT_FAILURE;
 			}
+			pkt_len = (size_t)len;
 			break;
-		case 'r':
-			rate_pps = (uint64_t)strtoull(optarg, NULL, 10);
+		}
+		case 'r': {
+			uint64_t rate;
+
+			if (ukarg_u64(optarg, 0, MAX_RATE_PPS, &rate) != 0) {
+				fprintf(stderr,
+					"Error: Rate must be 0..%llu pps: "
+					"'%s'\n",
+					(unsigned long long)MAX_RATE_PPS,
+					optarg);
+				return EXIT_FAILURE;
+			}
+			rate_pps = rate;
 			break;
-		case 'c':
-			pin_core = atoi(optarg);
+		}
+		case 'c': {
+			uint64_t core;
+
+			if (ukarg_u64(optarg, 0, MAX_CORE_ID, &core) != 0) {
+				fprintf(stderr,
+					"Error: Core id must be 0..%u: '%s'\n",
+					MAX_CORE_ID, optarg);
+				return EXIT_FAILURE;
+			}
+			pin_core = (int)core;
 			break;
+		}
 		case 'h':
 			print_usage(argv[0]);
 			return EXIT_SUCCESS;
@@ -209,6 +273,12 @@ int main(int argc, char *argv[])
 
 	if (!send_buf || !recv_buf || !latencies) {
 		fprintf(stderr, "Error: Memory allocation failed\n");
+		/* free(NULL) does nothing, so free all three. The earlier
+		 * code leaked the buffers that did succeed. Ticket
+		 * 3a53a6f5d4. */
+		free(send_buf);
+		free(recv_buf);
+		free(latencies);
 		close(fd);
 		return EXIT_FAILURE;
 	}

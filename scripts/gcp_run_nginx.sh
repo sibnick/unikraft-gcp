@@ -53,6 +53,29 @@ MACHINE_TYPE="${MACHINE_TYPE:-n1-standard-1}"
 CLIENT_MACHINE="${UKG_CLIENT_MACHINE:-e2-small}"
 UBUNTU_FAMILY="${UKG_UBUNTU_FAMILY:-ubuntu-2404-lts-amd64}"
 UBUNTU_PROJECT="${UKG_UBUNTU_PROJECT:-ubuntu-os-cloud}"
+UBUNTU_IMAGE="${UKG_UBUNTU_IMAGE:-}"
+
+# If UKG_UBUNTU_IMAGE is not set, resolve the latest image from the family.
+# This records the exact base image version for the run.
+if [ -z "${UBUNTU_IMAGE}" ] && command -v gcloud >/dev/null 2>&1; then
+    RESOLVED_IMAGE="$(gcloud compute images describe-from-family "${UBUNTU_FAMILY}" --project="${UBUNTU_PROJECT}" --format="value(name)" 2>/dev/null || true)"
+    if [ -n "${RESOLVED_IMAGE}" ]; then
+        UBUNTU_IMAGE="${RESOLVED_IMAGE}"
+    fi
+fi
+
+# Pinned guest package version for the smoke client and libcurl.
+# The install branch runs only when the image ships no curl, so
+# pinning never fights a preinstalled newer curl. Sibling package
+# libcurl4t64 must match the curl version. The defaults are Ubuntu
+# 24.04 LTS (noble) release versions. Update them together with
+# UKG_UBUNTU_FAMILY, or pass a per-run override. The client prints
+# the installed version to the serial log, so the stored evidence
+# names the exact package. Acquire::Retries keeps a flaky apt mirror
+# from failing the gate after billable time.
+# Tickets 1a21e263ad and ca3a596670.
+CURL_VERSION="${UKG_CURL_VERSION:-8.5.0-2ubuntu10}"
+LIBCURL_VERSION="${UKG_LIBCURL_VERSION:-${CURL_VERSION}}"
 
 SRV_NAME="${UKG_RUN}-srv"
 CLI_NAME="${UKG_RUN}-cli"
@@ -75,10 +98,9 @@ CLI_LOG="$(ukg_mk_serial_log "${UKG_RUN}-cli")"
 COMBINED_LOG="$(ukg_mk_serial_log "${UKG_RUN}")"
 
 # Client startup script, rendered below and passed through instance
-# metadata.
-LOG_DIR="${UKG_LOG_DIR:-/tmp/opencode}"
-mkdir -p "${LOG_DIR}"
-CLI_SCRIPT="$(mktemp "${LOG_DIR}/${UKG_RUN}-cli-startup-XXXXXX.sh")"
+# metadata. The helper places it in the private per-user log
+# directory.
+CLI_SCRIPT="$(ukg_mk_startup_script "${UKG_RUN}" cli)"
 
 # Evidence contract wiring, same as the other run scripts.
 UKG_GATE="NGINX"
@@ -99,6 +121,8 @@ echo "Run ID:       ${UKG_RUN}"
 echo "Server:       ${SRV_NAME} (${SRV_IP}) image: ${SRV_IMG}"
 echo "Client:       ${CLI_NAME} (${CLI_IP})"
 echo "Subnet:       ${SUBNET}"
+echo "Image:        family=${UBUNTU_FAMILY} project=${UBUNTU_PROJECT} image=${UBUNTU_IMAGE:-latest}"
+echo "Packages:     curl=${CURL_VERSION} libcurl4t64=${LIBCURL_VERSION}"
 echo "Logs:         ${SRV_LOG} ${CLI_LOG} ${COMBINED_LOG}"
 echo "=================================================="
 
@@ -137,6 +161,17 @@ cat >"${CLI_SCRIPT}" <<'CLI_EOF'
 # nginx smoke client (run @@RUN@@). Ticket 4ecf9dcedf.
 exec > /dev/console 2>&1
 echo "NGINXSMOKE start run=@@RUN@@ target=@@TARGET@@"
+GCP_IMAGE="unknown"
+if command -v curl >/dev/null 2>&1; then
+    GCP_IMAGE="$(curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/image 2>/dev/null || echo "unknown")"
+elif command -v wget >/dev/null 2>&1; then
+    GCP_IMAGE="$(wget -qO- --header="Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/image 2>/dev/null || echo "unknown")"
+fi
+OS_RELEASE="unknown"
+if [ -f /etc/os-release ]; then
+    OS_RELEASE="$(. /etc/os-release && echo "${VERSION:-unknown}")"
+fi
+echo "BASE_IMAGE family=@@UBUNTU_FAMILY@@ project=@@UBUNTU_PROJECT@@ image=@@UBUNTU_IMAGE@@ actual=${GCP_IMAGE} os=${OS_RELEASE}"
 TARGET="@@TARGET@@"
 MARKER="@@MARKER@@"
 PORT=80
@@ -155,12 +190,15 @@ if [ "${READY}" != "1" ]; then
 fi
 if ! command -v curl >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
-    if ! apt-get update -qq || ! apt-get install -y -qq curl; then
-        echo "GATE_NGINX_SMOKE_FAIL: could not install curl"
+    if ! apt-get update -qq -o Acquire::Retries=5 ||
+       ! apt-get install -y -qq -o Acquire::Retries=5 "curl=@@CURL_VERSION@@" "libcurl4t64=@@LIBCURL_VERSION@@"; then
+        echo "GATE_NGINX_SMOKE_FAIL: could not install pinned curl=@@CURL_VERSION@@ libcurl4t64=@@LIBCURL_VERSION@@. Set UKG_CURL_VERSION to a version this image offers."
         poweroff
         exit 1
     fi
 fi
+dpkg-query -W -f='PKG curl ${Version}\n' curl
+dpkg-query -W -f='PKG libcurl4t64 ${Version}\n' libcurl4t64 2>/dev/null || true
 STATUS1="$(curl -sS -m 10 -o /tmp/ukg-body-1 -w '%{http_code}' "http://${TARGET}:${PORT}/" 2>/dev/null || echo 000)"
 echo "NGINX_SMOKE_RESULT status=${STATUS1}"
 echo "NGINX_BODY_BEGIN"
@@ -181,9 +219,14 @@ fi
 poweroff
 CLI_EOF
 sed -i \
-    -e "s|@@RUN@@|${UKG_RUN}|g" \
-    -e "s|@@TARGET@@|${SRV_IP}|g" \
-    -e "s|@@MARKER@@|${SMOKE_MARKER}|g" \
+    -e "s|@@RUN@@|$(ukg_escape_sed "${UKG_RUN}")|g" \
+    -e "s|@@TARGET@@|$(ukg_escape_sed "${SRV_IP}")|g" \
+    -e "s|@@MARKER@@|$(ukg_escape_sed "${SMOKE_MARKER}")|g" \
+    -e "s|@@CURL_VERSION@@|$(ukg_escape_sed "${CURL_VERSION}")|g" \
+    -e "s|@@LIBCURL_VERSION@@|$(ukg_escape_sed "${LIBCURL_VERSION}")|g" \
+    -e "s|@@UBUNTU_FAMILY@@|$(ukg_escape_sed "${UBUNTU_FAMILY}")|g" \
+    -e "s|@@UBUNTU_PROJECT@@|$(ukg_escape_sed "${UBUNTU_PROJECT}")|g" \
+    -e "s|@@UBUNTU_IMAGE@@|$(ukg_escape_sed "${UBUNTU_IMAGE}")|g" \
     "${CLI_SCRIPT}"
 
 # 3. Internal firewall rule. Open only what the gate needs: TCP 80 for
@@ -242,14 +285,19 @@ ukg_nginx_create_srv() {
 # ingress rule.
 ukg_nginx_create_cli() {
     local z="$1"
+    local image_args=()
+    if [ -n "${UBUNTU_IMAGE}" ]; then
+        image_args=(--image="${UBUNTU_IMAGE}" --image-project="${UBUNTU_PROJECT}")
+    else
+        image_args=(--image-family="${UBUNTU_FAMILY}" --image-project="${UBUNTU_PROJECT}")
+    fi
     gcloud compute instances create "${CLI_NAME}" \
         --zone="${z}" \
         --project="${GCP_PROJECT}" \
         --machine-type="${CLIENT_MACHINE}" \
         --boot-disk-type=pd-balanced \
         --network-interface="nic-type=GVNIC,private-network-ip=${CLI_IP}" \
-        --image-family="${UBUNTU_FAMILY}" \
-        --image-project="${UBUNTU_PROJECT}" \
+        "${image_args[@]}" \
         --metadata-from-file="startup-script=${CLI_SCRIPT}" \
         --tags=ukg-vm \
         --labels="run=${UKG_RUN}"

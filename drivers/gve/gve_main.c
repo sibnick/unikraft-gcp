@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <uk/config.h>
 #include <uk/alloc.h>
+#include <uk/atomic.h>
 #include <uk/print.h>
 #include <uk/essentials.h>
 #include <uk/bus/pci.h>
@@ -32,7 +33,6 @@
 #endif
 
 #define DRIVER_NAME		"gve"
-#define GVE_PAGE_SIZE		4096UL
 #define GVE_PKT_BUF_ALIGN	2048UL
 /*
  * Admin Queue completion bound. The Linux gve driver waits up to
@@ -118,6 +118,7 @@ struct uk_netdev_tx_queue {
 	uint32_t db_idx;	/* device BAR2 doorbell index, checked at configure */
 	struct gve_queue_resources *q_resources;
 	uint8_t *bounce_bufs;
+	uint64_t *bounce_dma;	/* per-slot device DMA addresses */
 
 	/* DQO_RDA rings and state */
 	union gve_tx_desc_dqo *dqo_tx_ring;
@@ -156,6 +157,7 @@ struct uk_netdev_rx_queue {
 	struct gve_rx_desc_dqo *dqo_bufq_ring;
 	struct gve_rx_compl_desc_dqo *dqo_complq_ring;
 	uint8_t *dqo_rx_bufs;
+	uint64_t *dqo_rx_bufs_dma;	/* per-buffer device DMA addresses */
 	uint32_t dqo_bufq_tail;
 	uint32_t dqo_refill_pending;	/* reposts since last doorbell */
 	uint32_t dqo_complq_head;
@@ -176,7 +178,7 @@ struct uk_netdev_rx_queue {
 	/* MSI-X interrupt RX state (ticket eae6a73726) */
 	uint8_t intr_enabled;	/* rxq_intr_enable armed this queue */
 	uint32_t irq_db_idx;	/* BAR2 IRQ doorbell, checked at enable */
-	volatile uint32_t msix_events;	/* RX MSI-X events, ISR-owned */
+	uint32_t msix_events;	/* RX MSI-X events, ISR-owned, atomic */
 };
 
 struct gve_device {
@@ -242,6 +244,7 @@ struct gve_device {
 	int intr_want;			/* policy from gve.intr and APIC */
 	int msix_capable;		/* probe reserved the pool */
 	int msix_enabled;		/* table programmed by configure */
+	uint8_t msix_ctrl_on;		/* probe wrote the MSI-X enable bit */
 	uint32_t msix_cap_off;		/* capability offset in config space */
 	uint32_t msix_tbl_off;		/* table byte offset inside its BAR */
 	uint32_t msix_tbl_size;		/* vector count from the capability */
@@ -249,8 +252,7 @@ struct gve_device {
 	volatile uint32_t *msix_table;	/* mapped table, or NULL */
 	uint16_t msix_irq_pool[GVE_MSIX_MAX_IRQS];
 	uint8_t msix_pool_cnt;
-	volatile uint32_t msix_events;	/* total RX MSI-X events, ISR-owned */
-	uint8_t msix_marker_done;	/* gate marker printed once */
+	uint8_t msix_marker_done;	/* gate marker printed once, atomic claim */
 };
 
 #define to_gvedev(ndev) \
@@ -493,43 +495,73 @@ static void gve_unmap_bar(int slot)
 #endif /* CONFIG_LIBUKPAGING */
 
 /*
- * Device DMA address for a driver buffer (ticket eae6a73726).
+ * Map one driver buffer into the device DMA address space (ticket
+ * dd5b22a059).
  *
- * A non-paging kernel identity-maps RAM, so the pointer value is
- * also the physical address. The RSS and MC gates proved that
- * form. With ukpaging the heap lives at
- * CONFIG_LIBUKBOOT_HEAP_BASE (16 GiB here), so the pointer is not
- * a device address: the device needs the physical frame behind it.
- * Translate through the active page table, the same way the core
- * uksglist and virtio code does. One base translation covers a
- * whole buffer: the frame allocator backs a heap mapping with
- * contiguous frames, the assumption the core virtio rings make
- * too.
+ * Uniquekraft/KVM dma_map semantics: the platform exposes no
+ * dma_map_ops entry to call. Without ukpaging the kernel
+ * identity-maps RAM, so a dma_map is the identity: the pointer is
+ * already the device address, the form the RSS and MC gates proved.
+ * With ukpaging the heap sits at CONFIG_LIBUKBOOT_HEAP_BASE (16 GiB
+ * here), so the pointer is not a device address. The core DMA path,
+ * uksglist, translates one entry per page through the active page
+ * table and accepts a single-address description only while two
+ * neighboring pages are adjacent in physical memory.
+ *
+ * uk_paging_virt_to_phys() cannot report a failed walk: it asserts
+ * in debug builds, and a release build gets the raw entry value. So
+ * this helper checks every result (gve_dma_paddr_is_valid) and walks
+ * the pages after the first: the whole span must be one adjacent run
+ * of frames (gve_dma_pages_adjacent). A buffer that fails here must
+ * fail its caller path. Handing the device a bogus or non-contiguous
+ * address makes it read or write the wrong guest memory: silent
+ * corruption by DMA. On success *dma_out holds the device address of
+ * the first byte and the device may touch len contiguous bytes from
+ * there.
  */
-static inline uint64_t gve_dma_addr(const void *vaddr)
+static int gve_dma_map(const void *vaddr, size_t len, uint64_t *dma_out)
 {
+	if (vaddr == NULL || len == 0UL || dma_out == NULL)
+		return -EINVAL;
 #if CONFIG_LIBUKPAGING
-	return (uint64_t)uk_paging_virt_to_phys((__vaddr_t)(uintptr_t)vaddr);
+	uintptr_t v = (uintptr_t)vaddr;
+	uintptr_t page_v;
+	uint64_t base, prev;
+
+	base = (uint64_t)uk_paging_virt_to_phys((__vaddr_t)v);
+	if (!gve_dma_paddr_is_valid(base))
+		return -EFAULT;
+	prev = base;
+	page_v = (v & ~(GVE_PAGE_SIZE - 1ULL)) + GVE_PAGE_SIZE;
+	while (page_v < v + len) {
+		uint64_t p =
+			(uint64_t)uk_paging_virt_to_phys((__vaddr_t)page_v);
+
+		if (!gve_dma_paddr_is_valid(p) ||
+		    !gve_dma_pages_adjacent(prev, p))
+			return -EFAULT;
+		prev = p;
+		page_v += (uintptr_t)GVE_PAGE_SIZE;
+	}
+	*dma_out = base;
+	return 0;
 #else
-	return (uint64_t)(uintptr_t)vaddr;
+	/* Identity-mapped RAM: the pointer is the device address. */
+	*dma_out = (uint64_t)(uintptr_t)vaddr;
+	return 0;
 #endif
 }
 
 /*
- * Read one BAR size with the standard config-space probe: save the
- * BAR, write all ones, read the decode mask, and restore the BAR.
- * Nothing maps or accesses the BAR while it holds the probe value,
- * so the write cannot disturb the running system. Return the size
- * in bytes, decoded by gve_bar_size_from_mask(). Ticket ad4bd33ab8.
+ * Read one BAR size with the atomic config-space probe.
+ * The probe holds pci_conf_lock across the write, read, and restore
+ * sequence. Return the size in bytes, decoded by
+ * gve_bar_size_from_mask(). Ticket ad4bd33ab8, 8e61791e4e.
  */
 static uint64_t gve_bar_size(struct pci_device *pdev, uint32_t bar_off)
 {
-	uint32_t orig = uk_pci_read_config32(&pdev->addr, bar_off);
-	uint32_t mask;
+	uint32_t mask = uk_pci_probe_bar_mask(&pdev->addr, (__u8)bar_off);
 
-	uk_pci_write_config32(&pdev->addr, bar_off, 0xffffffffU);
-	mask = uk_pci_read_config32(&pdev->addr, bar_off);
-	uk_pci_write_config32(&pdev->addr, bar_off, orig);
 	return gve_bar_size_from_mask(mask);
 }
 
@@ -736,6 +768,7 @@ static int gve_register_qpl(struct gve_device *gdev, struct uk_alloc *a,
 {
 	uint8_t *pages;
 	uint64_t *page_bus;
+	uint64_t bus_dma = 0;
 	union gve_adminq_command cmd;
 	uint32_t cmd_status = 0;
 	uint32_t i;
@@ -771,17 +804,35 @@ static int gve_register_qpl(struct gve_device *gdev, struct uk_alloc *a,
 	memset(page_bus, 0, align_up_page((size_t)num_pages * sizeof(uint64_t)));
 
 	for (i = 0; i < num_pages; i++) {
-		uint64_t paddr = gve_dma_addr(pages + (size_t)i * GVE_PAGE_SIZE);
+		uint64_t paddr;
 
+		rc = gve_dma_map(pages + (size_t)i * GVE_PAGE_SIZE,
+				 GVE_PAGE_SIZE, &paddr);
+		if (rc != 0) {
+			uk_pr_err("gve: QPL id %u page %u has no usable DMA address (%d)\n",
+				  qpl_id, i, rc);
+			uk_free(a, page_bus);
+			uk_free(a, pages);
+			return rc;
+		}
 		page_bus[i] = bswap64(paddr);
+	}
+
+	rc = gve_dma_map(page_bus, (size_t)num_pages * sizeof(uint64_t),
+			 &bus_dma);
+	if (rc != 0) {
+		uk_pr_err("gve: QPL id %u bus list has no usable DMA address (%d)\n",
+			  qpl_id, rc);
+		uk_free(a, page_bus);
+		uk_free(a, pages);
+		return rc;
 	}
 
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.opcode = bswap32(GVE_ADMINQ_REGISTER_PAGE_LIST);
 	cmd.reg_page_list.page_list_id = bswap32(qpl_id);
 	cmd.reg_page_list.num_pages = bswap32(num_pages);
-	cmd.reg_page_list.page_address_list_addr =
-		bswap64(gve_dma_addr(page_bus));
+	cmd.reg_page_list.page_address_list_addr = bswap64(bus_dma);
 	cmd.reg_page_list.page_size = bswap64(GVE_PAGE_SIZE);
 
 	rc = gve_adminq_exec(gdev->reg_bar0, gdev->adminq,
@@ -840,6 +891,8 @@ static int gve_configure_rss(struct gve_device *gdev)
 					 (1U << GVE_RSS_HASH_UDPV6));
 	union gve_adminq_command cmd;
 	uint32_t cmd_status = 0;
+	uint64_t key_dma = 0;
+	uint64_t lut_dma = 0;
 	uint8_t *key;
 	uint32_t *lut;
 	int rc;
@@ -864,10 +917,22 @@ static int gve_configure_rss(struct gve_device *gdev)
 	gve_rss_fill_key(key, key_size);
 	gve_rss_fill_lut(lut, lut_size, pairs);
 
+	rc = gve_dma_map(key, key_size, &key_dma);
+	if (rc == 0)
+		rc = gve_dma_map(lut, (size_t)lut_size * sizeof(uint32_t),
+				 &lut_dma);
+	if (rc != 0) {
+		uk_pr_err("gve: RSS buffers have no usable DMA address (%d)\n",
+			  rc);
+		uk_free(drv_alloc, key);
+		uk_free(drv_alloc, lut);
+		return rc;
+	}
+
 	gve_adminq_fill_configure_rss(&cmd, hash_types,
 				      GVE_RSS_HASH_ALG_TOEPLITZ,
-				      gve_dma_addr(key), key_size,
-				      gve_dma_addr(lut), lut_size);
+				      key_dma, key_size,
+				      lut_dma, lut_size);
 	rc = gve_adminq_exec(gdev->reg_bar0, gdev->adminq,
 			     &gdev->adminq_prod_cnt, &cmd, &cmd_status);
 	uk_pr_info("gve: CONFIGURE_RSS types=0x%x alg=top key=%u lut=%u queues=%u rc=%d status=0x%x\n",
@@ -885,6 +950,8 @@ static int gve_configure_resources(struct gve_device *gdev)
 {
 	union gve_adminq_command cmd;
 	uint32_t cmd_status = 0;
+	uint64_t cnt_dma = 0;
+	uint64_t db_dma = 0;
 	uint32_t ntfy_candidates[2];
 	uint32_t ntfy_want;
 	int cand_idx;
@@ -949,13 +1016,34 @@ static int gve_configure_resources(struct gve_device *gdev)
 	if (ntfy_candidates[1] < ntfy_candidates[0])
 		ntfy_candidates[1] = ntfy_candidates[0];
 
+	/*
+	 * The device writes one counter and one irq db index per
+	 * notification block. Translate both arrays once and refuse
+	 * the call when either has no usable DMA address, so no
+	 * CONFIGURE command can carry a bogus device address.
+	 * Ticket dd5b22a059.
+	 */
+	rc = gve_dma_map(gdev->counter_array,
+			 (size_t)gdev->num_event_counters * sizeof(uint32_t),
+			 &cnt_dma);
+	if (rc == 0)
+		rc = gve_dma_map(gdev->irq_db_indices,
+				 (size_t)gdev->num_event_counters *
+				 sizeof(struct gve_irq_db),
+				 &db_dma);
+	if (rc != 0) {
+		uk_pr_err("gve: counter or irq db array has no usable DMA address (%d)\n",
+			  rc);
+		goto fail;
+	}
+
 	for (cand_idx = 0; cand_idx < 2; cand_idx++) {
 		uint32_t num_ntfy = ntfy_candidates[cand_idx];
 
 		gve_adminq_fill_configure_resources(
 			&cmd,
-			gve_dma_addr(gdev->counter_array),
-			gve_dma_addr(gdev->irq_db_indices),
+			cnt_dma,
+			db_dma,
 			gdev->num_event_counters,
 			num_ntfy,
 			(uint8_t)gdev->queue_format);
@@ -981,8 +1069,8 @@ static int gve_configure_resources(struct gve_device *gdev)
 		gdev->queue_format = GVE_GQI_QPL_FORMAT;
 		gve_adminq_fill_configure_resources(
 			&cmd,
-			gve_dma_addr(gdev->counter_array),
-			gve_dma_addr(gdev->irq_db_indices),
+			cnt_dma,
+			db_dma,
 			gdev->num_event_counters,
 			ntfy_candidates[0],
 			(uint8_t)gdev->queue_format);
@@ -1000,6 +1088,8 @@ static int gve_configure_resources(struct gve_device *gdev)
 		goto fail;
 
 	if (gdev->queue_format == GVE_DQO_RDA_FORMAT) {
+		uint64_t ptype_dma = 0;
+
 		if (!gdev->ptype_lut_dqo) {
 			gdev->ptype_lut_dqo = uk_memalign(
 				drv_alloc, GVE_PAGE_SIZE,
@@ -1013,20 +1103,34 @@ static int gve_configure_resources(struct gve_device *gdev)
 			got_ptype = 1;
 		}
 
-		memset(&cmd, 0, sizeof(cmd));
-		cmd.opcode = bswap32(GVE_ADMINQ_GET_PTYPE_MAP);
-		cmd.get_ptype_map.ptype_map_len =
-			bswap64(sizeof(struct gve_ptype_lut));
-		cmd.get_ptype_map.ptype_map_addr =
-			bswap64(gve_dma_addr(gdev->ptype_lut_dqo));
-
-		rc = gve_adminq_exec(gdev->reg_bar0, gdev->adminq,
-				     &gdev->adminq_prod_cnt, &cmd, &cmd_status);
-		uk_pr_info("gve: GET_PTYPE_MAP rc=%d status=0x%x\n",
-			   rc, cmd_status);
+		/*
+		 * GET_PTYPE_MAP is optional: a device that rejects it
+		 * still runs with the driver default ptype table. So a
+		 * buffer without a usable DMA address skips the
+		 * command instead of failing configure. Ticket
+		 * dd5b22a059.
+		 */
+		rc = gve_dma_map(gdev->ptype_lut_dqo,
+				 sizeof(struct gve_ptype_lut), &ptype_dma);
 		if (rc != 0) {
-			uk_pr_info("gve: Warning: GET_PTYPE_MAP returned status=0x%x\n",
-				   cmd_status);
+			uk_pr_info("gve: Warning: ptype map has no usable DMA address (%d), skipping GET_PTYPE_MAP\n",
+				   rc);
+		} else {
+			memset(&cmd, 0, sizeof(cmd));
+			cmd.opcode = bswap32(GVE_ADMINQ_GET_PTYPE_MAP);
+			cmd.get_ptype_map.ptype_map_len =
+				bswap64(sizeof(struct gve_ptype_lut));
+			cmd.get_ptype_map.ptype_map_addr = bswap64(ptype_dma);
+
+			rc = gve_adminq_exec(gdev->reg_bar0, gdev->adminq,
+					     &gdev->adminq_prod_cnt, &cmd,
+					     &cmd_status);
+			uk_pr_info("gve: GET_PTYPE_MAP rc=%d status=0x%x\n",
+				   rc, cmd_status);
+			if (rc != 0) {
+				uk_pr_info("gve: Warning: GET_PTYPE_MAP returned status=0x%x\n",
+					   cmd_status);
+			}
 		}
 	}
 
@@ -1107,7 +1211,10 @@ static int gve_netdev_probe(struct uk_netdev *dev)
  * Linux gve driver relies on in gve_napi_poll_dqo.
  */
 
-/* Message control word inside the capability, preserved across writes. */
+/* Message control word inside the capability, preserved across writes.
+ * The msix_ctrl_on flag tracks the enable bit so the error path can
+ * undo exactly what a write set. Ticket 0005e7ce7e.
+ */
 static void gve_msix_set_ctrl(struct gve_device *gdev, uint16_t set,
 			      uint16_t clear)
 {
@@ -1118,6 +1225,10 @@ static void gve_msix_set_ctrl(struct gve_device *gdev, uint16_t set,
 	cw = (uint32_t)((cw & ~clear) | set);
 	dword = (dword & 0xffffU) | (cw << 16);
 	uk_pci_write_config32(&pdev->addr, gdev->msix_cap_off, dword);
+	if ((set & GVE_MSIX_CTRL_ENABLE) != 0U)
+		gdev->msix_ctrl_on = 1;
+	if ((clear & GVE_MSIX_CTRL_ENABLE) != 0U)
+		gdev->msix_ctrl_on = 0;
 }
 
 static volatile uint32_t *gve_msix_entry(struct gve_device *gdev, uint32_t blk)
@@ -1165,6 +1276,40 @@ static int gve_msix_find_cap(struct pci_device *pdev, uint32_t *cap_off,
 }
 
 /*
+ * Undo the MSI-X probe setup symmetrically (ticket 0005e7ce7e). Free
+ * every irq the pool holds, then clear the MSI-X enable bit that
+ * gve_msix_set_ctrl wrote. The unwind flags helper picks the two
+ * steps from the device state, so an early stop in the pool loop and
+ * the probe error path release exactly what the reservation took.
+ * RX stays polled after this call. Safe when the probe set nothing
+ * up: the flags read zero and the call does nothing.
+ */
+static void gve_msix_teardown(struct gve_device *gdev)
+{
+	unsigned int flags;
+	uint32_t i;
+
+	flags = gve_msix_unwind_flags(gdev->msix_irq_pool, GVE_MSIX_MAX_IRQS,
+				      gdev->msix_ctrl_on);
+	if ((flags & GVE_MSIX_UNWIND_IRQS) != 0U) {
+		for (i = 0; i < GVE_MSIX_MAX_IRQS; i++) {
+			unsigned int irq;
+
+			if (gdev->msix_irq_pool[i] == 0U)
+				continue;
+			irq = gdev->msix_irq_pool[i] - 1U;
+			uk_intctlr_irq_free(&irq, 1);
+			gdev->msix_irq_pool[i] = 0U;
+		}
+	}
+	if ((flags & GVE_MSIX_UNWIND_CTRL) != 0U)
+		gve_msix_set_ctrl(gdev, 0U, GVE_MSIX_CTRL_ENABLE);
+	gdev->msix_pool_cnt = 0U;
+	gdev->msix_capable = 0;
+	gdev->msix_enabled = 0;
+}
+
+/*
  * Probe-time readiness check and pool reservation. Runs before the
  * first uk_netdev_info_get, whose RX-interrupt feature the stack
  * caches: after that point the interrupt path must never fail for a
@@ -1175,9 +1320,11 @@ static int gve_msix_find_cap(struct pci_device *pdev, uint32_t *cap_off,
 static void gve_msix_probe_check(struct gve_device *gdev)
 {
 	struct pci_device *pdev = gdev->pdev;
+	unsigned int skipped_irqs[GVE_MSIX_MAX_SKIPPED_IRQS];
 	uint32_t worst_irqs, bar_size, got = 0;
+	uint32_t num_skipped = 0;
 	unsigned int irq;
-	uint32_t i;
+	uint32_t i, j;
 
 	gdev->intr_want = gve_intr_policy();
 	if (!gdev->intr_want) {
@@ -1244,22 +1391,35 @@ static void gve_msix_probe_check(struct gve_device *gdev)
 	for (i = 0; i < worst_irqs; i++) {
 		for (;;) {
 			if (uk_intctlr_irq_alloc(&irq, 1) != 0) {
-				uint32_t j;
-
-				for (j = 0; j < got; j++) {
-					unsigned int old = gdev->msix_irq_pool[j] - 1U;
-
-					uk_intctlr_irq_free(&old, 1);
-					gdev->msix_irq_pool[j] = 0U;
-				}
+				/* Undo everything this call took:
+				 * pool irqs, skipped irqs, and the enable bit.
+				 * Tickets 0005e7ce7e and d9cdb2c635.
+				 */
+				for (j = 0; j < num_skipped; j++)
+					uk_intctlr_irq_free(&skipped_irqs[j], 1);
+				gve_msix_teardown(gdev);
 				uk_pr_info("gve: only %u of %u IRQs allocatable: RX stays polled\n",
 					   got, worst_irqs);
 				return;
 			}
-			/* Keep the platform static irqs (PIT 0, IPI 13
-			 * and 14, LAPIC timer 16) out of the pool. */
-			if (irq >= 17U)
+			/* Keep platform static irqs (PIT 0, IPI 13
+			 * and 14, LAPIC timer 16) out of the pool.
+			 * Retain skipped irqs in a temporary array.
+			 * Free them only after the loop completes or
+			 * fails. Immediate free caused an infinite loop
+			 * with first-fit allocators. Ticket d9cdb2c635.
+			 */
+			if (irq >= GVE_MSIX_MIN_IRQ)
 				break;
+			if (num_skipped >= GVE_MSIX_MAX_SKIPPED_IRQS) {
+				uk_intctlr_irq_free(&irq, 1);
+				for (j = 0; j < num_skipped; j++)
+					uk_intctlr_irq_free(&skipped_irqs[j], 1);
+				gve_msix_teardown(gdev);
+				uk_pr_info("gve: static IRQ limit exceeded: RX stays polled\n");
+				return;
+			}
+			skipped_irqs[num_skipped++] = irq;
 		}
 		gdev->msix_irq_pool[i] = (uint16_t)(irq + 1U);
 		got++;
@@ -1267,6 +1427,9 @@ static void gve_msix_probe_check(struct gve_device *gdev)
 		mmio_write32(gve_msix_entry(gdev, i) +
 			     GVE_MSIX_ENTRY_CTRL / 4U, GVE_MSIX_ENTRY_CTRL_MASK);
 	}
+	/* Free all retained skipped IRQs back to the controller. */
+	for (j = 0; j < num_skipped; j++)
+		uk_intctlr_irq_free(&skipped_irqs[j], 1);
 	gdev->msix_pool_cnt = (uint8_t)got;
 	gdev->msix_capable = 1;
 	uk_pr_info("gve: MSI-X ready: cap=0x%x, table=%u vectors BAR%u offset=0x%x, %u irqs reserved\n",
@@ -1307,29 +1470,47 @@ static void gve_msix_configure(struct gve_device *gdev)
 }
 
 /*
- * MSI-X RX event for one queue. Runs in interrupt context. It hands
- * the event to the uknetdev callback: with CONFIG_LIBUKNETDEV_DISPAT
- * CHERTHREADS the semaphore wake moves the work to the dispatcher
- * thread, which drains the ring and re-arms through the empty recv.
+ * MSI-X RX event for one queue. Runs in interrupt context. The console
+ * write path takes a lock: if the interrupted thread holds that lock
+ * on the same CPU, printing from here deadlocks. So the handler only
+ * counts the event atomically and hands the event to the uknetdev
+ * callback. With CONFIG_LIBUKNETDEV_DISPATCHERTHREADS the semaphore
+ * wake moves the work to the dispatcher thread, which drains the ring
+ * through recv. gve_msix_report_events prints the counters and the
+ * gate marker there, in thread context. Ticket cc8e850241.
  */
 static int gve_msix_isr(void *arg)
 {
 	struct uk_netdev_rx_queue *rxq = arg;
 	struct gve_device *gdev = rxq->gdev;
-	uint32_t ev;
 
-	ev = ++rxq->msix_events;
-	gdev->msix_events++;
-	if (ev == 1U || (ev & (ev - 1U)) == 0U)
-		uk_pr_info("gve: RX MSI-X event q=%u events=%u\n", rxq->qid, ev);
-	if (!gdev->msix_marker_done) {
-		gdev->msix_marker_done = 1;
+	uk_add_fetch(&rxq->msix_events, 1U);
+	uk_netdev_drv_rx_event(&gdev->netdev, rxq->qid);
+	return 1;
+}
+
+/*
+ * Report MSI-X RX events from thread context. The first receive call
+ * that sees events on the queue prints the per-queue counter and the
+ * gate marker. Several RX queues can reach this point on several CPUs
+ * through their dispatcher threads, so the atomic exchange decides
+ * the one-shot print exactly once. Ticket cc8e850241.
+ */
+static void gve_msix_report_events(struct gve_device *gdev,
+				   struct uk_netdev_rx_queue *rxq)
+{
+	uint32_t ev = uk_load_n(&rxq->msix_events);
+	const uint8_t claimed = 1U;
+
+	if (!gve_msix_marker_due(ev, uk_load_n(&gdev->msix_marker_done)))
+		return;
+	if (uk_exchange_n(&gdev->msix_marker_done, claimed) == 0U) {
+		uk_pr_info("gve: RX MSI-X events q=%u events=%u\n",
+			   rxq->qid, ev);
 		printf("GATE_GVE_MSIX_PASS vector=%u q=%u\n",
 		       gdev->msix_irq_pool[rxq->ntfy_id] - 1U + 32U,
 		       rxq->qid);
 	}
-	uk_netdev_drv_rx_event(&gdev->netdev, rxq->qid);
-	return 1;
 }
 
 /*
@@ -1396,18 +1577,19 @@ static int gve_netdev_rxq_intr_enable(struct uk_netdev *dev,
 	return 1;
 }
 
-static int gve_netdev_rxq_intr_disable(struct uk_netdev *dev,
-				       struct uk_netdev_rx_queue *queue)
+/*
+ * Shared disable path for one RX queue. Mask the block first, then
+ * drop the handler. The op below and gve_rxq_free both call it: the
+ * ISR holds the queue pointer, so no caller may free or recreate a
+ * queue while its interrupt is still armed. Ticket 03d8b1c494.
+ */
+static void gve_rxq_intr_off(struct gve_device *gdev,
+			     struct uk_netdev_rx_queue *queue)
 {
-	struct gve_device *gdev = to_gvedev(dev);
 	unsigned int irq;
 
-	if (!gdev || !queue)
-		return -EINVAL;
 	if (!queue->intr_enabled)
-		return 0;
-
-	/* Mask the block first, then drop the handler. */
+		return;
 	mmio_write32(&gdev->db_bar2[queue->irq_db_idx], 0U);
 	mmio_write32(gve_msix_entry(gdev, queue->ntfy_id) +
 		     GVE_MSIX_ENTRY_CTRL / 4U, GVE_MSIX_ENTRY_CTRL_MASK);
@@ -1415,6 +1597,16 @@ static int gve_netdev_rxq_intr_disable(struct uk_netdev *dev,
 	uk_intctlr_irq_unregister(irq, gve_msix_isr);
 	queue->intr_enabled = 0;
 	uk_pr_info("gve: RXq%u interrupt mode off\n", queue->qid);
+}
+
+static int gve_netdev_rxq_intr_disable(struct uk_netdev *dev,
+				       struct uk_netdev_rx_queue *queue)
+{
+	struct gve_device *gdev = to_gvedev(dev);
+
+	if (!gdev || !queue)
+		return -EINVAL;
+	gve_rxq_intr_off(gdev, queue);
 	return 0;
 }
 
@@ -1562,6 +1754,8 @@ static void gve_txq_free(struct gve_device *gdev,
 		uk_free(a, txq->qpl_page_bus);
 	if (txq->qpl_pages)
 		uk_free(a, txq->qpl_pages);
+	if (txq->bounce_dma)
+		uk_free(a, txq->bounce_dma);
 	if (txq->bounce_bufs)
 		uk_free(a, txq->bounce_bufs);
 	if (txq->dqo_compl_ring)
@@ -1583,8 +1777,12 @@ static struct uk_netdev_tx_queue *gve_netdev_txq_configure(
 	struct uk_netdev_tx_queue *txq;
 	union gve_adminq_command cmd;
 	uint32_t cmd_status = 0;
+	uint64_t qres_dma = 0;
+	uint64_t ring_dma = 0;
+	uint64_t comp_dma = 0;
 	struct uk_alloc *a;
 	size_t bounce_sz;
+	uint32_t i;
 	int rc;
 
 	if (!gdev || queue_id >= (gdev->queue_pairs ? gdev->queue_pairs : 1U))
@@ -1651,13 +1849,54 @@ static struct uk_netdev_tx_queue *gve_netdev_txq_configure(
 		memset(txq->bounce_bufs, 0, bounce_sz);
 		txq->dqo_cur_gen_bit = 1;
 
+		/*
+		 * Translate every queue buffer before CREATE_TX_QUEUE.
+		 * A ring or bounce area without one contiguous physical
+		 * range must fail the queue instead of handing the
+		 * device a bogus address. Ticket dd5b22a059.
+		 */
+		rc = gve_dma_map(txq->q_resources, GVE_PAGE_SIZE, &qres_dma);
+		if (rc == 0)
+			rc = gve_dma_map(txq->dqo_tx_ring,
+					 (size_t)txq->cnt * sizeof(union gve_tx_desc_dqo),
+					 &ring_dma);
+		if (rc == 0)
+			rc = gve_dma_map(txq->dqo_compl_ring,
+					 (size_t)txq->comp_cnt * sizeof(struct gve_tx_compl_desc),
+					 &comp_dma);
+		if (rc == 0) {
+			txq->bounce_dma = uk_malloc(a,
+				(size_t)txq->cnt * sizeof(uint64_t));
+			if (!txq->bounce_dma) {
+				rc = -ENOMEM;
+				goto err_free;
+			}
+			for (i = 0; i < (uint32_t)txq->cnt; i++) {
+				rc = gve_dma_map(
+					txq->bounce_bufs +
+					(size_t)i * GVE_DEFAULT_RX_BUFFER_SIZE,
+					GVE_DEFAULT_RX_BUFFER_SIZE,
+					&txq->bounce_dma[i]);
+				if (rc != 0) {
+					uk_pr_err("gve: TX%u bounce slot %u has no usable DMA address (%d)\n",
+						  queue_id, i, rc);
+					goto err_free;
+				}
+			}
+		}
+		if (rc != 0) {
+			uk_pr_err("gve: TX%u queue buffers have no usable DMA address (%d)\n",
+				  queue_id, rc);
+			goto err_free;
+		}
+
 		gve_adminq_fill_create_tx_queue(
 			&cmd, queue_id,
-			gve_dma_addr(txq->q_resources),
-			gve_dma_addr(txq->dqo_tx_ring),
+			qres_dma,
+			ring_dma,
 			GVE_RAW_ADDRESSING_QPL_ID,
 			txq->ntfy_id,
-			gve_dma_addr(txq->dqo_compl_ring),
+			comp_dma,
 			txq->cnt,
 			txq->comp_cnt);
 	} else {
@@ -1696,10 +1935,44 @@ static struct uk_netdev_tx_queue *gve_netdev_txq_configure(
 			memset(txq->bounce_bufs, 0, bounce_sz);
 		}
 
+		/* Same rule as the DQO branch: checked device
+		 * addresses before CREATE_TX_QUEUE. Ticket dd5b22a059.
+		 */
+		rc = gve_dma_map(txq->q_resources, GVE_PAGE_SIZE, &qres_dma);
+		if (rc == 0)
+			rc = gve_dma_map(txq->gqi_tx_ring,
+					 (size_t)txq->cnt * sizeof(union gve_tx_desc),
+					 &ring_dma);
+		if (rc == 0 && txq->bounce_bufs != NULL) {
+			txq->bounce_dma = uk_malloc(a,
+				(size_t)txq->cnt * sizeof(uint64_t));
+			if (!txq->bounce_dma) {
+				rc = -ENOMEM;
+				goto err_free;
+			}
+			for (i = 0; i < (uint32_t)txq->cnt; i++) {
+				rc = gve_dma_map(
+					txq->bounce_bufs +
+					(size_t)i * GVE_DEFAULT_RX_BUFFER_SIZE,
+					GVE_DEFAULT_RX_BUFFER_SIZE,
+					&txq->bounce_dma[i]);
+				if (rc != 0) {
+					uk_pr_err("gve: TX%u bounce slot %u has no usable DMA address (%d)\n",
+						  queue_id, i, rc);
+					goto err_free;
+				}
+			}
+		}
+		if (rc != 0) {
+			uk_pr_err("gve: TX%u queue buffers have no usable DMA address (%d)\n",
+				  queue_id, rc);
+			goto err_free;
+		}
+
 		gve_adminq_fill_create_tx_queue(
 			&cmd, queue_id,
-			gve_dma_addr(txq->q_resources),
-			gve_dma_addr(txq->gqi_tx_ring),
+			qres_dma,
+			ring_dma,
 			qpl_id,
 			txq->ntfy_id,
 			0,
@@ -1774,6 +2047,15 @@ static void gve_rxq_free(struct gve_device *gdev,
 
 	if (!rxq)
 		return;
+	/*
+	 * Silence MSI-X before anything else. The registered ISR holds
+	 * this queue pointer. Disable first so no event can run on the
+	 * queue once the device destroys it and the frees below start,
+	 * including the leak path after a failed teardown. Reconfigure
+	 * gets the same guarantee: the fresh queue can re-register the
+	 * IRQ because the old handler is gone. Ticket 03d8b1c494.
+	 */
+	gve_rxq_intr_off(gdev, rxq);
 	a = rxq->alloc ? rxq->alloc : drv_alloc;
 	if (destroy_queue)
 		rc |= gve_adminq_destroy_rx_queue(gdev, rxq->qid);
@@ -1795,6 +2077,8 @@ static void gve_rxq_free(struct gve_device *gdev,
 		uk_free(a, rxq->qpl_page_bus);
 	if (rxq->qpl_pages)
 		uk_free(a, rxq->qpl_pages);
+	if (rxq->dqo_rx_bufs_dma)
+		uk_free(a, rxq->dqo_rx_bufs_dma);
 	if (rxq->dqo_rx_bufs)
 		uk_free(a, rxq->dqo_rx_bufs);
 	if (rxq->dqo_complq_ring)
@@ -1818,6 +2102,11 @@ static struct uk_netdev_rx_queue *gve_netdev_rxq_configure(
 	struct uk_netdev_rx_queue *rxq;
 	union gve_adminq_command cmd;
 	uint32_t cmd_status = 0;
+	uint64_t qres_dma = 0;
+	uint64_t complq_dma = 0;
+	uint64_t bufq_dma = 0;
+	uint64_t desc_dma = 0;
+	uint64_t data_dma = 0;
 	struct uk_alloc *a;
 	uint32_t i;
 	int rc;
@@ -1886,21 +2175,61 @@ static struct uk_netdev_rx_queue *gve_netdev_rxq_configure(
 		memset(rxq->dqo_rx_bufs, 0, bufs_sz);
 		rxq->dqo_cur_gen_bit = 1;
 
-		for (i = 0; i < (uint32_t)(rxq->buf_cnt - 1U); i++) {
-			uint64_t baddr = gve_dma_addr(
-				rxq->dqo_rx_bufs + (size_t)i * GVE_DEFAULT_RX_BUFFER_SIZE);
+		/*
+		 * Translate every queue buffer before CREATE_RX_QUEUE.
+		 * The RX buffer area carries the whole receive path, so
+		 * its contiguity is checked once here. The receive path
+		 * then derives each buffer address from the validated
+		 * base instead of translating per repost. Ticket
+		 * dd5b22a059.
+		 */
+		rc = gve_dma_map(rxq->q_resources, GVE_PAGE_SIZE, &qres_dma);
+		if (rc == 0)
+			rc = gve_dma_map(rxq->dqo_complq_ring,
+					 (size_t)rxq->cnt * sizeof(struct gve_rx_compl_desc_dqo),
+					 &complq_dma);
+		if (rc == 0)
+			rc = gve_dma_map(rxq->dqo_bufq_ring,
+					 (size_t)rxq->buf_cnt * sizeof(struct gve_rx_desc_dqo),
+					 &bufq_dma);
+		if (rc == 0) {
+			rxq->dqo_rx_bufs_dma = uk_malloc(a,
+				(size_t)rxq->buf_cnt * sizeof(uint64_t));
+			if (!rxq->dqo_rx_bufs_dma) {
+				rc = -ENOMEM;
+				goto err_free;
+			}
+			for (i = 0; i < (uint32_t)rxq->buf_cnt; i++) {
+				rc = gve_dma_map(
+					rxq->dqo_rx_bufs +
+					(size_t)i * GVE_DEFAULT_RX_BUFFER_SIZE,
+					GVE_DEFAULT_RX_BUFFER_SIZE,
+					&rxq->dqo_rx_bufs_dma[i]);
+				if (rc != 0) {
+					uk_pr_err("gve: RX%u buffer %u has no usable DMA address (%d)\n",
+						  queue_id, i, rc);
+					goto err_free;
+				}
+			}
+		}
+		if (rc != 0) {
+			uk_pr_err("gve: RX%u queue buffers have no usable DMA address (%d)\n",
+				  queue_id, rc);
+			goto err_free;
+		}
 
+		for (i = 0; i < (uint32_t)(rxq->buf_cnt - 1U); i++) {
 			rxq->dqo_bufq_ring[i].buf_id = (uint16_t)i;
-			rxq->dqo_bufq_ring[i].buf_addr = baddr;
+			rxq->dqo_bufq_ring[i].buf_addr = rxq->dqo_rx_bufs_dma[i];
 			rxq->dqo_bufq_ring[i].header_buf_addr = 0;
 		}
 		rxq->dqo_bufq_tail = (uint32_t)(rxq->buf_cnt - 1U);
 
 		gve_adminq_fill_create_rx_queue(
 			&cmd, queue_id, 0, rxq->ntfy_id,
-			gve_dma_addr(rxq->q_resources),
-			gve_dma_addr(rxq->dqo_complq_ring),
-			gve_dma_addr(rxq->dqo_bufq_ring),
+			qres_dma,
+			complq_dma,
+			bufq_dma,
 			GVE_RAW_ADDRESSING_QPL_ID,
 			rxq->cnt,
 			GVE_DEFAULT_RX_BUFFER_SIZE,
@@ -1951,19 +2280,42 @@ static struct uk_netdev_rx_queue *gve_netdev_rxq_configure(
 			       (size_t)rxq->num_qpl_pages * GVE_PAGE_SIZE);
 
 			for (i = 0; i < rxq->cnt; i++) {
-				uint64_t paddr = gve_dma_addr(
-					rxq->qpl_pages + (size_t)i * GVE_PAGE_SIZE);
+				uint64_t paddr;
 
+				rc = gve_dma_map(
+					rxq->qpl_pages + (size_t)i * GVE_PAGE_SIZE,
+					GVE_PAGE_SIZE, &paddr);
+				if (rc != 0) {
+					uk_pr_err("gve: RX%u RDA page %u has no usable DMA address (%d)\n",
+						  queue_id, i, rc);
+					goto err_free;
+				}
 				rxq->gqi_data_ring[i].addr = bswap64(paddr);
 			}
 		}
 		rxq->gqi_fill_cnt = rxq->cnt;
 
+		/* Same rule as the DQO branch. Ticket dd5b22a059. */
+		rc = gve_dma_map(rxq->q_resources, GVE_PAGE_SIZE, &qres_dma);
+		if (rc == 0)
+			rc = gve_dma_map(rxq->gqi_desc_ring,
+					 (size_t)rxq->cnt * sizeof(struct gve_rx_desc),
+					 &desc_dma);
+		if (rc == 0)
+			rc = gve_dma_map(rxq->gqi_data_ring,
+					 (size_t)rxq->cnt * sizeof(union gve_rx_data_slot),
+					 &data_dma);
+		if (rc != 0) {
+			uk_pr_err("gve: RX%u queue buffers have no usable DMA address (%d)\n",
+				  queue_id, rc);
+			goto err_free;
+		}
+
 		gve_adminq_fill_create_rx_queue(
 			&cmd, queue_id, queue_id, rxq->ntfy_id,
-			gve_dma_addr(rxq->q_resources),
-			gve_dma_addr(rxq->gqi_desc_ring),
-			gve_dma_addr(rxq->gqi_data_ring),
+			qres_dma,
+			desc_dma,
+			data_dma,
 			qpl_id,
 			rxq->cnt,
 			GVE_DEFAULT_RX_BUFFER_SIZE,
@@ -2257,7 +2609,7 @@ static int gve_netdev_xmit(struct uk_netdev *dev,
 		gve_dqo_fill_tx_general_ctx_desc(
 			&queue->dqo_tx_ring[ctx_slot].general_ctx);
 		gve_dqo_fill_tx_pkt_desc(&queue->dqo_tx_ring[pkt_slot].pkt,
-					 gve_dma_addr(dst),
+					 queue->bounce_dma[pkt_slot],
 					 (uint16_t)pkt_slot,
 					 (uint16_t)padded_len);
 		__asm__ __volatile__("mfence" ::: "memory");
@@ -2297,7 +2649,7 @@ static int gve_netdev_xmit(struct uk_netdev *dev,
 		} else {
 			dst = queue->bounce_bufs +
 			      (size_t)slot * GVE_DEFAULT_RX_BUFFER_SIZE;
-			addr = gve_dma_addr(dst);
+			addr = queue->bounce_dma[slot];
 		}
 
 		for (iter = pkt; iter != NULL; iter = iter->next) {
@@ -2335,6 +2687,14 @@ static int gve_netdev_recv(struct uk_netdev *dev,
 
 	*pkt = NULL;
 	rx_db_idx = queue->db_idx;	/* validated at queue configure */
+
+	/*
+	 * A queue in interrupt mode reports its MSI-X counters here.
+	 * The receive call runs in thread context, so the console
+	 * write is safe. Ticket cc8e850241.
+	 */
+	if (queue->intr_enabled)
+		gve_msix_report_events(gdev, queue);
 
 	if (gdev->queue_format == GVE_DQO_RDA_FORMAT) {
 		struct gve_rx_compl_desc_dqo *cdesc =
@@ -2402,8 +2762,7 @@ static int gve_netdev_recv(struct uk_netdev *dev,
 			bslot = queue->dqo_bufq_tail;
 			queue->dqo_bufq_ring[bslot].buf_id = buf_id;
 			queue->dqo_bufq_ring[bslot].buf_addr =
-				gve_dma_addr(queue->dqo_rx_bufs +
-				(size_t)buf_id * GVE_DEFAULT_RX_BUFFER_SIZE);
+				queue->dqo_rx_bufs_dma[buf_id];
 			queue->dqo_bufq_ring[bslot].header_buf_addr = 0;
 			__asm__ __volatile__("mfence" ::: "memory");
 
@@ -2511,7 +2870,9 @@ static int gve_add_dev(struct pci_device *pdev)
 	const char *ver_str = "GVE-1.0.0\n";
 	const char *p;
 	union gve_adminq_command *adminq = NULL;
-	uint64_t adminq_paddr;
+	uint64_t adminq_paddr = 0;
+	uint64_t drv_info_dma = 0;
+	uint64_t desc_dma = 0;
 	struct gve_driver_info *drv_info = NULL;
 	uint8_t *desc_buf = NULL;
 	struct gve_device_descriptor *desc;
@@ -2654,7 +3015,12 @@ static int gve_add_dev(struct pci_device *pdev)
 	}
 	memset(adminq, 0, GVE_PAGE_SIZE);
 	gdev->adminq = adminq;
-	adminq_paddr = gve_dma_addr(adminq);
+	rc = gve_dma_map(adminq, GVE_PAGE_SIZE, &adminq_paddr);
+	if (rc != 0) {
+		printf("GATE_FAIL: gve adminq has no usable DMA address (%d)\n",
+		       rc);
+		goto err;
+	}
 
 	if (rev < 0x1) {
 		mmio_write32(&reg_bar0->adminq_pfn,
@@ -2706,8 +3072,14 @@ static int gve_add_dev(struct pci_device *pdev)
 	cmd.opcode = bswap32(GVE_ADMINQ_VERIFY_DRIVER_COMPATIBILITY);
 	cmd.verify_driver_compatibility.driver_info_len =
 		bswap64(sizeof(*drv_info));
+	rc = gve_dma_map(drv_info, sizeof(*drv_info), &drv_info_dma);
+	if (rc != 0) {
+		printf("GATE_FAIL: gve driver_info has no usable DMA address (%d)\n",
+		       rc);
+		goto err;
+	}
 	cmd.verify_driver_compatibility.driver_info_addr =
-		bswap64(gve_dma_addr(drv_info));
+		bswap64(drv_info_dma);
 
 	rc = gve_adminq_exec(reg_bar0, adminq, &gdev->adminq_prod_cnt, &cmd,
 			     &cmd_status);
@@ -2729,10 +3101,16 @@ static int gve_add_dev(struct pci_device *pdev)
 	}
 	memset(desc_buf, 0, GVE_PAGE_SIZE);
 
+	rc = gve_dma_map(desc_buf, GVE_PAGE_SIZE, &desc_dma);
+	if (rc != 0) {
+		printf("GATE_FAIL: gve desc_buf has no usable DMA address (%d)\n",
+		       rc);
+		goto err;
+	}
+
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.opcode = bswap32(GVE_ADMINQ_DESCRIBE_DEVICE);
-	cmd.describe_device.device_descriptor_addr =
-		bswap64(gve_dma_addr(desc_buf));
+	cmd.describe_device.device_descriptor_addr = bswap64(desc_dma);
 	cmd.describe_device.device_descriptor_version = bswap32(1);
 	cmd.describe_device.available_length = bswap32(GVE_PAGE_SIZE);
 
@@ -3058,6 +3436,16 @@ err:
 	} else {
 		uk_pr_err("gve: probe aborted with a command possibly pending, leaking adminq, driver info, and descriptor buffers\n");
 	}
+	/*
+	 * Unwind in reverse order of the build. gve_msix_probe_check
+	 * may have enabled MSI-X and reserved the IRQ pool before the
+	 * registration failed. Release the pool and clear the enable
+	 * bit before freeing gdev, or the irqs stay claimed and the
+	 * device keeps MSI-X enabled with no driver. The call is a
+	 * no-op when the probe stopped before that point. Ticket
+	 * 0005e7ce7e.
+	 */
+	gve_msix_teardown(gdev);
 	if (mapped_bar1)
 		gve_unmap_bar(2);
 	if (mapped_bar2)
