@@ -125,5 +125,36 @@ command instead. Ticket c16353731a.
    switch for debug reruns of the same image; it keeps the device
    masked and restores the polled path.
 
+## 6. Host-side SMP Check (no cloud)
+
+`scripts/host_run_mc.sh [sample-dir] [boots] [timeout]` boots
+`samples/httpreply-mc` N times on local QEMU and requires
+`detected 4 worker cores` in every boot. It prefers KVM and falls
+back to single-thread TCG (`UKG_HOST_FORCE_TCG=1`).
+
+Facts from ticket `dd4a8c64ea`, measured 2026-11-08:
+
+1. Default multi-thread TCG with `-kernel` sporadically resets the
+   whole machine at AP ramp-up, 3 boots of 8 under host CPU load.
+   Cause: QEMU replays a stale translation of its own multiboot
+   loader code at guest address 0x1000 after the kernel copies the
+   AP trampoline over that page. The AP faults and the machine
+   resets with no console output. This is a QEMU TCG defect, not a
+   kernel defect. KVM and single-thread TCG show no reset in 40
+   boots.
+2. The same host CPU load makes the bounded AP-online wait in patch
+   0003 print `GATE_FAIL: kvm: AP ... did not come online` on TCG,
+   yet every AP comes online shortly after and the boot is healthy.
+   Under TCG treat that line as soft and trust the worker count.
+   Under KVM it is a hard failure.
+3. TCG needs `-cpu qemu64,+rdrand`. Without CPU randomness the lwIP
+   CSPRNG seed fails and the sample crashes at `udp.c`.
+
+## 7. Evidence For Host-only Defects
+
+Host-only gates store logs in `fossil uv` under `reports/` the same
+way as cloud gates. No cloud run is needed when the defect and the
+fix both live on the host side.
+
 One agent drives one gate at a time. The full lifecycle is in
 `AGENTS.md`.
