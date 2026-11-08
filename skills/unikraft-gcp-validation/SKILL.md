@@ -135,13 +135,16 @@ back to single-thread TCG (`UKG_HOST_FORCE_TCG=1`).
 Facts from ticket `dd4a8c64ea`, measured 2026-11-08:
 
 1. Default multi-thread TCG with `-kernel` sporadically resets the
-   whole machine at AP ramp-up, 3 boots of 8 under host CPU load.
-   Cause: QEMU replays a stale translation of its own multiboot
-   loader code at guest address 0x1000 after the kernel copies the
-   AP trampoline over that page. The AP faults and the machine
-   resets with no console output. This is a QEMU TCG defect, not a
-   kernel defect. KVM and single-thread TCG show no reset in 40
-   boots.
+   whole machine at AP ramp-up. It hits about 1 boot in 8 with an
+   idle host and about 1 boot in 4 under host CPU load. Cause: QEMU
+   replays a stale translation of its own multiboot loader code at
+   guest address 0x1000 after the kernel copies the AP trampoline
+   over that page. The first SIPI'd AP usually faults; a rarer
+   variant faults on the BSP in the same window. The machine resets
+   with no console output, and the next boot always succeeds. This
+   is a QEMU TCG defect, not a kernel defect. KVM and
+   single-thread TCG show no reset in 32 boots (24 under load,
+   8 idle).
 2. The same host CPU load makes the bounded AP-online wait in patch
    0003 print `GATE_FAIL: kvm: AP ... did not come online` on TCG,
    yet every AP comes online shortly after and the boot is healthy.
