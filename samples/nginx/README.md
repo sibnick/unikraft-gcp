@@ -27,9 +27,9 @@ space.
 | :--- | :--- | :--- |
 | Driver | `lib-ena` | `lib-virtio-net` (in core), Path A |
 | Address | DHCP or `NETDEV_IP` env | `netdev.ip=<ip>/<bits>:<gw>` boot argument, like the other GCP runners |
-| Pin | `unikraft: stable` + local `.libs` clone | core `RELEASE-0.21.0` (`prepare-unikraft.sh`), `app-elfloader` `RELEASE-0.21.0` = commit `6ecbcd08d85b`, `libelf` = commit `c03d4ceb22a2`, all fetched by hash |
+| Pin | `unikraft: stable` + local `.libs` clone | core from the owner fork `github.com/sibnick/unikraft`, branch `feature/gcp-patches`, pinned by commit hash (`prepare-unikraft.sh`); the fork commits the former core patch set on upstream staging. `app-elfloader` `RELEASE-0.21.0` = commit `6ecbcd08d85b`, `libelf` = commit `c03d4ceb22a2`, both fetched by hash |
 | Disk builder | `scripts/build_disk.sh` (ext4, `grub-bios-setup`) | `scripts/gcp_build_image.sh` (FAT32 ESP, BIOS + UEFI GRUB), initrd passed as a fourth argument |
-| Empty `PT_LOAD` fix | `scripts/elf_drop_empty_segments.py` rewrites the kernel before GRUB | not needed: core patch `0001-plat-kvm-x86-drop-tls-phdrs.patch` drops the empty TLS program headers at the core level, and patch `0004-plat-kvm-x86-keep-tdata-in-data.patch` keeps the real `.tdata` bytes inside the data segment. The image build needs no ELF rewrite |
+| Empty `PT_LOAD` fix | `scripts/elf_drop_empty_segments.py` rewrites the kernel before GRUB | not needed: the fork carries the former core patches `0001` (drop empty TLS program headers) and `0004` (keep real `.tdata` bytes in the data segment) as commits. The image build needs no ELF rewrite |
 | LAPIC idle crash | ENA core carried its own LAPIC wake fix | core patch `0005-plat-kvm-x86-map-lapic-page.patch` maps the local APIC page in the kernel page table. GRUB may omit that page from the memory map, and the LAPIC one-shot wake path faults on its first MMIO write when the system idles |
 | eventfd `FIONBIO` | ENA core carried its own eventfd fix | core patch `0006-lib-posix-eventfd-accept-fionbio.patch` accepts the non-blocking switch that nginx does on its notify eventfd at startup |
 | Idle wake | ENA gate ran on AWS with the LAPIC one-shot wake | `CONFIG_KVM_X86_LAPIC_ONESHOT=n` in the defconfig. Core patch `0007-plat-kvm-x86-lapic-oneshot-option.patch` adds the switch. The first GCP run showed the one-shot probe passing, yet the guest never woke on a halted core. The nginx defconfig now uses the i8254 wake that every GCP gate in this repo has passed with |
@@ -60,8 +60,10 @@ Cloud and virtio-net.
 ## 4. Prerequisites
 
 Run `scripts/prepare-unikraft.sh` from the repository root once per
-checkout. It fetches the pinned core, `lib-lwip`, `app-elfloader`, and
-`libelf`, then applies the `patches/` set. A fresh checkout cannot run
+checkout. It fetches the core fork commit, `lib-lwip`,
+`app-elfloader`, and `libelf`, then applies the `patches/` lwIP set.
+The core carries its former patch set as commits on the fork branch.
+A fresh checkout cannot run
 `make defconfig` without it (lesson from ticket `9e7086837e`).
 
 ## 5. Build

@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: BSD-3-Clause
-# Prepare pinned Unikraft core at RELEASE-0.21.0 (7351f8b563c9e6773da9fdd5bacde6ac91e32112),
+# Prepare the Unikraft core from the owner fork (github.com/sibnick/unikraft,
+# branch feature/gcp-patches), pinned at commit
+# 399ebe383380786b69b328a480fe7a728771ed88. The fork carries the former
+# patches/0001-0007 core patch set as committed history on top of upstream
+# staging, so no patch step runs for the core any more. Fetch by commit
+# hash, same discipline as the other pins. The former 0.21 core patch set is
+# archived under patches/archive/core-release-0.21/.
 # lib-lwip at RELEASE-0.21.0 (ec55ae17618feeb57c8c10109bcf5c42723e8e95), and the
 # two libraries that samples/nginx needs: app-elfloader at RELEASE-0.21.0
 # (6ecbcd08d85b4688112a3b275a9c8446cf59e25d) and lib-libelf (libelf) at the commit
@@ -14,8 +20,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 UK_DEST="${ROOT_DIR}/.unikraft/unikraft"
-UK_COMMIT="7351f8b563c9e6773da9fdd5bacde6ac91e32112"
-UK_URL="https://github.com/unikraft/unikraft.git"
+# Owner fork of unikraft. Branch feature/gcp-patches; the hash below is its
+# tip at the time of the fork migration. Push new work to the branch, then
+# update this hash.
+UK_COMMIT="399ebe383380786b69b328a480fe7a728771ed88"
+UK_URL="git@github.com:sibnick/unikraft.git"
 
 LWIP_DEST="${ROOT_DIR}/.unikraft/libs/lwip"
 LWIP_COMMIT="ec55ae17618feeb57c8c10109bcf5c42723e8e95"
@@ -45,13 +54,22 @@ ukg_fetch_pinned() {
         git init "${dest}"
         git -C "${dest}" remote add origin "${url}"
     fi
+    # The core pin moved from upstream to the owner fork. Re-point the
+    # remote on every run so an existing checkout switches correctly.
+    if [ "$(git -C "${dest}" remote get-url origin)" != "${url}" ]; then
+        echo "[INFO] Switching origin of ${dest} to ${url}..."
+        git -C "${dest}" remote set-url origin "${url}"
+    fi
     if [ "$(git -C "${dest}" rev-parse HEAD 2>/dev/null || true)" = "${commit}" ]; then
         echo "[INFO] ${dest} is already at ${commit}."
         return 0
     fi
     echo "[INFO] Fetching commit ${commit} from ${url}..."
     git -C "${dest}" fetch --depth 1 origin "${commit}"
-    git -C "${dest}" checkout --detach FETCH_HEAD
+    # --force: an older run may have left patches applied in the working
+    # tree (uncommitted). The pin carries its patches as commits, so local
+    # changes to tracked files are stale build state, not user work.
+    git -C "${dest}" checkout --force --detach FETCH_HEAD
 }
 
 mkdir -p "${ROOT_DIR}/.unikraft/libs"
