@@ -60,10 +60,9 @@ Cloud and virtio-net.
 ## 4. Prerequisites
 
 Run `scripts/prepare-unikraft.sh` from the repository root once per
-checkout. It fetches the core fork commit, `lib-lwip`,
-`app-elfloader`, and `libelf`, then applies the `patches/` lwIP set.
-The core carries its former patch set as commits on the fork branch.
-A fresh checkout cannot run
+checkout. It fetches the core fork commit, the lib-lwip fork commit,
+`app-elfloader`, and `libelf`. Both forks carry their former patch sets
+as commits. A fresh checkout cannot run
 `make defconfig` without it (lesson from ticket `9e7086837e`).
 
 ## 5. Build

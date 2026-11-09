@@ -7,8 +7,14 @@
 # staging, so no patch step runs for the core any more. Fetch by commit
 # hash, same discipline as the other pins. The former 0.21 core patch set is
 # archived under patches/archive/core-release-0.21/.
-# lib-lwip at RELEASE-0.21.0 (ec55ae17618feeb57c8c10109bcf5c42723e8e95), and the
-# two libraries that samples/nginx needs: app-elfloader at RELEASE-0.21.0
+# lib-lwip from the owner fork (github.com/sibnick/lib-lwip, branch
+# feature/gcp-patches), pinned at commit
+# 2cf0eb7cac8c75ca607acea96c79fbf8eaa51440. That branch commits the former
+# lib-lwip-*.patch set on RELEASE-0.21.0 (ec55ae17), so no patch step runs
+# for lwIP any more. Its tree is byte-identical to the old pin plus patch
+# set (proof: diff -r at migration time, 2026-11-09). The former lwIP patch
+# set is archived under patches/archive/lwip-release-0.21/.
+# The two libraries that samples/nginx needs: app-elfloader at RELEASE-0.21.0
 # (6ecbcd08d85b4688112a3b275a9c8446cf59e25d) and lib-libelf (libelf) at the commit
 # the proven ENA nginx build carried (c03d4ceb22a2b9e9799238f9c277a14284d313ad).
 # Fetch by commit hash, not by tag. A tag can move and then no longer
@@ -27,8 +33,11 @@ UK_COMMIT="399ebe383380786b69b328a480fe7a728771ed88"
 UK_URL="git@github.com:sibnick/unikraft.git"
 
 LWIP_DEST="${ROOT_DIR}/.unikraft/libs/lwip"
-LWIP_COMMIT="ec55ae17618feeb57c8c10109bcf5c42723e8e95"
-LWIP_URL="https://github.com/unikraft/lib-lwip.git"
+# Owner fork of lib-lwip. Branch feature/gcp-patches; the hash below is its
+# tip at the time of the fork migration. Push new work to the branch, then
+# update this hash.
+LWIP_COMMIT="2cf0eb7cac8c75ca607acea96c79fbf8eaa51440"
+LWIP_URL="git@github.com:sibnick/lib-lwip.git"
 
 # app-elfloader is not in the KraftKit package index. The samples/nginx
 # build uses this clone. Ticket 4ecf9dcedf.
